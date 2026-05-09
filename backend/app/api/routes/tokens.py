@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.token import TokenInventory
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 router = APIRouter()
 
@@ -23,3 +23,16 @@ async def get_stock(db: AsyncSession = Depends(get_db)):
         )
         result[str(pkg)] = len(count_result.scalars().all())
     return result
+
+
+@router.get("/trial-stock")
+async def get_trial_stock(db: AsyncSession = Depends(get_db)):
+    """Public endpoint: returns available trial token count"""
+    result = await db.execute(
+        select(func.count()).select_from(TokenInventory).where(
+            TokenInventory.is_trial == True,
+            TokenInventory.is_assigned == False,
+        )
+    )
+    count = result.scalar() or 0
+    return {"count": count, "available": count > 0}

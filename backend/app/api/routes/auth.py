@@ -18,6 +18,7 @@ class RegisterRequest(BaseModel):
     username: str
     email: EmailStr
     password: str
+    account_type: str = "trial"  # "trial" | "paid"
 
 
 class LoginRequest(BaseModel):
@@ -39,34 +40,39 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="用户名或邮箱已存在")
 
-    # Check trial token availability
-    trial_token = await db.execute(
-        select(TokenInventory).where(
-            TokenInventory.is_trial == True,
-            TokenInventory.is_assigned == False,
-        ).limit(1)
-    )
-    trial_token = trial_token.scalar_one_or_none()
-    if not trial_token:
-        raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
+    if req.account_type not in ("trial", "paid"):
+        raise HTTPException(status_code=400, detail="无效的账户类型")
 
     now = datetime.now(timezone.utc)
+    trial_token = None
+
+    if req.account_type == "trial":
+        t = await db.execute(
+            select(TokenInventory).where(
+                TokenInventory.is_trial == True,
+                TokenInventory.is_assigned == False,
+            ).limit(1)
+        )
+        trial_token = t.scalar_one_or_none()
+        if not trial_token:
+            raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
+
     user = User(
         id=str(uuid.uuid4()),
         username=req.username,
         email=req.email,
         password_hash=hash_password(req.password),
-        account_type="trial",
-        balance_usd=1.0,
-        api_token_id=trial_token.id,
-        trial_expires_at=now + timedelta(days=2),
+        account_type=req.account_type,
+        balance_usd=1.0 if req.account_type == "trial" else 0.0,
+        api_token_id=trial_token.id if trial_token else None,
+        trial_expires_at=now + timedelta(days=2) if req.account_type == "trial" else None,
     )
     db.add(user)
 
-    # Mark trial token as assigned
-    trial_token.is_assigned = True
-    trial_token.assigned_to = user.id
-    trial_token.assigned_at = now
+    if trial_token:
+        trial_token.is_assigned = True
+        trial_token.assigned_to = user.id
+        trial_token.assigned_at = now
 
     await db.flush()
     token = create_access_token(user.id)
