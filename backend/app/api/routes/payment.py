@@ -1,32 +1,22 @@
-import hashlib
 import uuid
+import json
 import httpx
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
 
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import get_current_user, get_admin_user
 from app.core.config import settings
 from app.core.redis import get_redis
-from app.models.user import User
+from app.core.wechatpay import get_wxpay
+from app.models.user import User, UserToken
 from app.models.token import TokenInventory, Order
 
 router = APIRouter()
-
-PACKAGES = {10: "$10 套餐", 20: "$20 套餐", 50: "$50 套餐", 100: "$100 套餐"}
-
-
-def _md5_sign(params: dict, key: str) -> str:
-    # Filter out sign, sign_type and empty values
-    filtered = {k: v for k, v in params.items() if k not in ("sign", "sign_type") and v != "" and v is not None}
-    # Sort by ASCII key order
-    sorted_str = "&".join(f"{k}={filtered[k]}" for k in sorted(filtered.keys()))
-    # Append key
-    sign_str = sorted_str + key
-    return hashlib.md5(sign_str.encode("utf-8")).hexdigest()
 
 
 async def _get_exchange_rate() -> float:
@@ -42,13 +32,12 @@ async def _get_exchange_rate() -> float:
             await redis.setex("exchange_rate_usd_cny", 3600, str(rate))
             return rate
     except Exception:
-        return 7.25  # fallback rate
+        return 7.25
 
 
 class CreateOrderRequest(BaseModel):
-    package_usd: int
-    pay_type: str  # alipay / wxpay
-    client_ip: str = "127.0.0.1"
+    group: str
+    amount_usd: float
 
 
 @router.post("/create_order")
@@ -57,128 +46,79 @@ async def create_order(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if req.package_usd not in PACKAGES:
-        raise HTTPException(status_code=400, detail="无效的套餐")
-    if req.pay_type not in ("alipay", "wxpay"):
-        raise HTTPException(status_code=400, detail="不支持的支付方式")
-
-    # Check stock
-    stock = await db.execute(
-        select(TokenInventory).where(
-            TokenInventory.package_usd == req.package_usd,
-            TokenInventory.is_trial == False,
-            TokenInventory.is_assigned == False,
-        ).limit(1)
-    )
-    if not stock.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="当前套餐暂时缺货，请联系客服")
+    if req.amount_usd < 1 or req.amount_usd > 1000:
+        raise HTTPException(status_code=400, detail="充值金额需在 $1 ~ $1000 之间")
 
     rate = await _get_exchange_rate()
-    amount_cny = round(req.package_usd * rate, 2)
+    amount_cny = round(req.amount_usd * rate, 2)
     out_trade_no = f"CY{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
 
-    # Create order in DB
     order = Order(
         user_id=user.id,
         out_trade_no=out_trade_no,
-        package_usd=req.package_usd,
+        group=req.group,
+        amount_usd=req.amount_usd,
         amount_cny=amount_cny,
         exchange_rate=rate,
-        pay_type=req.pay_type,
+        pay_type="wxpay",
         status="pending",
     )
     db.add(order)
     await db.flush()
 
-    # Call 树杰支付 unified order API
-    timestamp = str(int(datetime.now(timezone.utc).timestamp()))
-    params = {
-        "pid": str(settings.SHUJIE_PID),
-        "method": "web",
-        "device": "pc",
-        "type": req.pay_type,
-        "out_trade_no": out_trade_no,
-        "notify_url": settings.SHUJIE_NOTIFY_URL,
-        "name": PACKAGES[req.package_usd],
-        "money": f"{amount_cny:.2f}",
-        "client_ip": req.client_ip,
-        "timestamp": timestamp,
-    }
-    params["sign"] = _md5_sign(params, settings.SHUJIE_MD5_KEY)
-    params["sign_type"] = "MD5"
+    wxpay = get_wxpay()
+    time_expire = (datetime.now(timezone(timedelta(hours=8))) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    code, result = await wxpay.pay(
+        description=f"CyImagePro充值-{req.group}",
+        out_trade_no=out_trade_no,
+        amount={"total": int(amount_cny * 100), "currency": "CNY"},
+        time_expire=time_expire,
+    )
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(f"{settings.SHUJIE_API_BASE}/create", data=params)
-        result = resp.json()
-
-    if result.get("code") != 0:
-        raise HTTPException(status_code=400, detail=f"创建支付订单失败: {result.get('msg', '未知错误')}")
-
-    # Save platform trade_no
-    order.trade_no = result.get("trade_no")
+    if code != 200:
+        raise HTTPException(status_code=502, detail=f"微信支付下单失败: {result}")
 
     return {
         "out_trade_no": out_trade_no,
+        "code_url": result.get("code_url"),
+        "amount_usd": req.amount_usd,
         "amount_cny": amount_cny,
         "exchange_rate": rate,
-        "pay_type": result.get("pay_type"),
-        "pay_info": result.get("pay_info"),  # QR code URL or payment URL
-        "package_usd": req.package_usd,
+        "group": req.group,
+        "status": "pending",
     }
 
 
 @router.post("/notify")
-async def payment_notify(request: Request, db: AsyncSession = Depends(get_db)):
-    form = await request.form()
-    params = dict(form)
+async def wechat_notify(request: Request, db: AsyncSession = Depends(get_db)):
+    headers = {k: v for k, v in request.headers.items()}
+    body = (await request.body()).decode("utf-8")
+    wxpay = get_wxpay()
+    result = wxpay.callback(headers, body)
+    if not result:
+        return Response(
+            status_code=400,
+            content=json.dumps({"code": "FAIL", "message": "验签失败"}),
+            media_type="application/json",
+        )
 
-    # Verify MD5 signature
-    expected_sign = _md5_sign(params, settings.SHUJIE_MD5_KEY)
-    if params.get("sign") != expected_sign:
-        return "fail"
+    data = json.loads(result)
+    if data.get("trade_state") != "SUCCESS":
+        return Response(status_code=200)
 
-    if params.get("trade_status") != "TRADE_SUCCESS":
-        return "success"
-
-    out_trade_no = params.get("out_trade_no")
-    result = await db.execute(select(Order).where(Order.out_trade_no == out_trade_no))
-    order = result.scalar_one_or_none()
-    if not order or order.status == "paid":
-        return "success"
-
-    # Find available token for this package
-    token_result = await db.execute(
-        select(TokenInventory).where(
-            TokenInventory.package_usd == order.package_usd,
-            TokenInventory.is_trial == False,
-            TokenInventory.is_assigned == False,
-        ).limit(1)
-    )
-    token = token_result.scalar_one_or_none()
-    if not token:
-        # No stock — mark order paid but no token assigned yet
+    out_trade_no = data["out_trade_no"]
+    res = await db.execute(select(Order).where(Order.out_trade_no == out_trade_no))
+    order = res.scalar_one_or_none()
+    if order and order.status == "pending":
         order.status = "paid"
         order.paid_at = datetime.now(timezone.utc)
-        return "success"
+        order.trade_no = data.get("transaction_id")
+        user_res = await db.execute(select(User).where(User.id == order.user_id))
+        u = user_res.scalar_one_or_none()
+        if u:
+            u.account_type = "paid"
 
-    now = datetime.now(timezone.utc)
-    token.is_assigned = True
-    token.assigned_to = order.user_id
-    token.assigned_at = now
-
-    order.status = "paid"
-    order.paid_at = now
-    order.token_id = token.id
-
-    # Upgrade user to paid, add balance, assign token
-    user_result = await db.execute(select(User).where(User.id == order.user_id))
-    user = user_result.scalar_one_or_none()
-    if user:
-        user.account_type = "paid"
-        user.balance_usd = float(user.balance_usd) + order.package_usd
-        user.api_token_id = token.id
-
-    return "success"
+    return Response(status_code=200)
 
 
 @router.get("/query/{out_trade_no}")
@@ -194,8 +134,20 @@ async def query_order(
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
 
+    if order.status == "pending":
+        wxpay = get_wxpay()
+        code, wx_result = await wxpay.query(out_trade_no=out_trade_no)
+        if code == 200 and wx_result.get("trade_state") == "SUCCESS":
+            order.status = "paid"
+            order.paid_at = datetime.now(timezone.utc)
+            order.transaction_id = wx_result.get("transaction_id")
+            user_res = await db.execute(select(User).where(User.id == user.id))
+            u = user_res.scalar_one_or_none()
+            if u:
+                u.account_type = "paid"
+
     token_value = None
-    if order.status == "paid" and order.token_id:
+    if order.token_id:
         t = await db.execute(select(TokenInventory).where(TokenInventory.id == order.token_id))
         tok = t.scalar_one_or_none()
         if tok:
@@ -204,22 +156,80 @@ async def query_order(
     return {
         "out_trade_no": order.out_trade_no,
         "status": order.status,
-        "package_usd": order.package_usd,
+        "group": order.group,
+        "amount_usd": float(order.amount_usd),
         "amount_cny": float(order.amount_cny),
         "paid_at": order.paid_at.isoformat() if order.paid_at else None,
         "api_token": token_value,
     }
 
 
+@router.post("/close/{out_trade_no}")
+async def close_order(
+    out_trade_no: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Order).where(Order.out_trade_no == out_trade_no, Order.user_id == user.id)
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if order.status != "pending":
+        raise HTTPException(status_code=400, detail="只能关闭待支付订单")
+
+    wxpay = get_wxpay()
+    code, wx_result = await wxpay.close(out_trade_no=out_trade_no)
+    if code not in (200, 204):
+        raise HTTPException(status_code=502, detail=f"关闭订单失败: {wx_result}")
+
+    order.status = "closed"
+    return {"status": "closed", "out_trade_no": out_trade_no}
+
+
+class RefundRequest(BaseModel):
+    reason: str = ""
+
+
+@router.post("/refund/{out_trade_no}")
+async def refund_order(
+    out_trade_no: str,
+    req: RefundRequest = RefundRequest(),
+    _=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Order).where(Order.out_trade_no == out_trade_no))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if order.status != "paid":
+        raise HTTPException(status_code=400, detail="只能退款已支付订单")
+
+    out_refund_no = f"RF{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+    total_fee = int(float(order.amount_cny) * 100)
+
+    wxpay = get_wxpay()
+    code, wx_result = await wxpay.refund(
+        out_refund_no=out_refund_no,
+        amount={"refund": total_fee, "total": total_fee, "currency": "CNY"},
+        out_trade_no=out_trade_no,
+        reason=req.reason or "管理员退款",
+    )
+    if code != 200:
+        raise HTTPException(status_code=502, detail=f"退款失败: {wx_result}")
+
+    order.status = "refunded"
+    return {"status": "refunded", "out_refund_no": out_refund_no}
+
+
 @router.get("/packages")
-async def get_packages():
+async def get_packages(db: AsyncSession = Depends(get_db)):
+    from app.models.content import Group
     rate = await _get_exchange_rate()
-    return [
-        {
-            "package_usd": usd,
-            "name": name,
-            "price_cny": round(usd * rate, 2),
-            "exchange_rate": rate,
-        }
-        for usd, name in PACKAGES.items()
-    ]
+    result = await db.execute(select(Group).order_by(Group.sort_order))
+    groups = result.scalars().all()
+    return {
+        "exchange_rate": rate,
+        "groups": [{"name": g.name, "description": g.description} for g in groups],
+    }

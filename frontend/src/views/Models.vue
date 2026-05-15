@@ -4,11 +4,11 @@
     <n-button type="primary" style="margin-bottom:16px" @click="openCreate">+ 新增模型</n-button>
     <n-data-table :columns="columns" :data="models" :pagination="{ pageSize: 20 }" />
 
-    <n-modal v-model:show="showModal" :title="editId ? '编辑模型' : '新增模型'" preset="card" style="width:600px">
+    <n-modal v-model:show="showModal" :title="editId ? '编辑模型' : '新增模型'" preset="card" style="width:640px">
       <n-form :model="form" label-placement="top">
         <n-grid :cols="2" :x-gap="12">
           <n-gi>
-            <n-form-item label="模型 ID（如 gpt-image-2）">
+            <n-form-item label="模型 ID（如 gpt-5.5）">
               <n-input v-model:value="form.name" />
             </n-form-item>
           </n-gi>
@@ -18,46 +18,61 @@
             </n-form-item>
           </n-gi>
           <n-gi>
+            <n-form-item label="供应商">
+              <n-input v-model:value="form.provider" />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="分组">
+              <n-select v-model:value="form.group" :options="groupOptions" tag filterable />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
             <n-form-item label="类型">
               <n-select v-model:value="form.model_type" :options="typeOptions" />
             </n-form-item>
           </n-gi>
           <n-gi>
+            <n-form-item label="计费方式">
+              <n-select v-model:value="form.billing_type" :options="billingOptions" />
+            </n-form-item>
+          </n-gi>
+          <n-gi v-if="editId">
             <n-form-item label="排序">
               <n-input-number v-model:value="form.sort_order" style="width:100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
-            <n-form-item label="启用">
-              <n-switch v-model:value="form.is_enabled" />
-            </n-form-item>
-          </n-gi>
-          <n-gi>
-            <n-form-item label="试用可用">
-              <n-switch v-model:value="form.trial_allowed" />
+            <n-form-item label="启用 / 试用可用">
+              <n-space>
+                <n-switch v-model:value="form.is_enabled" /><span>启用</span>
+                <n-switch v-model:value="form.trial_allowed" /><span>试用</span>
+              </n-space>
             </n-form-item>
           </n-gi>
         </n-grid>
-        <n-divider>计费参数（图片模型填每张价格，对话模型填每百万 token 价格）</n-divider>
-        <n-grid :cols="2" :x-gap="12">
+        <n-divider>计费参数</n-divider>
+        <n-grid :cols="2" :x-gap="12" v-if="form.billing_type === 'per_call'">
+          <n-gi :span="2">
+            <n-form-item label="单次价格 $（每次调用）">
+              <n-input v-model:value="form.price_per_call" placeholder="0.040" />
+            </n-form-item>
+          </n-gi>
+        </n-grid>
+        <n-grid :cols="3" :x-gap="12" v-if="form.billing_type === 'per_token'">
           <n-gi>
-            <n-form-item label="图片单价 $（每张）">
-              <n-input-number v-model:value="form.price_per_image" :precision="4" style="width:100%" />
+            <n-form-item label="输入 $/1K tokens">
+              <n-input v-model:value="form.price_input" placeholder="0.0025" />
             </n-form-item>
           </n-gi>
           <n-gi>
-            <n-form-item label="输入 Token 价格 $（每百万）">
-              <n-input-number v-model:value="form.price_input_per_m" :precision="4" style="width:100%" />
+            <n-form-item label="输出 $/1K tokens">
+              <n-input v-model:value="form.price_output" placeholder="0.0150" />
             </n-form-item>
           </n-gi>
           <n-gi>
-            <n-form-item label="输出 Token 价格 $（每百万）">
-              <n-input-number v-model:value="form.price_output_per_m" :precision="4" style="width:100%" />
-            </n-form-item>
-          </n-gi>
-          <n-gi>
-            <n-form-item label="缓存 Token 价格 $（每百万）">
-              <n-input-number v-model:value="form.price_cached_per_m" :precision="4" style="width:100%" />
+            <n-form-item label="缓存 $/1K tokens">
+              <n-input v-model:value="form.price_cached" placeholder="0.0003" />
             </n-form-item>
           </n-gi>
         </n-grid>
@@ -74,7 +89,7 @@
 
 <script setup>
 import { ref, onMounted, h } from 'vue'
-import { useMessage, NButton, NSpace, NTag, NSwitch } from 'naive-ui'
+import { useMessage, NButton, NSpace, NTag } from 'naive-ui'
 import http from '../api/http'
 
 const msg = useMessage()
@@ -84,29 +99,38 @@ const editId = ref(null)
 const saving = ref(false)
 
 const defaultForm = () => ({
-  name: '', display_name: '', model_type: 'image', is_enabled: true,
-  trial_allowed: false, sort_order: 0,
-  price_per_image: 0.04, price_input_per_m: 0, price_output_per_m: 0, price_cached_per_m: 0,
+  name: '', display_name: '', provider: 'OpenAI', billing_type: 'per_token',
+  model_type: 'chat', group: '', is_enabled: true, trial_allowed: false,
+  sort_order: 0, price_input: '', price_output: '', price_cached: '', price_per_call: '',
 })
 const form = ref(defaultForm())
+
 const typeOptions = [
   { label: '图片', value: 'image' },
   { label: '对话', value: 'chat' },
 ]
+const billingOptions = [
+  { label: '按量计费（per token）', value: 'per_token' },
+  { label: '按次计费（per call）', value: 'per_call' },
+]
+const groupOptions = ref([])
+
+async function loadGroups() {
+  const { data } = await http.get('/api/admin/groups')
+  groupOptions.value = data.map(g => ({ label: g.name, value: g.name }))
+}
 
 const columns = [
-  { title: '模型 ID', key: 'name', width: 160 },
-  { title: '显示名称', key: 'display_name', width: 140 },
-  { title: '类型', key: 'model_type', width: 70,
-    render: row => h(NTag, { type: row.model_type === 'image' ? 'info' : 'success', size: 'small' },
-      { default: () => row.model_type === 'image' ? '图片' : '对话' }) },
-  { title: '启用', key: 'is_enabled', width: 70,
+  { title: '模型', key: 'name', width: 120 },
+  { title: '显示名', key: 'display_name', width: 130 },
+  { title: '分组', key: 'group', width: 100,
+    render: row => h(NTag, { size: 'small' }, { default: () => row.group }) },
+  { title: '计费', key: 'billing_type', width: 70,
+    render: row => row.billing_type === 'per_call' ? '按次' : '按量' },
+  { title: '启用', key: 'is_enabled', width: 55,
     render: row => h(NTag, { type: row.is_enabled ? 'success' : 'default', size: 'small' },
       { default: () => row.is_enabled ? '是' : '否' }) },
-  { title: '试用', key: 'trial_allowed', width: 70,
-    render: row => h(NTag, { type: row.trial_allowed ? 'warning' : 'default', size: 'small' },
-      { default: () => row.trial_allowed ? '是' : '否' }) },
-  { title: '排序', key: 'sort_order', width: 60 },
+  { title: '排序', key: 'sort_order', width: 50 },
   {
     title: '操作', key: 'actions', width: 120,
     render: row => h(NSpace, null, {
@@ -159,5 +183,5 @@ async function del(id) {
   await load()
 }
 
-onMounted(load)
+onMounted(() => { load(); loadGroups() })
 </script>

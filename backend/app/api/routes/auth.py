@@ -6,9 +6,9 @@ from pydantic import BaseModel, EmailStr
 import uuid
 
 from app.core.database import get_db
-from app.core.security import hash_password, verify_password, create_access_token, create_admin_token
+from app.core.security import hash_password, verify_password, create_access_token, create_admin_token, get_current_user
 from app.core.config import settings
-from app.models.user import User
+from app.models.user import User, UserToken
 from app.models.token import TokenInventory
 
 router = APIRouter()
@@ -18,6 +18,7 @@ class RegisterRequest(BaseModel):
     username: str
     email: EmailStr
     password: str
+    account_type: str = "normal"
 
 
 class LoginRequest(BaseModel):
@@ -32,23 +33,14 @@ class AdminLoginRequest(BaseModel):
 
 @router.post("/register")
 async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    # Check username/email uniqueness
+    if req.account_type not in ("trial", "normal"):
+        raise HTTPException(status_code=400, detail="account_type 必须为 trial 或 normal")
+
     existing = await db.execute(
         select(User).where((User.username == req.username) | (User.email == req.email))
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="用户名或邮箱已存在")
-
-    # Check trial token availability
-    trial_token = await db.execute(
-        select(TokenInventory).where(
-            TokenInventory.is_trial == True,
-            TokenInventory.is_assigned == False,
-        ).limit(1)
-    )
-    trial_token = trial_token.scalar_one_or_none()
-    if not trial_token:
-        raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
 
     now = datetime.now(timezone.utc)
     user = User(
@@ -56,24 +48,47 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
         username=req.username,
         email=req.email,
         password_hash=hash_password(req.password),
-        account_type="trial",
-        balance_usd=1.0,
-        api_token_id=trial_token.id,
-        trial_expires_at=now + timedelta(days=2),
+        account_type="normal",
     )
     db.add(user)
+    await db.flush()
 
-    # Mark trial token as assigned
-    trial_token.is_assigned = True
-    trial_token.assigned_to = user.id
-    trial_token.assigned_at = now
+    if req.account_type == "trial":
+        trial_token = await db.execute(
+            select(TokenInventory).where(
+                TokenInventory.is_trial == True,
+                TokenInventory.group == "sora",
+                TokenInventory.is_assigned == False,
+            ).limit(1)
+        )
+        trial_token = trial_token.scalar_one_or_none()
+        if not trial_token:
+            raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
+
+        trial_token.is_assigned = True
+        trial_token.assigned_to = user.id
+        trial_token.assigned_at = now
+
+        ut = UserToken(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            token_id=trial_token.id,
+            group="sora",
+            balance_usd=1.0,
+            is_trial=True,
+        )
+        db.add(ut)
+        user.account_type = "trial"
+        user.trial_expires_at = now + timedelta(days=2)
 
     await db.flush()
-    token = create_access_token(user.id)
+    access_token = create_access_token(user.id)
+    user_info = await _user_info(user, db)
+
     return {
-        "access_token": token,
+        "access_token": access_token,
         "token_type": "bearer",
-        "user": _user_info(user, trial_token),
+        "user": user_info,
     }
 
 
@@ -86,16 +101,12 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(status_code=403, detail="账号已被禁用")
 
-    token_record = None
-    if user.api_token_id:
-        r = await db.execute(select(TokenInventory).where(TokenInventory.id == user.api_token_id))
-        token_record = r.scalar_one_or_none()
-
     access_token = create_access_token(user.id)
+    user_info = await _user_info(user, db)
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "user": _user_info(user, token_record),
+        "user": user_info,
     }
 
 
@@ -106,20 +117,89 @@ async def admin_login(req: AdminLoginRequest):
     return {"access_token": create_admin_token(), "token_type": "bearer"}
 
 
-def _user_info(user: User, token_record=None):
+@router.post("/upgrade-trial")
+async def upgrade_trial(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if user.account_type != "normal":
+        raise HTTPException(status_code=400, detail="仅普通账户可申请试用")
+
+    existing_ut = await db.execute(
+        select(UserToken).where(UserToken.user_id == user.id, UserToken.group == "sora")
+    )
+    if existing_ut.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="已拥有该分组的 Token")
+
+    trial_token = await db.execute(
+        select(TokenInventory).where(
+            TokenInventory.is_trial == True,
+            TokenInventory.group == "sora",
+            TokenInventory.is_assigned == False,
+        ).limit(1)
+    )
+    trial_token = trial_token.scalar_one_or_none()
+    if not trial_token:
+        raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
+
+    now = datetime.now(timezone.utc)
+    user.account_type = "trial"
+    user.trial_expires_at = now + timedelta(days=3)
+
+    trial_token.is_assigned = True
+    trial_token.assigned_to = user.id
+    trial_token.assigned_at = now
+
+    ut = UserToken(
+        id=str(uuid.uuid4()),
+        user_id=user.id,
+        token_id=trial_token.id,
+        group="sora",
+        balance_usd=1.0,
+        is_trial=True,
+    )
+    db.add(ut)
+    await db.commit()
+
+    user_info = await _user_info(user, db)
+    return {"user": user_info}
+
+
+@router.get("/me")
+async def get_me(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    return await _user_info(user, db)
+
+
+async def _user_info(user: User, db: AsyncSession):
     now = datetime.now(timezone.utc)
     trial_expired = (
         user.account_type == "trial"
         and user.trial_expires_at
         and user.trial_expires_at.replace(tzinfo=timezone.utc) < now
     )
+
+    ut_result = await db.execute(
+        select(UserToken).where(UserToken.user_id == user.id)
+    )
+    user_tokens = ut_result.scalars().all()
+
+    tokens = []
+    for ut in user_tokens:
+        tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
+        tok = tok_result.scalar_one_or_none()
+        tokens.append({
+            "group": ut.group,
+            "balance_usd": float(ut.balance_usd),
+            "api_token": tok.token_value if tok else None,
+            "is_trial": ut.is_trial,
+        })
+
     return {
         "id": user.id,
         "username": user.username,
         "email": user.email,
         "account_type": user.account_type,
-        "balance_usd": float(user.balance_usd),
-        "api_token": token_record.token_value if token_record else None,
         "trial_expires_at": user.trial_expires_at.isoformat() if user.trial_expires_at else None,
         "trial_expired": trial_expired,
+        "tokens": tokens,
     }

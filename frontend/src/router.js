@@ -12,6 +12,7 @@ const routes = [
       { path: 'notice', component: () => import('./views/Notice.vue') },
       { path: 'prompts', component: () => import('./views/Prompts.vue') },
       { path: 'models', component: () => import('./views/Models.vue') },
+      { path: 'groups', component: () => import('./views/Groups.vue') },
       { path: 'orders', component: () => import('./views/Orders.vue') },
       { path: 'users', component: () => import('./views/Users.vue') },
     ]

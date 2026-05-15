@@ -5,7 +5,7 @@ from sqlalchemy import select
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
-from app.models.token import TokenInventory, UsageLog
+from app.models.token import UsageLog
 from app.api.routes.auth import _user_info
 
 router = APIRouter()
@@ -13,11 +13,7 @@ router = APIRouter()
 
 @router.get("/me")
 async def get_me(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    token_record = None
-    if user.api_token_id:
-        r = await db.execute(select(TokenInventory).where(TokenInventory.id == user.api_token_id))
-        token_record = r.scalar_one_or_none()
-    return _user_info(user, token_record)
+    return await _user_info(user, db)
 
 
 @router.get("/me/usage")

@@ -17,12 +17,13 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
 
-    # 树杰支付
-    SHUJIE_PID: int = 1752
-    SHUJIE_MD5_KEY: str = "cA1DdJ1ODA2xoU0QEPD5pdE1C513D0V1"
-    SHUJIE_API_BASE: str = "https://www.shujiepay.com/api/pay"
-    SHUJIE_NOTIFY_URL: str = "http://150.158.124.224/api/pay/notify"
-    SHUJIE_RETURN_URL: str = "http://150.158.124.224/api/pay/return"
+    # 微信支付
+    WECHAT_MCHID: str = ""
+    WECHAT_APPID: str = ""
+    WECHAT_APIV3_KEY: str = ""
+    WECHAT_CERT_SERIAL_NO: str = ""
+    WECHAT_PRIVATE_KEY_PATH: str = "/app/certs/apiclient_key.pem"
+    WECHAT_NOTIFY_URL: str = ""
 
     # Server
     SERVER_BASE_URL: str = "http://150.158.124.224"
@@ -32,6 +33,7 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 
 settings = Settings()

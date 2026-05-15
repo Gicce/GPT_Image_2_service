@@ -30,6 +30,7 @@ const menuOptions = [
   { label: '通知栏', key: 'notice' },
   { label: '提示词库', key: 'prompts' },
   { label: '模型管理', key: 'models' },
+  { label: '分组管理', key: 'groups' },
   { label: '订单管理', key: 'orders' },
   { label: '用户管理', key: 'users' },
 ]

@@ -14,7 +14,7 @@ class TokenInventory(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     token_value: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
-    package_usd: Mapped[int] = mapped_column(Integer, nullable=False)  # 10, 20, 50, 100
+    group: Mapped[str] = mapped_column(String(32), nullable=False)
     is_trial: Mapped[bool] = mapped_column(Boolean, default=False)
     is_assigned: Mapped[bool] = mapped_column(Boolean, default=False)
     assigned_to: Mapped[str] = mapped_column(String(36), nullable=True)
@@ -28,13 +28,14 @@ class Order(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     out_trade_no: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
-    trade_no: Mapped[str] = mapped_column(String(64), nullable=True)  # 树杰支付平台订单号
-    package_usd: Mapped[int] = mapped_column(Integer, nullable=False)
+    trade_no: Mapped[str] = mapped_column(String(64), nullable=True)
+    group: Mapped[str] = mapped_column(String(32), nullable=False)
+    amount_usd: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     amount_cny: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     exchange_rate: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False)
-    pay_type: Mapped[str] = mapped_column(String(16), nullable=True)  # alipay / wxpay
-    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending / paid / closed
-    token_id: Mapped[str] = mapped_column(String(36), nullable=True)  # 分配的 token
+    pay_type: Mapped[str] = mapped_column(String(16), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    token_id: Mapped[str] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -47,7 +48,7 @@ class UsageLog(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     model: Mapped[str] = mapped_column(String(64), nullable=False)
-    usage_type: Mapped[str] = mapped_column(String(16), nullable=False)  # image / chat
+    usage_type: Mapped[str] = mapped_column(String(16), nullable=False)
     image_count: Mapped[int] = mapped_column(Integer, default=0)
     input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)

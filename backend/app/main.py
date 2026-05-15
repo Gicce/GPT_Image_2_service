@@ -1,8 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import os
+import traceback
 
 from app.core.database import engine, Base
 from app.core.redis import init_redis
@@ -18,6 +20,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CyImagePro Service", version="1.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"服务器内部错误：{str(exc)}"},
+    )
 
 app.add_middleware(
     CORSMiddleware,
