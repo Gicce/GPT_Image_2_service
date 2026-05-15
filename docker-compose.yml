@@ -36,6 +36,8 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cyimage}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-cyimage}
       REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./certs:/app/certs:ro
     depends_on:
       postgres:
         condition: service_healthy

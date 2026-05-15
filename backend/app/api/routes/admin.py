@@ -518,10 +518,107 @@ async def delete_order(order_id: str, _=Depends(get_admin_user), db: AsyncSessio
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
-    if order.token_id:
-        raise HTTPException(status_code=400, detail="已分配 Token 的订单不可删除")
+    if order.status == "paid" and order.token_id:
+        raise HTTPException(status_code=400, detail="已分配 Token 的已支付订单不可删除")
     await db.delete(order)
     return {"ok": True}
+
+
+class AdminCreateOrderRequest(BaseModel):
+    group: str
+    amount_usd: float
+    user_id: Optional[str] = None
+
+
+@router.post("/orders/create")
+async def admin_create_order(req: AdminCreateOrderRequest, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    if req.amount_usd < 1 or req.amount_usd > 1000:
+        raise HTTPException(status_code=400, detail="金额需在 $1 ~ $1000 之间")
+
+    import httpx
+    from app.core.wechatpay import get_wxpay
+
+    user_id = req.user_id
+    if not user_id:
+        result = await db.execute(select(User).limit(1))
+        u = result.scalar_one_or_none()
+        if not u:
+            raise HTTPException(status_code=400, detail="系统中没有用户，请先创建用户")
+        user_id = u.id
+
+    redis = get_redis()
+    cached = await redis.get("exchange_rate_usd_cny")
+    if cached:
+        rate = float(cached)
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(settings.EXCHANGE_RATE_API)
+                data = resp.json()
+                rate = float(data["rates"]["CNY"])
+                await redis.setex("exchange_rate_usd_cny", 3600, str(rate))
+        except Exception:
+            rate = 7.25
+
+    amount_cny = round(req.amount_usd * rate, 2)
+    out_trade_no = f"CY{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+
+    order = Order(
+        user_id=user_id,
+        out_trade_no=out_trade_no,
+        group=req.group,
+        amount_usd=req.amount_usd,
+        amount_cny=amount_cny,
+        exchange_rate=rate,
+        pay_type="wxpay",
+        status="pending",
+    )
+    db.add(order)
+    await db.flush()
+
+    wxpay = get_wxpay()
+    from datetime import timedelta
+    time_expire = (datetime.now(timezone(timedelta(hours=8))) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    code, result = await wxpay.pay(
+        description=f"CyImagePro充值-{req.group}",
+        out_trade_no=out_trade_no,
+        amount={"total": int(amount_cny * 100), "currency": "CNY"},
+        time_expire=time_expire,
+    )
+
+    if code != 200:
+        raise HTTPException(status_code=502, detail=f"微信支付下单失败: {result}")
+
+    return {
+        "out_trade_no": out_trade_no,
+        "code_url": result.get("code_url"),
+        "amount_usd": req.amount_usd,
+        "amount_cny": amount_cny,
+        "exchange_rate": rate,
+        "group": req.group,
+        "status": "pending",
+    }
+
+
+@router.get("/orders/query_pay/{out_trade_no}")
+async def admin_query_pay(out_trade_no: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Order).where(Order.out_trade_no == out_trade_no))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if order.status != "pending":
+        return {"status": order.status, "out_trade_no": order.out_trade_no}
+
+    from app.core.wechatpay import get_wxpay
+    wxpay = get_wxpay()
+    code, wx_result = await wxpay.query(out_trade_no=order.out_trade_no)
+    if code == 200 and wx_result.get("trade_state") == "SUCCESS":
+        order.status = "paid"
+        order.paid_at = datetime.now(timezone.utc)
+        order.trade_no = wx_result.get("transaction_id")
+        return {"status": "paid", "out_trade_no": order.out_trade_no}
+
+    return {"status": order.status, "out_trade_no": order.out_trade_no}
 
 
 # ── User Token Management ────────────────────────────────────────
