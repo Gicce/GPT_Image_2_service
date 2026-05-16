@@ -17,6 +17,8 @@ from app.models.user import User, UserToken
 from app.models.token import TokenInventory, Order
 
 router = APIRouter()
+MIN_PAYMENT_CNY = 1.00
+MAX_PAYMENT_USD = 1000.00
 
 
 async def _get_exchange_rate() -> float:
@@ -46,11 +48,11 @@ async def create_order(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if req.amount_usd < 1 or req.amount_usd > 1000:
-        raise HTTPException(status_code=400, detail="充值金额需在 $1 ~ $1000 之间")
-
     rate = await _get_exchange_rate()
     amount_cny = round(req.amount_usd * rate, 2)
+    if req.amount_usd <= 0 or req.amount_usd > MAX_PAYMENT_USD or amount_cny < MIN_PAYMENT_CNY:
+        raise HTTPException(status_code=400, detail="充值金额需不少于 ¥1，且不超过 $1000")
+
     out_trade_no = f"CY{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
 
     order = Order(
@@ -71,7 +73,7 @@ async def create_order(
     code, result = await wxpay.pay(
         description=f"CyImagePro充值-{req.group}",
         out_trade_no=out_trade_no,
-        amount={"total": int(amount_cny * 100), "currency": "CNY"},
+        amount={"total": int(round(amount_cny * 100)), "currency": "CNY"},
         time_expire=time_expire,
     )
 

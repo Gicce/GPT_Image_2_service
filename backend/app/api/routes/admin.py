@@ -532,9 +532,6 @@ class AdminCreateOrderRequest(BaseModel):
 
 @router.post("/orders/create")
 async def admin_create_order(req: AdminCreateOrderRequest, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    if req.amount_usd < 1 or req.amount_usd > 1000:
-        raise HTTPException(status_code=400, detail="金额需在 $1 ~ $1000 之间")
-
     import httpx
     from app.core.wechatpay import get_wxpay
 
@@ -561,6 +558,9 @@ async def admin_create_order(req: AdminCreateOrderRequest, _=Depends(get_admin_u
             rate = 7.25
 
     amount_cny = round(req.amount_usd * rate, 2)
+    if req.amount_usd <= 0 or req.amount_usd > 1000 or amount_cny < 1:
+        raise HTTPException(status_code=400, detail="充值金额需不少于 ¥1，且不超过 $1000")
+
     out_trade_no = f"CY{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
 
     order = Order(
@@ -582,7 +582,7 @@ async def admin_create_order(req: AdminCreateOrderRequest, _=Depends(get_admin_u
     code, result = await wxpay.pay(
         description=f"CyImagePro充值-{req.group}",
         out_trade_no=out_trade_no,
-        amount={"total": int(amount_cny * 100), "currency": "CNY"},
+        amount={"total": int(round(amount_cny * 100)), "currency": "CNY"},
         time_expire=time_expire,
     )
 

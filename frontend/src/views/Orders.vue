@@ -72,7 +72,7 @@
           <n-select v-model:value="createForm.group" :options="groupOptions" placeholder="选择分组" />
         </n-form-item>
         <n-form-item label="金额(USD)">
-          <n-input-number v-model:value="createForm.amount_usd" :precision="2" :min="1" :max="1000" style="width:100%" />
+          <n-input-number v-model:value="createForm.amount_usd" :precision="2" :min="0.01" :max="1000" style="width:100%" />
         </n-form-item>
       </n-form>
       <template #footer>
