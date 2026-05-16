@@ -15,11 +15,18 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_scheme = HTTPBearer()
 
 
+def _validate_bcrypt_password(password: str) -> None:
+    if len(password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="密码过长，请使用 72 字节以内的密码")
+
+
 def hash_password(password: str) -> str:
+    _validate_bcrypt_password(password)
     return pwd_context.hash(password)
 
 
 def verify_password(plain: str, hashed: str) -> bool:
+    _validate_bcrypt_password(plain)
     return pwd_context.verify(plain, hashed)
 
 

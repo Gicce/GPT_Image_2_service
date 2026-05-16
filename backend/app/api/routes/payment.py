@@ -12,11 +12,15 @@ from app.core.database import get_db
 from app.core.security import get_current_user, get_admin_user
 from app.core.config import settings
 from app.core.redis import get_redis
-from app.core.wechatpay import get_wxpay
+from app.core.wechatpay import get_wxpay, wechatpay_request
 from app.models.user import User, UserToken
 from app.models.token import TokenInventory, Order
 
 router = APIRouter()
+
+
+def _wechatpay_error(exc: Exception) -> HTTPException:
+    return HTTPException(status_code=502, detail=f"WeChat Pay request failed: {exc}")
 
 
 async def _get_exchange_rate() -> float:
@@ -66,17 +70,28 @@ async def create_order(
     db.add(order)
     await db.flush()
 
-    wxpay = get_wxpay()
     time_expire = (datetime.now(timezone(timedelta(hours=8))) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S+08:00")
-    code, result = await wxpay.pay(
-        description=f"CyImagePro充值-{req.group}",
-        out_trade_no=out_trade_no,
-        amount={"total": int(amount_cny * 100), "currency": "CNY"},
-        time_expire=time_expire,
-    )
+    try:
+        code, result = await wechatpay_request(
+            "/v3/pay/transactions/native",
+            method="POST",
+            data={
+                "appid": settings.WECHAT_APPID,
+                "mchid": settings.WECHAT_MCHID,
+                "description": f"CyImagePro recharge {req.group}",
+                "out_trade_no": out_trade_no,
+                "notify_url": settings.WECHAT_NOTIFY_URL,
+                "amount": {"total": int(amount_cny * 100), "currency": "CNY"},
+                "time_expire": time_expire,
+            },
+        )
+    except Exception as exc:
+        raise _wechatpay_error(exc) from exc
 
     if code != 200:
-        raise HTTPException(status_code=502, detail=f"微信支付下单失败: {result}")
+        raise HTTPException(status_code=502, detail=f"WeChat Pay create order failed: {result}")
+
+    result = json.loads(result)
 
     return {
         "out_trade_no": out_trade_no,
@@ -135,8 +150,9 @@ async def query_order(
         raise HTTPException(status_code=404, detail="订单不存在")
 
     if order.status == "pending":
-        wxpay = get_wxpay()
-        code, wx_result = await wxpay.query(out_trade_no=out_trade_no)
+        path = f"/v3/pay/transactions/out-trade-no/{out_trade_no}?mchid={settings.WECHAT_MCHID}"
+        code, wx_result = await wechatpay_request(path)
+        wx_result = json.loads(wx_result) if wx_result else {}
         if code == 200 and wx_result.get("trade_state") == "SUCCESS":
             order.status = "paid"
             order.paid_at = datetime.now(timezone.utc)
@@ -179,8 +195,12 @@ async def close_order(
     if order.status != "pending":
         raise HTTPException(status_code=400, detail="只能关闭待支付订单")
 
-    wxpay = get_wxpay()
-    code, wx_result = await wxpay.close(out_trade_no=out_trade_no)
+    path = f"/v3/pay/transactions/out-trade-no/{out_trade_no}/close"
+    code, wx_result = await wechatpay_request(
+        path,
+        method="POST",
+        data={"mchid": settings.WECHAT_MCHID},
+    )
     if code not in (200, 204):
         raise HTTPException(status_code=502, detail=f"关闭订单失败: {wx_result}")
 
@@ -209,12 +229,15 @@ async def refund_order(
     out_refund_no = f"RF{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
     total_fee = int(float(order.amount_cny) * 100)
 
-    wxpay = get_wxpay()
-    code, wx_result = await wxpay.refund(
-        out_refund_no=out_refund_no,
-        amount={"refund": total_fee, "total": total_fee, "currency": "CNY"},
-        out_trade_no=out_trade_no,
-        reason=req.reason or "管理员退款",
+    code, wx_result = await wechatpay_request(
+        "/v3/refund/domestic/refunds",
+        method="POST",
+        data={
+            "out_refund_no": out_refund_no,
+            "out_trade_no": out_trade_no,
+            "reason": req.reason or "admin refund",
+            "amount": {"refund": total_fee, "total": total_fee, "currency": "CNY"},
+        },
     )
     if code != 200:
         raise HTTPException(status_code=502, detail=f"退款失败: {wx_result}")
