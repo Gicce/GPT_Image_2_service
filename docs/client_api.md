@@ -1,6 +1,7 @@
 # CyImagePro 客户端 API 对接文档
 
-> Base URL: `http://<服务器IP>:8000`
+> Base URL: `https://www.zjcypc.com`
+> 所有后端接口路径都以 `/api` 开头，例如 `https://www.zjcypc.com/api/auth/login`。
 > 认证方式: Bearer Token（JWT），放在 Header `Authorization: Bearer <token>` 中
 
 ---
