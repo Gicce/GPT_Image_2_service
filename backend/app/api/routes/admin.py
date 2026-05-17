@@ -808,7 +808,7 @@ def _infer_field_type(key: str) -> str:
         return "password"
     if key.endswith("_USE_SSL"):
         return "boolean"
-    if any(kw in key for kw in ("PORT", "MIN", "MAX", "EXPIRE")):
+    if key.endswith("_PORT") or key.endswith("_MIN") or key.endswith("_MAX") or key.endswith("_EXPIRE") or key.endswith("_MINUTES") or "_MIN_" in key or "_MAX_" in key:
         return "number"
     return "text"
 
