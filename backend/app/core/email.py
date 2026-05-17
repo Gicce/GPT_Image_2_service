@@ -9,13 +9,21 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
-async def send_verification_code(to_email: str, code: str) -> None:
-    subject = "CyImagePro 密码重置验证码"
+async def send_verification_code(to_email: str, code: str, purpose: str = "reset") -> None:
+    if purpose == "register":
+        subject = "CyImagePro 邮箱验证码"
+        title = "邮箱验证码"
+        desc = "您正在注册 CyImagePro 账户"
+    else:
+        subject = "CyImagePro 密码重置验证码"
+        title = "密码重置验证码"
+        desc = "您正在重置 CyImagePro 账户密码"
+
     body_html = f"""
     <div style="max-width:480px;margin:0 auto;font-family:sans-serif;
                 background:#1e1e2e;color:#e4e4ef;padding:32px;border-radius:12px;">
-      <h2 style="color:#00d4aa;margin-top:0;">密码重置验证码</h2>
-      <p>您正在重置 CyImagePro 账户密码，验证码为：</p>
+      <h2 style="color:#00d4aa;margin-top:0;">{title}</h2>
+      <p>{desc}，验证码为：</p>
       <div style="font-size:32px;font-weight:700;letter-spacing:8px;
                   color:#00d4aa;text-align:center;margin:24px 0;">
         {code}
@@ -25,7 +33,7 @@ async def send_verification_code(to_email: str, code: str) -> None:
       </p>
     </div>
     """
-    body_text = f"您的密码重置验证码为：{code}，5分钟内有效。如非本人操作，请忽略此邮件。"
+    body_text = f"您的{title}为：{code}，5分钟内有效。如非本人操作，请忽略此邮件。"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject

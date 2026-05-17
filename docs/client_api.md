@@ -26,10 +26,14 @@
 
 ## 二、认证模块
 
-### 2.1 用户注册
+### 2.1 用户注册（邮箱验证码）
+
+注册分为两步：先发送验证码到邮箱，再用验证码完成注册。
+
+#### 2.1.1 发送注册验证码
 
 ```
-POST /api/auth/register
+POST /api/auth/register/send-code
 ```
 
 **请求体：**
@@ -49,9 +53,71 @@ POST /api/auth/register
 | password | string | 是 | 密码 |
 | account_type | string | 否 | `trial`（试用）或 `normal`（普通），默认 `normal` |
 
+**成功响应 200：**
+```json
+{
+  "message": "验证码已发送"
+}
+```
+
+**错误：**
+- 400: `用户名或邮箱已存在`
+- 400: `account_type 必须为 trial 或 normal`
+- 429: `请求过于频繁，请60秒后重试`
+- 429: `验证码尝试次数过多，请稍后再试`
+- 500: `邮件发送失败，请稍后重试`
+
+#### 2.1.2 验证码完成注册
+
+```
+POST /api/auth/register/verify
+```
+
+**请求体：**
+```json
+{
+  "email": "test@example.com",
+  "code": "123456",
+  "username": "testuser",
+  "password": "123456",
+  "account_type": "normal"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| email | string | 是 | 与发送验证码时相同的邮箱 |
+| code | string | 是 | 邮箱收到的 6 位验证码 |
+| username | string | 是 | 与发送验证码时相同的用户名 |
+| password | string | 是 | 与发送验证码时相同的密码 |
+| account_type | string | 否 | 与发送验证码时相同 |
+
 **account_type 说明：**
-- `trial`：自动分配一个图片 Token，`image_balance_usd=1.0`，有效期 3 天。不分配对话 Token。
+- `trial`：自动分配一个图片 Token，`image_balance_usd=1.0`，有效期 2 天。不分配对话 Token。
 - `normal`：不分配任何 Token，两个余额均为 0，需购买套餐后使用。
+
+**成功响应 200：**
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIs...",
+  "token_type": "bearer",
+  "user": {
+    "id": "uuid",
+    "username": "testuser",
+    "email": "test@example.com",
+    "account_type": "normal",
+    "tokens": []
+  }
+}
+```
+
+**错误：**
+- 400: `验证码无效或已过期`
+- 400: `验证码无效或已过期，请重新发送`
+- 400: `用户名或邮箱已存在`
+- 429: `验证码尝试次数过多，请稍后再试`（5次错误后锁定15分钟）
+
+> **旧接口 `POST /api/auth/register`（无验证码）仍可用，但建议新客户端使用验证码流程。**
 
 **成功响应 200：**
 ```json

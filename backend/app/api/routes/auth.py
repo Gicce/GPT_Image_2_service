@@ -47,6 +47,157 @@ class ForgotPasswordResetRequest(BaseModel):
     new_password: str
 
 
+class RegisterSendCodeRequest(BaseModel):
+    username: str
+    email: EmailStr
+    password: str
+    account_type: str = "normal"
+
+
+class RegisterVerifyRequest(BaseModel):
+    email: EmailStr
+    code: str
+    username: str
+    password: str
+    account_type: str = "normal"
+
+
+@router.post("/register/send-code")
+async def register_send_code(req: RegisterSendCodeRequest, db: AsyncSession = Depends(get_db)):
+    if req.account_type not in ("trial", "normal"):
+        raise HTTPException(status_code=400, detail="account_type 必须为 trial 或 normal")
+
+    _validate_bcrypt_password(req.password)
+
+    existing = await db.execute(
+        select(User).where((User.username == req.username) | (User.email == req.email))
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="用户名或邮箱已存在")
+
+    email = req.email.strip().lower()
+    redis = get_redis()
+
+    rate_key = f"reg:rate:{email}"
+    if await redis.exists(rate_key):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请60秒后重试")
+
+    lockout_key = f"reg:lockout:{email}"
+    if await redis.exists(lockout_key):
+        raise HTTPException(status_code=429, detail="验证码尝试次数过多，请稍后再试")
+
+    await redis.setex(rate_key, 60, "1")
+
+    code = "".join(secrets.choice("0123456789") for _ in range(6))
+    code_key = f"reg:code:{email}"
+    attempts_key = f"reg:attempts:{email}"
+
+    # Store code + registration data in Redis
+    reg_data = {"username": req.username, "password": req.password, "account_type": req.account_type}
+    import json
+    await redis.setex(code_key, 300, json.dumps({"code": code, "data": reg_data}))
+    await redis.setex(attempts_key, 300, "0")
+
+    try:
+        await send_verification_code(email, code, purpose="register")
+    except Exception:
+        logger.exception("Failed to send registration code to %s", email)
+        raise HTTPException(status_code=500, detail="邮件发送失败，请稍后重试")
+
+    return {"message": "验证码已发送"}
+
+
+@router.post("/register/verify")
+async def register_verify(req: RegisterVerifyRequest, db: AsyncSession = Depends(get_db)):
+    email = req.email.strip().lower()
+    redis = get_redis()
+
+    code_key = f"reg:code:{email}"
+    attempts_key = f"reg:attempts:{email}"
+    lockout_key = f"reg:lockout:{email}"
+
+    if await redis.exists(lockout_key):
+        raise HTTPException(status_code=429, detail="验证码尝试次数过多，请稍后再试")
+
+    stored = await redis.get(code_key)
+    if not stored:
+        raise HTTPException(status_code=400, detail="验证码无效或已过期，请重新发送")
+
+    import json
+    stored_data = json.loads(stored)
+
+    if stored_data.get("code") != req.code:
+        attempts = int(await redis.get(attempts_key) or "0") + 1
+        await redis.setex(attempts_key, 300, str(attempts))
+
+        if attempts >= 5:
+            await redis.setex(lockout_key, 900, "1")
+            await redis.delete(code_key, attempts_key)
+            raise HTTPException(status_code=429, detail="验证码尝试次数过多，请稍后再试")
+
+        raise HTTPException(status_code=400, detail="验证码无效或已过期")
+
+    # Re-check uniqueness (could have changed since send-code)
+    existing = await db.execute(
+        select(User).where((User.username == req.username) | (User.email == req.email))
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="用户名或邮箱已存在")
+
+    _validate_bcrypt_password(req.password)
+
+    now = datetime.now(timezone.utc)
+    user = User(
+        id=str(uuid.uuid4()),
+        username=req.username,
+        email=email,
+        password_hash=hash_password(req.password),
+        account_type="normal",
+    )
+    db.add(user)
+    await db.flush()
+
+    if req.account_type == "trial":
+        trial_token = await db.execute(
+            select(TokenInventory).where(
+                TokenInventory.is_trial == True,
+                TokenInventory.group == "sora",
+                TokenInventory.is_assigned == False,
+            ).limit(1)
+        )
+        trial_token = trial_token.scalar_one_or_none()
+        if not trial_token:
+            raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
+
+        trial_token.is_assigned = True
+        trial_token.assigned_to = user.id
+        trial_token.assigned_at = now
+
+        ut = UserToken(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            token_id=trial_token.id,
+            group="sora",
+            balance_usd=1.0,
+            is_trial=True,
+        )
+        db.add(ut)
+        user.account_type = "trial"
+        user.trial_expires_at = now + timedelta(days=2)
+
+    await db.flush()
+    access_token = create_access_token(user.id)
+    user_info = await _user_info(user, db)
+
+    await redis.delete(code_key, attempts_key, f"reg:rate:{email}")
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": user_info,
+    }
+
+
 @router.post("/register")
 async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if req.account_type not in ("trial", "normal"):
