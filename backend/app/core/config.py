@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     SMTP_FROM_NAME: str = "CyImagePro"
     SMTP_USE_SSL: bool = True
 
+    # Payment limits
+    PAYMENT_MIN_TOTAL_USD: float = 1.0
+    PAYMENT_MAX_TOTAL_USD: float = 1000.0
+    PAYMENT_MIN_PER_ITEM_USD: float = 0.01
+
     # Exchange rate API (free tier)
     EXCHANGE_RATE_API: str = "https://open.er-api.com/v6/latest/USD"
 

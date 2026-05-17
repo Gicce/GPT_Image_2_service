@@ -560,12 +560,12 @@ async def admin_create_order(req: AdminCreateOrderRequest, _=Depends(get_admin_u
         raise HTTPException(status_code=400, detail="至少选择一个分组")
 
     for item in req.items:
-        if item.amount_usd < 0.01:
-            raise HTTPException(status_code=400, detail=f"分组 {item.group} 金额不能小于 $0.01")
+        if item.amount_usd < settings.PAYMENT_MIN_PER_ITEM_USD:
+            raise HTTPException(status_code=400, detail=f"分组 {item.group} 金额不能小于 ${settings.PAYMENT_MIN_PER_ITEM_USD}")
 
     total_usd = sum(item.amount_usd for item in req.items)
-    if total_usd < 1 or total_usd > 1000:
-        raise HTTPException(status_code=400, detail="总金额需在 $1 ~ $1000 之间")
+    if total_usd < settings.PAYMENT_MIN_TOTAL_USD or total_usd > settings.PAYMENT_MAX_TOTAL_USD:
+        raise HTTPException(status_code=400, detail=f"总金额需在 ${settings.PAYMENT_MIN_TOTAL_USD} ~ ${settings.PAYMENT_MAX_TOTAL_USD} 之间")
 
     import httpx
     import json

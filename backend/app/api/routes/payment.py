@@ -18,7 +18,6 @@ from app.models.token import TokenInventory, Order
 
 router = APIRouter()
 MIN_PAYMENT_CNY = 0.01
-MAX_PAYMENT_USD = 1000.00
 
 
 def _wechatpay_error(exc: Exception) -> HTTPException:
@@ -59,12 +58,12 @@ async def create_order(
         raise HTTPException(status_code=400, detail="至少选择一个分组")
 
     for item in req.items:
-        if item.amount_usd < 0.01:
-            raise HTTPException(status_code=400, detail=f"分组 {item.group} 金额不能小于 $0.01")
+        if item.amount_usd < settings.PAYMENT_MIN_PER_ITEM_USD:
+            raise HTTPException(status_code=400, detail=f"分组 {item.group} 金额不能小于 ${settings.PAYMENT_MIN_PER_ITEM_USD}")
 
     total_usd = sum(item.amount_usd for item in req.items)
-    if total_usd > MAX_PAYMENT_USD:
-        raise HTTPException(status_code=400, detail=f"总金额不能超过 ${MAX_PAYMENT_USD}")
+    if total_usd < settings.PAYMENT_MIN_TOTAL_USD or total_usd > settings.PAYMENT_MAX_TOTAL_USD:
+        raise HTTPException(status_code=400, detail=f"总金额需在 ${settings.PAYMENT_MIN_TOTAL_USD} ~ ${settings.PAYMENT_MAX_TOTAL_USD} 之间")
 
     rate = await _get_exchange_rate()
     amount_cny = round(total_usd * rate, 2)
@@ -275,4 +274,9 @@ async def get_packages(db: AsyncSession = Depends(get_db)):
     return {
         "exchange_rate": rate,
         "groups": [{"name": g.name, "description": g.description} for g in groups],
+        "limits": {
+            "min_total_usd": settings.PAYMENT_MIN_TOTAL_USD,
+            "max_total_usd": settings.PAYMENT_MAX_TOTAL_USD,
+            "min_per_item_usd": settings.PAYMENT_MIN_PER_ITEM_USD,
+        },
     }
