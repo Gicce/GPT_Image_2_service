@@ -41,9 +41,12 @@ async def _get_exchange_rate() -> float:
         return 7.25
 
 
-class CreateOrderRequest(BaseModel):
+class OrderItem(BaseModel):
     group: str
     amount_usd: float
+
+class CreateOrderRequest(BaseModel):
+    items: list[OrderItem]
 
 
 @router.post("/create_order")
@@ -52,20 +55,34 @@ async def create_order(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    rate = await _get_exchange_rate()
-    amount_cny = round(req.amount_usd * rate, 2)
-    if req.amount_usd <= 0 or req.amount_usd > MAX_PAYMENT_USD or amount_cny < MIN_PAYMENT_CNY:
-        raise HTTPException(status_code=400, detail="充值金额需不少于 ¥1，且不超过 $1000")
+    if not req.items:
+        raise HTTPException(status_code=400, detail="至少选择一个分组")
 
+    for item in req.items:
+        if item.amount_usd < 0.01:
+            raise HTTPException(status_code=400, detail=f"分组 {item.group} 金额不能小于 $0.01")
+
+    total_usd = sum(item.amount_usd for item in req.items)
+    if total_usd > MAX_PAYMENT_USD:
+        raise HTTPException(status_code=400, detail=f"总金额不能超过 ${MAX_PAYMENT_USD}")
+
+    rate = await _get_exchange_rate()
+    amount_cny = round(total_usd * rate, 2)
+    if amount_cny < MIN_PAYMENT_CNY:
+        raise HTTPException(status_code=400, detail="充值金额需不少于 ¥0.01")
+
+    groups = ",".join(item.group for item in req.items)
+    items_json = json.dumps([{"group": item.group, "amount_usd": item.amount_usd} for item in req.items])
     out_trade_no = f"CY{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
 
     order = Order(
         user_id=user.id,
         out_trade_no=out_trade_no,
-        group=req.group,
-        amount_usd=req.amount_usd,
+        group=groups,
+        amount_usd=total_usd,
         amount_cny=amount_cny,
         exchange_rate=rate,
+        items_json=items_json,
         pay_type="wxpay",
         status="pending",
     )
@@ -80,7 +97,7 @@ async def create_order(
             data={
                 "appid": settings.WECHAT_APPID,
                 "mchid": settings.WECHAT_MCHID,
-                "description": f"CyImagePro recharge {req.group}",
+                "description": f"CyImagePro recharge {groups}",
                 "out_trade_no": out_trade_no,
                 "notify_url": settings.WECHAT_NOTIFY_URL,
                 "amount": {"total": int(round(amount_cny * 100)), "currency": "CNY"},
@@ -98,10 +115,11 @@ async def create_order(
     return {
         "out_trade_no": out_trade_no,
         "code_url": result.get("code_url"),
-        "amount_usd": req.amount_usd,
+        "amount_usd": total_usd,
         "amount_cny": amount_cny,
         "exchange_rate": rate,
-        "group": req.group,
+        "group": groups,
+        "items": [{"group": item.group, "amount_usd": item.amount_usd} for item in req.items],
         "status": "pending",
     }
 
