@@ -70,14 +70,18 @@
     </n-modal>
 
     <!-- 创建订单 -->
-    <n-modal v-model:show="showCreate" preset="card" title="创建订单" style="width:420px">
+    <n-modal v-model:show="showCreate" preset="card" title="创建订单" style="width:520px">
       <n-form label-placement="left" label-width="80">
-        <n-form-item label="分组">
-          <n-select v-model:value="createForm.group" :options="groupOptions" placeholder="选择分组" />
-        </n-form-item>
-        <n-form-item label="金额(USD)">
-          <n-input-number v-model:value="createForm.amount_usd" :precision="2" :min="1" :max="1000" style="width:100%" />
-        </n-form-item>
+        <div v-for="(item, idx) in createForm.items" :key="idx" style="display:flex;gap:12px;align-items:center;margin-bottom:12px">
+          <n-select v-model:value="item.group" :options="groupOptions" placeholder="选择分组" style="width:160px" />
+          <n-input-number v-model:value="item.amount_usd" :precision="2" :min="0.01" :max="1000" placeholder="金额(USD)" style="width:140px" />
+          <n-button v-if="createForm.items.length > 1" quaternary type="error" size="small" @click="createForm.items.splice(idx, 1)">移除</n-button>
+        </div>
+        <n-button quaternary type="primary" size="small" @click="createForm.items.push({ group: '', amount_usd: 0 })">+ 添加分组</n-button>
+        <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--cy-border);display:flex;justify-content:space-between">
+          <span style="color:var(--cy-text-muted)">合计: ${{ totalUsd.toFixed(2) }}</span>
+          <span style="color:var(--cy-accent)">≈ ¥{{ totalCny.toFixed(2) }}</span>
+        </div>
       </n-form>
       <template #footer>
         <n-space justify="end">
@@ -123,9 +127,13 @@ const assignToken = ref('')
 const assigning = ref(false)
 
 const showCreate = ref(false)
-const createForm = ref({ group: '', amount_usd: 10 })
+const createForm = ref({ items: [{ group: '', amount_usd: 0 }] })
 const creating = ref(false)
 const groupOptions = ref([])
+const exchangeRate = ref(7.25)
+
+const totalUsd = computed(() => createForm.value.items.reduce((sum, i) => sum + (i.amount_usd || 0), 0))
+const totalCny = computed(() => Math.round(totalUsd.value * exchangeRate.value * 100) / 100)
 
 const showQrcode = ref(false)
 const qrcodeOrder = ref({})
@@ -158,7 +166,7 @@ const filtered = computed(() => {
 const columns = [
   { title: '订单号', key: 'out_trade_no', width: 180, ellipsis: true },
   { title: '用户', key: 'username', width: 100 },
-  { title: '分组', key: 'group', width: 80,
+  { title: '分组', key: 'group', width: 120,
     render: row => h(NTag, { size: 'small', bordered: false }, { default: () => row.group }) },
   { title: '金额(USD)', key: 'amount_usd', width: 90,
     render: row => `$${Number(row.amount_usd).toFixed(2)}` },
@@ -223,20 +231,27 @@ async function submitAssign() {
 
 async function openCreateOrder() {
   try {
-    const { data } = await http.get('/api/admin/groups')
-    groupOptions.value = data.map(g => ({ label: g.name, value: g.name }))
-    if (groupOptions.value.length && !createForm.value.group) {
-      createForm.value.group = groupOptions.value[0].value
+    const [groupsRes, packagesRes] = await Promise.all([
+      http.get('/api/admin/groups'),
+      http.get('/api/pay/packages')
+    ])
+    groupOptions.value = groupsRes.data.map(g => ({ label: g.name, value: g.name }))
+    if (packagesRes.data.exchange_rate) {
+      exchangeRate.value = packagesRes.data.exchange_rate
+    }
+    if (groupOptions.value.length) {
+      createForm.value.items = [{ group: groupOptions.value[0].value, amount_usd: 0 }]
     }
   } catch {}
   showCreate.value = true
 }
 
 async function submitCreateOrder() {
-  if (!createForm.value.group) return message.warning('请选择分组')
+  const validItems = createForm.value.items.filter(i => i.group && i.amount_usd > 0)
+  if (!validItems.length) return message.warning('请至少填写一个分组的金额')
   creating.value = true
   try {
-    const { data } = await http.post('/api/admin/orders/create', createForm.value)
+    const { data } = await http.post('/api/admin/orders/create', { items: validItems })
     showCreate.value = false
     qrcodeOrder.value = data
     showQrcode.value = true

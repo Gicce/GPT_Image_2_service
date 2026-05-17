@@ -435,6 +435,8 @@ class AssignTokenRequest(BaseModel):
 
 @router.post("/orders/{order_id}/assign")
 async def assign_order_token(order_id: str, req: AssignTokenRequest, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    import json as _json
+
     result = await db.execute(select(Order).where(Order.id == order_id))
     order = result.scalar_one_or_none()
     if not order:
@@ -445,35 +447,54 @@ async def assign_order_token(order_id: str, req: AssignTokenRequest, _=Depends(g
         raise HTTPException(status_code=400, detail="订单已分配 Token")
 
     now = datetime.now(timezone.utc)
-    token = TokenInventory(
-        id=str(uuid.uuid4()),
-        token_value=req.token_value.strip(),
-        group=order.group,
-        is_trial=False,
-        is_assigned=True,
-        assigned_to=order.user_id,
-        assigned_at=now,
-    )
-    db.add(token)
-    await db.flush()
 
-    order.token_id = token.id
-
-    ut_result = await db.execute(
-        select(UserToken).where(UserToken.user_id == order.user_id, UserToken.group == order.group)
-    )
-    ut = ut_result.scalar_one_or_none()
-    if ut:
-        ut.balance_usd = float(ut.balance_usd) + float(order.amount_usd)
+    # Parse items_json for merged orders, or fall back to single-group order
+    items = []
+    if order.items_json:
+        items = _json.loads(order.items_json)
     else:
-        ut = UserToken(
+        items = [{"group": order.group, "amount_usd": float(order.amount_usd)}]
+
+    # Create one TokenInventory entry per group
+    first_token_id = None
+    for item in items:
+        token = TokenInventory(
             id=str(uuid.uuid4()),
-            user_id=order.user_id,
-            token_id=token.id,
-            group=order.group,
-            balance_usd=float(order.amount_usd),
+            token_value=req.token_value.strip(),
+            group=item["group"],
+            is_trial=False,
+            is_assigned=True,
+            assigned_to=order.user_id,
+            assigned_at=now,
         )
-        db.add(ut)
+        db.add(token)
+        await db.flush()
+
+        if first_token_id is None:
+            first_token_id = token.id
+
+        ut_result = await db.execute(
+            select(UserToken).where(UserToken.user_id == order.user_id, UserToken.group == item["group"])
+        )
+        ut = ut_result.scalar_one_or_none()
+        if ut:
+            ut.balance_usd = float(ut.balance_usd) + item["amount_usd"]
+            # Update the token reference to the new one
+            tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
+            old_tok = tok_result.scalar_one_or_none()
+            if old_tok:
+                old_tok.token_value = req.token_value.strip()
+        else:
+            ut = UserToken(
+                id=str(uuid.uuid4()),
+                user_id=order.user_id,
+                token_id=token.id,
+                group=item["group"],
+                balance_usd=item["amount_usd"],
+            )
+            db.add(ut)
+
+    order.token_id = first_token_id
 
     user_result = await db.execute(select(User).where(User.id == order.user_id))
     u = user_result.scalar_one_or_none()
@@ -524,18 +545,30 @@ async def delete_order(order_id: str, _=Depends(get_admin_user), db: AsyncSessio
     return {"ok": True}
 
 
-class AdminCreateOrderRequest(BaseModel):
+class OrderItem(BaseModel):
     group: str
     amount_usd: float
+
+class AdminCreateOrderRequest(BaseModel):
+    items: list[OrderItem]
     user_id: Optional[str] = None
 
 
 @router.post("/orders/create")
 async def admin_create_order(req: AdminCreateOrderRequest, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    if req.amount_usd < 1 or req.amount_usd > 1000:
-        raise HTTPException(status_code=400, detail="金额需在 $1 ~ $1000 之间")
+    if not req.items:
+        raise HTTPException(status_code=400, detail="至少选择一个分组")
+
+    for item in req.items:
+        if item.amount_usd < 0.01:
+            raise HTTPException(status_code=400, detail=f"分组 {item.group} 金额不能小于 $0.01")
+
+    total_usd = sum(item.amount_usd for item in req.items)
+    if total_usd < 1 or total_usd > 1000:
+        raise HTTPException(status_code=400, detail="总金额需在 $1 ~ $1000 之间")
 
     import httpx
+    import json
     from app.core.wechatpay import get_wxpay
 
     user_id = req.user_id
@@ -560,16 +593,19 @@ async def admin_create_order(req: AdminCreateOrderRequest, _=Depends(get_admin_u
         except Exception:
             rate = 7.25
 
-    amount_cny = round(req.amount_usd * rate, 2)
+    amount_cny = round(total_usd * rate, 2)
     out_trade_no = f"CY{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+    groups = ",".join(item.group for item in req.items)
+    items_json = json.dumps([{"group": item.group, "amount_usd": item.amount_usd} for item in req.items])
 
     order = Order(
         user_id=user_id,
         out_trade_no=out_trade_no,
-        group=req.group,
-        amount_usd=req.amount_usd,
+        group=groups,
+        amount_usd=total_usd,
         amount_cny=amount_cny,
         exchange_rate=rate,
+        items_json=items_json,
         pay_type="wxpay",
         status="pending",
     )
@@ -580,9 +616,9 @@ async def admin_create_order(req: AdminCreateOrderRequest, _=Depends(get_admin_u
     from datetime import timedelta
     time_expire = (datetime.now(timezone(timedelta(hours=8))) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S+08:00")
     code, result = await wxpay.pay(
-        description=f"CyImagePro充值-{req.group}",
+        description=f"CyImagePro充值-{groups}",
         out_trade_no=out_trade_no,
-        amount={"total": int(amount_cny * 100), "currency": "CNY"},
+        amount={"total": int(round(amount_cny * 100)), "currency": "CNY"},
         time_expire=time_expire,
     )
 
@@ -592,10 +628,11 @@ async def admin_create_order(req: AdminCreateOrderRequest, _=Depends(get_admin_u
     return {
         "out_trade_no": out_trade_no,
         "code_url": result.get("code_url"),
-        "amount_usd": req.amount_usd,
+        "amount_usd": total_usd,
         "amount_cny": amount_cny,
         "exchange_rate": rate,
-        "group": req.group,
+        "group": groups,
+        "items": [{"group": item.group, "amount_usd": item.amount_usd} for item in req.items],
         "status": "pending",
     }
 

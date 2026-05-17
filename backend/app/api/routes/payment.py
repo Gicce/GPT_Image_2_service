@@ -17,7 +17,7 @@ from app.models.user import User, UserToken
 from app.models.token import TokenInventory, Order
 
 router = APIRouter()
-MIN_PAYMENT_CNY = 1.00
+MIN_PAYMENT_CNY = 0.01
 MAX_PAYMENT_USD = 1000.00
 
 
@@ -229,7 +229,7 @@ async def refund_order(
         raise HTTPException(status_code=400, detail="只能退款已支付订单")
 
     out_refund_no = f"RF{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
-    total_fee = int(float(order.amount_cny) * 100)
+    total_fee = int(round(float(order.amount_cny) * 100))
 
     code, wx_result = await wechatpay_request(
         "/v3/refund/domestic/refunds",

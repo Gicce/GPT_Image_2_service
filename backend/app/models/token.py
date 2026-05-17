@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, DateTime, Boolean, Numeric, Integer, ForeignKey, Text
+from sqlalchemy import String, DateTime, Boolean, Numeric, Integer, ForeignKey, Text, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
@@ -29,10 +29,11 @@ class Order(Base):
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     out_trade_no: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     trade_no: Mapped[str] = mapped_column(String(64), nullable=True)
-    group: Mapped[str] = mapped_column(String(32), nullable=False)
+    group: Mapped[str] = mapped_column(String(128), nullable=False)
     amount_usd: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     amount_cny: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     exchange_rate: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False)
+    items_json: Mapped[str] = mapped_column(Text, nullable=True)
     pay_type: Mapped[str] = mapped_column(String(16), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="pending")
     token_id: Mapped[str] = mapped_column(String(36), nullable=True)
