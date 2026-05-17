@@ -20,13 +20,12 @@ async def get_models(
     )
     models = result.scalars().all()
 
+    user_groups: set = set()
     if user:
         ut_result = await db.execute(
             select(UserToken.group).where(UserToken.user_id == user.id)
         )
         user_groups = {r[0] for r in ut_result.all()}
-        if user_groups:
-            models = [m for m in models if m.group in user_groups]
 
     return [
         {
@@ -38,6 +37,7 @@ async def get_models(
             "model_type": m.model_type,
             "trial_allowed": m.trial_allowed,
             "group": m.group,
+            "user_has_access": m.group in user_groups if user_groups else False,
         }
         for m in models
     ]
