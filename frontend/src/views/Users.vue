@@ -1,11 +1,13 @@
 <template>
   <div>
-    <n-h2>用户列表</n-h2>
-    <div style="display:flex;gap:12px;margin-bottom:16px">
+    <div class="page-header">
+      <h2 class="page-header-title">用户列表</h2>
+    </div>
+    <div class="filter-bar">
       <n-select v-model:value="filterType" :options="typeOptions" clearable placeholder="筛选类型" style="width:160px" />
       <n-input v-model:value="search" placeholder="搜索用户名 / 邮箱" style="width:260px" clearable />
     </div>
-    <n-data-table :columns="columns" :data="filtered" :pagination="{ pageSize: 20 }" :row-key="row => row.id" />
+    <n-data-table :columns="columns" :data="filtered" :pagination="{ pageSize: 20 }" :row-key="row => row.id" :bordered="false" />
 
     <!-- 查看用户详情 -->
     <n-modal v-model:show="showDetail" preset="card" title="用户详情" style="width:660px">
@@ -14,10 +16,10 @@
           <n-descriptions-item label="用户名">{{ detailUser.username }}</n-descriptions-item>
           <n-descriptions-item label="邮箱">{{ detailUser.email }}</n-descriptions-item>
           <n-descriptions-item label="类型">
-            <n-tag :type="typeTag[detailUser.account_type] || 'default'" size="small">{{ typeLabel[detailUser.account_type] || detailUser.account_type }}</n-tag>
+            <n-tag :type="typeTag[detailUser.account_type] || 'default'" size="small" bordered="false">{{ typeLabel[detailUser.account_type] || detailUser.account_type }}</n-tag>
           </n-descriptions-item>
           <n-descriptions-item label="状态">
-            <n-tag :type="detailUser.is_active ? 'success' : 'error'" size="small">{{ detailUser.is_active ? '正常' : '禁用' }}</n-tag>
+            <n-tag :type="detailUser.is_active ? 'success' : 'error'" size="small" bordered="false">{{ detailUser.is_active ? '正常' : '禁用' }}</n-tag>
           </n-descriptions-item>
           <n-descriptions-item label="注册时间">{{ formatTime(detailUser.created_at) }}</n-descriptions-item>
           <n-descriptions-item label="试用到期">{{ detailUser.trial_expires_at ? formatTime(detailUser.trial_expires_at) : '-' }}</n-descriptions-item>
@@ -26,18 +28,17 @@
         <n-divider style="margin:16px 0 12px">Token & 余额</n-divider>
         <n-grid :cols="2" :x-gap="12" :y-gap="12">
           <n-gi v-for="t in (detailUser.tokens || [])" :key="t.group">
-            <n-card size="small" :bordered="true">
-              <n-statistic :label="t.group + (t.is_trial ? ' (试用)' : '')">
-                <template #prefix>$</template>
-                {{ Number(t.balance_usd).toFixed(4) }}
-              </n-statistic>
-              <div v-if="t.api_token" style="margin-top:8px;font-size:12px;color:#666">
+            <div class="stat-card">
+              <div class="stat-card-accent" style="background:linear-gradient(90deg,#00d4aa,#00d4aa00)"></div>
+              <div class="stat-card-label">{{ t.group }}{{ t.is_trial ? ' (试用)' : '' }}</div>
+              <div class="stat-card-value" style="font-size:22px">${{ Number(t.balance_usd).toFixed(4) }}</div>
+              <div v-if="t.api_token" style="margin-top:8px">
                 <n-input-group style="margin-top:4px">
-                  <n-input :value="t.api_token" readonly size="small" style="font-family:monospace;font-size:12px" />
+                  <n-input :value="t.api_token" readonly size="small" style="font-family:var(--cy-font-mono);font-size:12px" />
                   <n-button size="small" type="primary" @click="copyToken(t.api_token)">复制</n-button>
                 </n-input-group>
               </div>
-            </n-card>
+            </div>
           </n-gi>
           <n-gi v-if="!(detailUser.tokens && detailUser.tokens.length)">
             <n-empty description="暂无 Token" size="small" />
@@ -45,7 +46,7 @@
         </n-grid>
 
         <n-divider style="margin:16px 0 12px">最近用量</n-divider>
-        <n-data-table v-if="detailUser.usage_logs && detailUser.usage_logs.length" :columns="usageColumns" :data="detailUser.usage_logs" :pagination="{ pageSize: 10 }" size="small" :max-height="240" />
+        <n-data-table v-if="detailUser.usage_logs && detailUser.usage_logs.length" :columns="usageColumns" :data="detailUser.usage_logs" :pagination="{ pageSize: 10 }" size="small" :max-height="240" :bordered="false" />
         <n-empty v-else description="暂无用量记录" size="small" />
       </template>
     </n-modal>
@@ -68,11 +69,11 @@
       </n-form>
       <n-divider style="margin:12px 0">Token 管理</n-divider>
       <div v-for="t in editTokens" :key="t.group" style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
-        <n-tag size="small">{{ t.group }}</n-tag>
-        <span style="font-family:monospace;font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ t.api_token || '-' }}</span>
-        <span style="white-space:nowrap">${{ Number(t.balance_usd).toFixed(2) }}</span>
-        <n-button size="tiny" type="warning" @click="openTokenEdit(t)">编辑</n-button>
-        <n-button size="tiny" type="error" @click="deleteToken(t)">删除</n-button>
+        <n-tag size="small" bordered="false">{{ t.group }}</n-tag>
+        <span style="font-family:var(--cy-font-mono);font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--cy-text-muted)">{{ t.api_token || '-' }}</span>
+        <span style="white-space:nowrap;color:var(--cy-accent);font-family:var(--cy-font-mono)">${{ Number(t.balance_usd).toFixed(2) }}</span>
+        <n-button size="tiny" quaternary type="warning" @click="openTokenEdit(t)">编辑</n-button>
+        <n-button size="tiny" quaternary type="error" @click="deleteToken(t)">删除</n-button>
       </div>
       <n-empty v-if="!editTokens.length" description="暂无 Token" size="small" style="margin:8px 0" />
       <n-button size="small" dashed @click="openTokenAdd">+ 添加分组 Token</n-button>
@@ -172,19 +173,19 @@ const columns = [
   { title: '用户名', key: 'username', width: 140 },
   { title: '邮箱', key: 'email', width: 200 },
   { title: '类型', key: 'account_type', width: 80,
-    render: row => h(NTag, { type: typeTag[row.account_type] || 'default', size: 'small' },
+    render: row => h(NTag, { type: typeTag[row.account_type] || 'default', size: 'small', bordered: false },
       { default: () => typeLabel[row.account_type] || row.account_type }) },
   { title: '余额', key: 'tokens', width: 160,
     render: row => {
       const tokens = row.tokens || []
-      if (!tokens.length) return '-'
+      if (!tokens.length) return h('span', { style: 'color:var(--cy-text-dim)' }, '-')
       return h('div', null, tokens.map(t =>
-        h('span', { style: 'margin-right:8px' }, `${t.group}: $${Number(t.balance_usd).toFixed(2)}`)
+        h('span', { style: 'margin-right:8px;font-family:var(--cy-font-mono);font-size:12px' }, `${t.group}: $${Number(t.balance_usd).toFixed(2)}`)
       ))
     }
   },
   { title: '状态', key: 'is_active', width: 80,
-    render: row => h(NTag, { type: row.is_active ? 'success' : 'error', size: 'small' },
+    render: row => h(NTag, { type: row.is_active ? 'success' : 'error', size: 'small', bordered: false },
       { default: () => row.is_active ? '正常' : '禁用' }) },
   { title: '注册时间', key: 'created_at', width: 160,
     render: row => row.created_at?.replace('T', ' ').slice(0, 19) },

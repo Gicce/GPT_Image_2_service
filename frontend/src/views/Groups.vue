@@ -1,8 +1,10 @@
 <template>
   <div>
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-      <h2 style="margin:0">分组管理</h2>
-      <n-button type="primary" @click="openCreate">添加分组</n-button>
+    <div class="page-header">
+      <h2 class="page-header-title">分组管理</h2>
+      <div class="page-header-actions">
+        <n-button type="primary" @click="openCreate">添加分组</n-button>
+      </div>
     </div>
     <n-data-table :columns="columns" :data="groups" :bordered="false" />
     <n-modal v-model:show="showModal" preset="card" :title="editId ? '编辑分组' : '添加分组'" style="width:420px">
@@ -47,10 +49,10 @@ const columns = [
   { title: '排序', key: 'sort_order', width: 70 },
   {
     title: '操作', key: 'actions', width: 140,
-    render: row => h(NSpace, null, {
+    render: row => h(NSpace, { size: 'small' }, {
       default: () => [
-        h(NButton, { size: 'small', onClick: () => openEdit(row) }, { default: () => '编辑' }),
-        h(NButton, { size: 'small', type: 'error', onClick: () => del(row.id) }, { default: () => '删除' }),
+        h(NButton, { size: 'small', quaternary: true, onClick: () => openEdit(row) }, { default: () => '编辑' }),
+        h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => del(row.id) }, { default: () => '删除' }),
       ]
     })
   }

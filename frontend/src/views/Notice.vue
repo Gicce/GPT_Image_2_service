@@ -1,12 +1,16 @@
 <template>
   <div>
-    <n-h2>通知栏</n-h2>
-    <n-card>
+    <div class="page-header">
+      <h2 class="page-header-title">通知栏</h2>
+    </div>
+    <n-card :bordered="false" class="form-card">
       <n-form-item label="通知内容（留空则不显示跑马灯）">
         <n-input v-model:value="content" type="textarea" :rows="4" placeholder="输入要广播给所有客户端的通知文字..." />
       </n-form-item>
-      <n-button type="primary" :loading="loading" @click="save">保存并推送</n-button>
-      <n-text depth="3" style="margin-left:12px;font-size:12px">客户端每 3 分钟自动拉取一次</n-text>
+      <div class="notice-footer">
+        <n-button type="primary" :loading="loading" @click="save">保存并推送</n-button>
+        <span class="notice-hint">客户端每 3 分钟自动拉取一次</span>
+      </div>
     </n-card>
   </div>
 </template>
@@ -37,3 +41,24 @@ async function save() {
   }
 }
 </script>
+
+<style scoped>
+.form-card {
+  background: var(--cy-bg-elevated) !important;
+  border: 1px solid var(--cy-border) !important;
+  border-radius: 10px !important;
+}
+.form-card :deep(.n-card__content) {
+  padding: 24px !important;
+}
+.notice-footer {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 4px;
+}
+.notice-hint {
+  font-size: 12px;
+  color: var(--cy-text-dim);
+}
+</style>

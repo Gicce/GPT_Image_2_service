@@ -1,12 +1,19 @@
 <template>
   <div>
-    <n-h2>试用 Token 管理</n-h2>
+    <div class="page-header">
+      <h2 class="page-header-title">试用 Token 管理</h2>
+    </div>
 
-    <n-card title="sora 试用 Token 库存" style="margin-bottom:24px">
-      <n-statistic :value="trialCount" label="可用试用 Token" />
-    </n-card>
+    <div class="stat-card" style="margin-bottom:20px">
+      <div class="stat-card-accent" style="background:linear-gradient(90deg,#00d4aa,#00d4aa00)"></div>
+      <div class="stat-card-label">sora 试用 Token 可用库存</div>
+      <div class="stat-card-value">{{ trialCount }}</div>
+    </div>
 
-    <n-card title="批量录入试用 Token">
+    <n-card :bordered="false" class="form-card">
+      <div class="form-card-header">
+        <h3 class="form-card-title">批量录入试用 Token</h3>
+      </div>
       <n-form-item label="Token 列表（每行一条）">
         <n-input v-model:value="tokensRaw" type="textarea" :rows="8" placeholder="每行粘贴一条，支持 '名称 sk-xxx' 格式，自动提取 sk- 开头的 Token" />
       </n-form-item>
@@ -52,3 +59,22 @@ async function submit() {
 
 onMounted(loadStock)
 </script>
+
+<style scoped>
+.form-card {
+  background: var(--cy-bg-elevated) !important;
+  border: 1px solid var(--cy-border) !important;
+  border-radius: 10px !important;
+}
+.form-card :deep(.n-card__content) {
+  padding: 24px !important;
+}
+.form-card-header {
+  margin-bottom: 20px;
+}
+.form-card-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--cy-text);
+}
+</style>

@@ -1,11 +1,15 @@
 <template>
   <div>
-    <n-h2>概览</n-h2>
-    <n-grid :cols="5" :x-gap="16" :y-gap="16">
-      <n-gi v-for="s in stats" :key="s.label">
-        <n-card>
-          <n-statistic :label="s.label" :value="s.value" />
-        </n-card>
+    <div class="page-header">
+      <h2 class="page-header-title">概览</h2>
+    </div>
+    <n-grid :cols="5" :x-gap="16" :y-gap="16" responsive="screen" item-responsive>
+      <n-gi v-for="(s, i) in stats" :key="s.label" span="0:5 800:1">
+        <div class="stat-card">
+          <div class="stat-card-accent" :style="{ background: accentColors[i] }"></div>
+          <div class="stat-card-label">{{ s.label }}</div>
+          <div class="stat-card-value">{{ s.value }}</div>
+        </div>
       </n-gi>
     </n-grid>
   </div>
@@ -15,9 +19,17 @@
 import { ref, onMounted } from 'vue'
 import http from '../api/http'
 
+const accentColors = [
+  'linear-gradient(90deg, #00d4aa, #00d4aa00)',
+  'linear-gradient(90deg, #6366f1, #6366f100)',
+  'linear-gradient(90deg, #f59e0b, #f59e0b00)',
+  'linear-gradient(90deg, #3b82f6, #3b82f600)',
+  'linear-gradient(90deg, #ec4899, #ec489900)',
+]
+
 const stats = ref([
   { label: '用户总数', value: '-' },
-  { label: '今日订单', value: '-' },
+  { label: '今日成功订单', value: '-' },
   { label: '图片 Token 库存', value: '-' },
   { label: '对话 Token 库存', value: '-' },
   { label: '试用 Token 库存', value: '-' },

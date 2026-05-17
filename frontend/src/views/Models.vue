@@ -1,8 +1,12 @@
 <template>
   <div>
-    <n-h2>模型管理</n-h2>
-    <n-button type="primary" style="margin-bottom:16px" @click="openCreate">+ 新增模型</n-button>
-    <n-data-table :columns="columns" :data="models" :pagination="{ pageSize: 20 }" />
+    <div class="page-header">
+      <h2 class="page-header-title">模型管理</h2>
+      <div class="page-header-actions">
+        <n-button type="primary" @click="openCreate">+ 新增模型</n-button>
+      </div>
+    </div>
+    <n-data-table :columns="columns" :data="models" :pagination="{ pageSize: 20 }" :bordered="false" />
 
     <n-modal v-model:show="showModal" :title="editId ? '编辑模型' : '新增模型'" preset="card" style="width:640px">
       <n-form :model="form" label-placement="top">
@@ -124,19 +128,19 @@ const columns = [
   { title: '模型', key: 'name', width: 120 },
   { title: '显示名', key: 'display_name', width: 130 },
   { title: '分组', key: 'group', width: 100,
-    render: row => h(NTag, { size: 'small' }, { default: () => row.group }) },
+    render: row => h(NTag, { size: 'small', bordered: false }, { default: () => row.group }) },
   { title: '计费', key: 'billing_type', width: 70,
     render: row => row.billing_type === 'per_call' ? '按次' : '按量' },
   { title: '启用', key: 'is_enabled', width: 55,
-    render: row => h(NTag, { type: row.is_enabled ? 'success' : 'default', size: 'small' },
+    render: row => h(NTag, { type: row.is_enabled ? 'success' : 'default', size: 'small', bordered: false },
       { default: () => row.is_enabled ? '是' : '否' }) },
   { title: '排序', key: 'sort_order', width: 50 },
   {
     title: '操作', key: 'actions', width: 120,
-    render: row => h(NSpace, null, {
+    render: row => h(NSpace, { size: 'small' }, {
       default: () => [
-        h(NButton, { size: 'small', onClick: () => openEdit(row) }, { default: () => '编辑' }),
-        h(NButton, { size: 'small', type: 'error', onClick: () => del(row.id) }, { default: () => '删除' }),
+        h(NButton, { size: 'small', quaternary: true, onClick: () => openEdit(row) }, { default: () => '编辑' }),
+        h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => del(row.id) }, { default: () => '删除' }),
       ]
     })
   }

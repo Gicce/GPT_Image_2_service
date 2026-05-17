@@ -1,11 +1,13 @@
 <template>
   <div>
-    <n-h2>提示词库</n-h2>
-    <div style="display:flex;gap:12px;margin-bottom:16px">
-      <n-select v-model:value="filterCat" :options="catOptions" clearable placeholder="筛选分类" style="width:200px" />
-      <n-button type="primary" @click="openCreate">+ 新增提示词</n-button>
+    <div class="page-header">
+      <h2 class="page-header-title">提示词库</h2>
+      <div class="page-header-actions">
+        <n-select v-model:value="filterCat" :options="catOptions" clearable placeholder="筛选分类" style="width:200px" />
+        <n-button type="primary" @click="openCreate">+ 新增提示词</n-button>
+      </div>
     </div>
-    <n-data-table :columns="columns" :data="filtered" :pagination="{ pageSize: 20 }" />
+    <n-data-table :columns="columns" :data="filtered" :pagination="{ pageSize: 20 }" :bordered="false" />
 
     <n-modal v-model:show="showModal" :title="editId ? '编辑提示词' : '新增提示词'" preset="card" style="width:560px">
       <n-form :model="form" label-placement="top">
@@ -53,16 +55,17 @@ const filtered = computed(() =>
 )
 
 const columns = [
-  { title: '分类', key: 'category', width: 120 },
+  { title: '分类', key: 'category', width: 120,
+    render: row => h(NTag, { size: 'small', bordered: false }, { default: () => row.category }) },
   { title: '标题', key: 'title', width: 160 },
   { title: '内容', key: 'content', ellipsis: { tooltip: true } },
   { title: '排序', key: 'sort_order', width: 60 },
   {
     title: '操作', key: 'actions', width: 120,
-    render: row => h(NSpace, null, {
+    render: row => h(NSpace, { size: 'small' }, {
       default: () => [
-        h(NButton, { size: 'small', onClick: () => openEdit(row) }, { default: () => '编辑' }),
-        h(NButton, { size: 'small', type: 'error', onClick: () => del(row.id) }, { default: () => '删除' }),
+        h(NButton, { size: 'small', quaternary: true, onClick: () => openEdit(row) }, { default: () => '编辑' }),
+        h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => del(row.id) }, { default: () => '删除' }),
       ]
     })
   }
