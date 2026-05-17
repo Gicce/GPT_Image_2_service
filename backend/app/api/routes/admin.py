@@ -908,6 +908,9 @@ async def update_config(req: ConfigUpdateRequest, _=Depends(get_admin_user)):
 
     if updated_keys:
         from app.core.config import Settings
+        # Clear env vars so Settings reads from the updated .env file
+        for key in updated_keys:
+            os.environ.pop(key, None)
         new_settings = Settings()
         for field in new_settings.model_fields:
             setattr(settings, field, getattr(new_settings, field))
