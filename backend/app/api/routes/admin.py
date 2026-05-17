@@ -685,21 +685,30 @@ async def add_or_update_user_token(user_id: str, req: UserTokenInput, _=Depends(
             tok.token_value = req.token_value.strip()
         ut.balance_usd = req.balance_usd
     else:
-        token = TokenInventory(
-            id=str(uuid.uuid4()),
-            token_value=req.token_value.strip(),
-            group=req.group,
-            is_trial=False,
-            is_assigned=True,
-            assigned_to=user_id,
-            assigned_at=now,
+        # Check if TokenInventory already exists for this token_value + group
+        existing_tok = await db.execute(
+            select(TokenInventory).where(
+                TokenInventory.token_value == req.token_value.strip(),
+                TokenInventory.group == req.group,
+            )
         )
-        db.add(token)
-        await db.flush()
+        tok = existing_tok.scalar_one_or_none()
+        if not tok:
+            tok = TokenInventory(
+                id=str(uuid.uuid4()),
+                token_value=req.token_value.strip(),
+                group=req.group,
+                is_trial=False,
+                is_assigned=True,
+                assigned_to=user_id,
+                assigned_at=now,
+            )
+            db.add(tok)
+            await db.flush()
         ut = UserToken(
             id=str(uuid.uuid4()),
             user_id=user_id,
-            token_id=token.id,
+            token_id=tok.id,
             group=req.group,
             balance_usd=req.balance_usd,
         )

@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, DateTime, Boolean, Numeric, Integer, ForeignKey, Text, JSON
+from sqlalchemy import String, DateTime, Boolean, Numeric, Integer, ForeignKey, Text, JSON, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
@@ -13,13 +13,15 @@ class TokenInventory(Base):
     __tablename__ = "token_inventory"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    token_value: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    token_value: Mapped[str] = mapped_column(String(512), nullable=False)
     group: Mapped[str] = mapped_column(String(32), nullable=False)
     is_trial: Mapped[bool] = mapped_column(Boolean, default=False)
     is_assigned: Mapped[bool] = mapped_column(Boolean, default=False)
     assigned_to: Mapped[str] = mapped_column(String(36), nullable=True)
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (UniqueConstraint('token_value', 'group', name='uq_token_value_group'),)
 
 
 class Order(Base):
