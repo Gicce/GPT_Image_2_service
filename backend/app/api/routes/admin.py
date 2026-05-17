@@ -747,3 +747,187 @@ async def change_admin_password(req: PasswordChange, _=Depends(get_admin_user)):
     # Update in-memory settings (persists until restart; for permanent change use .env)
     settings.ADMIN_PASSWORD = req.new_password
     return {"ok": True, "note": "重启后失效，如需永久修改请更新 .env 文件中的 ADMIN_PASSWORD"}
+
+
+# ── System Config (.env) ─────────────────────────────────────────
+
+import os
+
+SENSITIVE_KEYS = {"SECRET_KEY", "ADMIN_PASSWORD", "POSTGRES_PASSWORD", "WECHAT_APIV3_KEY", "SMTP_PASSWORD"}
+MASK = "********"
+
+CONFIG_CATEGORIES = [
+    {
+        "label": "数据库",
+        "icon": "database",
+        "keys": ["POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"],
+        "descriptions": {"POSTGRES_DB": "数据库名", "POSTGRES_USER": "数据库用户", "POSTGRES_PASSWORD": "数据库密码"},
+    },
+    {
+        "label": "认证与安全",
+        "icon": "security",
+        "keys": ["SECRET_KEY", "ADMIN_USERNAME", "ADMIN_PASSWORD"],
+        "descriptions": {"SECRET_KEY": "JWT 密钥", "ADMIN_USERNAME": "管理员用户名", "ADMIN_PASSWORD": "管理员密码"},
+    },
+    {
+        "label": "微信支付",
+        "icon": "wechat",
+        "keys": ["WECHAT_MCHID", "WECHAT_APPID", "WECHAT_APIV3_KEY", "WECHAT_CERT_SERIAL_NO",
+                 "WECHAT_PRIVATE_KEY_PATH", "WECHAT_PUBLIC_KEY_PATH", "WECHAT_PUBLIC_KEY_ID",
+                 "WECHAT_NOTIFY_URL"],
+        "descriptions": {"WECHAT_MCHID": "商户号", "WECHAT_APPID": "应用 ID", "WECHAT_APIV3_KEY": "APIv3 密钥",
+                         "WECHAT_CERT_SERIAL_NO": "证书序列号", "WECHAT_PRIVATE_KEY_PATH": "私钥路径",
+                         "WECHAT_PUBLIC_KEY_PATH": "公钥路径", "WECHAT_PUBLIC_KEY_ID": "公钥 ID",
+                         "WECHAT_NOTIFY_URL": "支付回调 URL"},
+    },
+    {
+        "label": "邮件服务 (SMTP)",
+        "icon": "smtp",
+        "keys": ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM_NAME", "SMTP_USE_SSL"],
+        "descriptions": {"SMTP_HOST": "SMTP 服务器", "SMTP_PORT": "端口", "SMTP_USER": "发件邮箱",
+                         "SMTP_PASSWORD": "授权码/密码", "SMTP_FROM_NAME": "发件人名称", "SMTP_USE_SSL": "使用 SSL"},
+    },
+    {
+        "label": "支付限额",
+        "icon": "payment",
+        "keys": ["PAYMENT_MIN_TOTAL_USD", "PAYMENT_MAX_TOTAL_USD", "PAYMENT_MIN_PER_ITEM_USD"],
+        "descriptions": {"PAYMENT_MIN_TOTAL_USD": "最低总金额 ($)", "PAYMENT_MAX_TOTAL_USD": "最高总金额 ($)",
+                         "PAYMENT_MIN_PER_ITEM_USD": "单项最低金额 ($)"},
+    },
+    {
+        "label": "服务器",
+        "icon": "server",
+        "keys": ["SERVER_BASE_URL", "EXCHANGE_RATE_API"],
+        "descriptions": {"SERVER_BASE_URL": "服务器地址", "EXCHANGE_RATE_API": "汇率 API"},
+    },
+]
+
+
+def _infer_field_type(key: str) -> str:
+    if key in SENSITIVE_KEYS:
+        return "password"
+    if key.endswith("_USE_SSL"):
+        return "boolean"
+    if any(kw in key for kw in ("PORT", "MIN", "MAX", "EXPIRE")):
+        return "number"
+    return "text"
+
+
+def _parse_env_file(path: str) -> list[dict]:
+    lines = []
+    if not os.path.exists(path):
+        return lines
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n").rstrip("\r")
+            stripped = line.strip()
+            if not stripped:
+                lines.append({"type": "blank"})
+            elif stripped.startswith("#"):
+                lines.append({"type": "comment", "raw": line})
+            elif "=" in stripped:
+                key, _, value = stripped.partition("=")
+                lines.append({"type": "kv", "key": key.strip(), "value": value, "raw": line})
+            else:
+                lines.append({"type": "comment", "raw": line})
+    return lines
+
+
+def _write_env_file(path: str, parsed: list[dict], updates: dict[str, str]) -> list[str]:
+    updated_keys = []
+    existing_keys = set()
+    for entry in parsed:
+        if entry["type"] == "kv":
+            existing_keys.add(entry["key"])
+            if entry["key"] in updates and updates[entry["key"]] != MASK:
+                old_val = entry["value"]
+                entry["value"] = updates[entry["key"]]
+                entry["raw"] = f"{entry['key']}={entry['value']}"
+                if old_val != entry["value"]:
+                    updated_keys.append(entry["key"])
+    for key in updates:
+        if key not in existing_keys and updates[key] != MASK:
+            parsed.append({"type": "kv", "key": key, "value": updates[key], "raw": f"{key}={updates[key]}"})
+            updated_keys.append(key)
+    with open(path, "w", encoding="utf-8") as f:
+        for entry in parsed:
+            if entry["type"] == "blank":
+                f.write("\n")
+            else:
+                f.write(entry["raw"] + "\n")
+    return updated_keys
+
+
+@router.get("/config")
+async def get_config(_=Depends(get_admin_user)):
+    env_path = os.environ.get("ENV_FILE_PATH", "/app/.env")
+    if not os.path.exists(env_path):
+        env_path = ".env"
+    parsed = _parse_env_file(env_path)
+    env_dict = {e["key"]: e["value"] for e in parsed if e["type"] == "kv"}
+
+    categories = []
+    for cat in CONFIG_CATEGORIES:
+        items = []
+        for key in cat["keys"]:
+            raw_val = env_dict.get(key, "")
+            is_sensitive = key in SENSITIVE_KEYS
+            value = MASK if is_sensitive and raw_val else raw_val
+            items.append({
+                "key": key,
+                "value": value,
+                "is_sensitive": is_sensitive,
+                "field_type": _infer_field_type(key),
+                "description": cat["descriptions"].get(key, key),
+            })
+        categories.append({"label": cat["label"], "icon": cat["icon"], "items": items})
+
+    return {"categories": categories}
+
+
+class ConfigUpdateRequest(BaseModel):
+    updates: dict[str, str]
+
+
+@router.put("/config")
+async def update_config(req: ConfigUpdateRequest, _=Depends(get_admin_user)):
+    env_path = os.environ.get("ENV_FILE_PATH", "/app/.env")
+    if not os.path.exists(env_path):
+        env_path = ".env"
+
+    all_known_keys = set()
+    for cat in CONFIG_CATEGORIES:
+        all_known_keys.update(cat["keys"])
+
+    for key in req.updates:
+        if key not in all_known_keys:
+            raise HTTPException(status_code=400, detail=f"未知配置项: {key}")
+
+    parsed = _parse_env_file(env_path)
+    updated_keys = _write_env_file(env_path, parsed, req.updates)
+
+    if updated_keys:
+        from app.core.config import Settings
+        new_settings = Settings()
+        for field in new_settings.model_fields:
+            setattr(settings, field, getattr(new_settings, field))
+
+    return {"ok": True, "updated_keys": updated_keys}
+
+
+@router.post("/config/restart")
+async def restart_backend(_=Depends(get_admin_user)):
+    try:
+        import docker
+        client = docker.from_env()
+        containers = client.containers.list(filters={"label": "com.docker.compose.service=backend"})
+        if not containers:
+            containers = client.containers.list(all=True, filters={"name": "backend"})
+        if not containers:
+            raise HTTPException(status_code=404, detail="未找到 backend 容器")
+        containers[0].restart(timeout=10)
+        return {"ok": True}
+    except ImportError:
+        raise HTTPException(status_code=500, detail="docker SDK 未安装")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"重启失败: {exc}")

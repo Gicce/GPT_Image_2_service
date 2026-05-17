@@ -15,6 +15,7 @@ const routes = [
       { path: 'groups', component: () => import('./views/Groups.vue') },
       { path: 'orders', component: () => import('./views/Orders.vue') },
       { path: 'users', component: () => import('./views/Users.vue') },
+      { path: 'settings', component: () => import('./views/Settings.vue') },
     ]
   }
 ]
