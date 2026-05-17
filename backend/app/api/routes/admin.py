@@ -430,7 +430,7 @@ async def list_orders(_=Depends(get_admin_user), db: AsyncSession = Depends(get_
 
 
 class AssignTokenRequest(BaseModel):
-    token_value: str
+    tokens: dict[str, str]  # { "sora": "sk-xxx", "codex": "sk-yyy" }
 
 
 @router.post("/orders/{order_id}/assign")
@@ -455,13 +455,22 @@ async def assign_order_token(order_id: str, req: AssignTokenRequest, _=Depends(g
     else:
         items = [{"group": order.group, "amount_usd": float(order.amount_usd)}]
 
+    # Validate: every group in the order must have a token in the request
+    order_groups = [item["group"] for item in items]
+    for g in order_groups:
+        if g not in req.tokens or not req.tokens[g].strip():
+            raise HTTPException(status_code=400, detail=f"分组 {g} 未提供 Token")
+
     # Create one TokenInventory entry per group
     first_token_id = None
     for item in items:
+        group = item["group"]
+        token_val = req.tokens[group].strip()
+
         token = TokenInventory(
             id=str(uuid.uuid4()),
-            token_value=req.token_value.strip(),
-            group=item["group"],
+            token_value=token_val,
+            group=group,
             is_trial=False,
             is_assigned=True,
             assigned_to=order.user_id,
@@ -474,22 +483,21 @@ async def assign_order_token(order_id: str, req: AssignTokenRequest, _=Depends(g
             first_token_id = token.id
 
         ut_result = await db.execute(
-            select(UserToken).where(UserToken.user_id == order.user_id, UserToken.group == item["group"])
+            select(UserToken).where(UserToken.user_id == order.user_id, UserToken.group == group)
         )
         ut = ut_result.scalar_one_or_none()
         if ut:
             ut.balance_usd = float(ut.balance_usd) + item["amount_usd"]
-            # Update the token reference to the new one
             tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
             old_tok = tok_result.scalar_one_or_none()
             if old_tok:
-                old_tok.token_value = req.token_value.strip()
+                old_tok.token_value = token_val
         else:
             ut = UserToken(
                 id=str(uuid.uuid4()),
                 user_id=order.user_id,
                 token_id=token.id,
-                group=item["group"],
+                group=group,
                 balance_usd=item["amount_usd"],
             )
             db.add(ut)

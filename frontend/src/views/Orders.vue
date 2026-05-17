@@ -58,9 +58,11 @@
 
     <!-- 分配 Token -->
     <n-modal v-model:show="showAssign" preset="card" title="分配 Token" style="width:480px">
-      <n-form-item label="Token（sk-xxx）">
-        <n-input v-model:value="assignToken" placeholder="粘贴完整的 API Token" />
-      </n-form-item>
+      <n-form label-placement="left" label-width="80">
+        <n-form-item v-for="g in assignGroups" :key="g" :label="'Token（' + g + '）'">
+          <n-input v-model:value="assignTokens[g]" :placeholder="'粘贴 ' + g + ' 分组的 API Token'" />
+        </n-form-item>
+      </n-form>
       <template #footer>
         <n-space justify="end">
           <n-button @click="showAssign = false">取消</n-button>
@@ -123,7 +125,8 @@ const editForm = ref(null)
 const editOrderId = ref(null)
 const showAssign = ref(false)
 const assignOrderId = ref(null)
-const assignToken = ref('')
+const assignGroups = ref([])
+const assignTokens = reactive({})
 const assigning = ref(false)
 
 const showCreate = ref(false)
@@ -215,13 +218,23 @@ async function submitEdit() {
   } catch (e) { message.error(e.response?.data?.detail || '保存失败') }
 }
 
-function openAssign(row) { assignOrderId.value = row.id; assignToken.value = ''; showAssign.value = true }
+function openAssign(row) {
+  assignOrderId.value = row.id
+  assignGroups.value = (row.group || '').split(',').map(g => g.trim()).filter(Boolean)
+  for (const key of Object.keys(assignTokens)) { delete assignTokens[key] }
+  for (const g of assignGroups.value) { assignTokens[g] = '' }
+  showAssign.value = true
+}
 
 async function submitAssign() {
-  if (!assignToken.value.trim()) return message.warning('请输入 Token')
+  for (const g of assignGroups.value) {
+    if (!assignTokens[g]?.trim()) return message.warning(`请输入 ${g} 分组的 Token`)
+  }
   assigning.value = true
   try {
-    await http.post(`/api/admin/orders/${assignOrderId.value}/assign`, { token_value: assignToken.value.trim() })
+    const tokens = {}
+    for (const g of assignGroups.value) { tokens[g] = assignTokens[g].trim() }
+    await http.post(`/api/admin/orders/${assignOrderId.value}/assign`, { tokens })
     message.success('分配成功')
     showAssign.value = false
     await loadOrders()
