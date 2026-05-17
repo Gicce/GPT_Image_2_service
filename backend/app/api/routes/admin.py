@@ -430,7 +430,7 @@ async def list_orders(_=Depends(get_admin_user), db: AsyncSession = Depends(get_
 
 
 class AssignTokenRequest(BaseModel):
-    tokens: dict[str, str]  # { "sora": "sk-xxx", "codex": "sk-yyy" }
+    tokens: dict[str, str]  # { "sora": "sk-xxx", "codex": "sk-yyy" }; value 可为空表示充值不换 Token
 
 
 @router.post("/orders/{order_id}/assign")
@@ -442,9 +442,9 @@ async def assign_order_token(order_id: str, req: AssignTokenRequest, _=Depends(g
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
     if order.status != "paid":
-        raise HTTPException(status_code=400, detail="订单未支付，无法分配")
+        raise HTTPException(status_code=400, detail="订单未支付，无法操作")
     if order.token_id:
-        raise HTTPException(status_code=400, detail="订单已分配 Token")
+        raise HTTPException(status_code=400, detail="订单已处理")
 
     now = datetime.now(timezone.utc)
 
@@ -455,44 +455,43 @@ async def assign_order_token(order_id: str, req: AssignTokenRequest, _=Depends(g
     else:
         items = [{"group": order.group, "amount_usd": float(order.amount_usd)}]
 
-    # Validate: every group in the order must have a token in the request
-    order_groups = [item["group"] for item in items]
-    for g in order_groups:
-        if g not in req.tokens or not req.tokens[g].strip():
-            raise HTTPException(status_code=400, detail=f"分组 {g} 未提供 Token")
-
-    # Create one TokenInventory entry per group
     first_token_id = None
     for item in items:
         group = item["group"]
-        token_val = req.tokens[group].strip()
-
-        token = TokenInventory(
-            id=str(uuid.uuid4()),
-            token_value=token_val,
-            group=group,
-            is_trial=False,
-            is_assigned=True,
-            assigned_to=order.user_id,
-            assigned_at=now,
-        )
-        db.add(token)
-        await db.flush()
-
-        if first_token_id is None:
-            first_token_id = token.id
+        token_val = req.tokens.get(group, "").strip()
 
         ut_result = await db.execute(
             select(UserToken).where(UserToken.user_id == order.user_id, UserToken.group == group)
         )
         ut = ut_result.scalar_one_or_none()
+
         if ut:
+            # 充值：增加余额，有新 Token 则更新
             ut.balance_usd = float(ut.balance_usd) + item["amount_usd"]
-            tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
-            old_tok = tok_result.scalar_one_or_none()
-            if old_tok:
-                old_tok.token_value = token_val
+            if token_val:
+                tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
+                old_tok = tok_result.scalar_one_or_none()
+                if old_tok:
+                    old_tok.token_value = token_val
         else:
+            # 分配：必须提供 Token
+            if not token_val:
+                raise HTTPException(status_code=400, detail=f"分组 {group} 需提供 Token（新分配）")
+            token = TokenInventory(
+                id=str(uuid.uuid4()),
+                token_value=token_val,
+                group=group,
+                is_trial=False,
+                is_assigned=True,
+                assigned_to=order.user_id,
+                assigned_at=now,
+            )
+            db.add(token)
+            await db.flush()
+
+            if first_token_id is None:
+                first_token_id = token.id
+
             ut = UserToken(
                 id=str(uuid.uuid4()),
                 user_id=order.user_id,
@@ -502,7 +501,8 @@ async def assign_order_token(order_id: str, req: AssignTokenRequest, _=Depends(g
             )
             db.add(ut)
 
-    order.token_id = first_token_id
+    if first_token_id:
+        order.token_id = first_token_id
 
     user_result = await db.execute(select(User).where(User.id == order.user_id))
     u = user_result.scalar_one_or_none()

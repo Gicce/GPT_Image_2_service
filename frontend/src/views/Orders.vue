@@ -60,7 +60,7 @@
     <n-modal v-model:show="showAssign" preset="card" title="分配 Token" style="width:480px">
       <n-form label-placement="left" label-width="80">
         <n-form-item v-for="g in assignGroups" :key="g" :label="'Token（' + g + '）'">
-          <n-input v-model:value="assignTokens[g]" :placeholder="'粘贴 ' + g + ' 分组的 API Token'" />
+          <n-input v-model:value="assignTokens[g]" :placeholder="'粘贴 ' + g + ' 分组的 API Token，留空则保留原 Token'" />
         </n-form-item>
       </n-form>
       <template #footer>
@@ -108,7 +108,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, h, nextTick, watch } from 'vue'
+import { ref, reactive, computed, onMounted, h, nextTick, watch } from 'vue'
 import { NTag, NButton, NSpace, useMessage, useDialog } from 'naive-ui'
 import QRCode from 'qrcode'
 import http from '../api/http'
@@ -227,18 +227,15 @@ function openAssign(row) {
 }
 
 async function submitAssign() {
-  for (const g of assignGroups.value) {
-    if (!assignTokens[g]?.trim()) return message.warning(`请输入 ${g} 分组的 Token`)
-  }
   assigning.value = true
   try {
     const tokens = {}
-    for (const g of assignGroups.value) { tokens[g] = assignTokens[g].trim() }
+    for (const g of assignGroups.value) { tokens[g] = (assignTokens[g] || '').trim() }
     await http.post(`/api/admin/orders/${assignOrderId.value}/assign`, { tokens })
-    message.success('分配成功')
+    message.success('操作成功')
     showAssign.value = false
     await loadOrders()
-  } catch (e) { message.error(e.response?.data?.detail || '分配失败') }
+  } catch (e) { message.error(e.response?.data?.detail || '操作失败') }
   finally { assigning.value = false }
 }
 
