@@ -1,5 +1,6 @@
 """
-Run once after first deploy to seed default AI models and recreate tables.
+Safe seed script: creates missing tables and inserts default groups/models.
+Does NOT drop or destroy any existing data.
 Usage: cd backend && python init_data.py
 """
 import asyncio
@@ -8,7 +9,6 @@ from app.core.database import engine, Base
 from app.models.content import AIModel, Notice, Prompt, Group
 from app.models.user import User, UserToken
 from app.models.token import TokenInventory, Order, UsageLog
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -66,18 +66,28 @@ DEFAULT_MODELS = [
 
 async def seed():
     async with engine.begin() as conn:
-        await conn.execute(text("DROP SCHEMA public CASCADE"))
-        await conn.execute(text("CREATE SCHEMA public"))
         await conn.run_sync(Base.metadata.create_all)
-    print("Tables recreated.")
+    print("Tables ensured.")
 
     async with AsyncSession(engine) as session:
         for g in DEFAULT_GROUPS:
-            session.add(Group(**g))
-            print(f"  + group: {g['name']}")
+            result = await session.execute(select(Group).where(Group.name == g["name"]))
+            if not result.scalar_one_or_none():
+                session.add(Group(**g))
+                print(f"  + group: {g['name']}")
+            else:
+                print(f"  = group: {g['name']} (exists)")
+
         for m in DEFAULT_MODELS:
-            session.add(AIModel(**m))
-            print(f"  + model: {m['name']}")
+            result = await session.execute(
+                select(AIModel).where(AIModel.name == m["name"], AIModel.group == m["group"])
+            )
+            if not result.scalar_one_or_none():
+                session.add(AIModel(**m))
+                print(f"  + model: {m['name']} ({m['group']})")
+            else:
+                print(f"  = model: {m['name']} ({m['group']}) (exists)")
+
         await session.commit()
     print("Done.")
 
