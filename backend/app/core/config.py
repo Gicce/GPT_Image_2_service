@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     # Server
     SERVER_BASE_URL: str = "https://www.zjcypc.com"
 
+    # SMTP / Email
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 465
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_NAME: str = "CyImagePro"
+    SMTP_USE_SSL: bool = True
+
     # Exchange rate API (free tier)
     EXCHANGE_RATE_API: str = "https://open.er-api.com/v6/latest/USD"
 

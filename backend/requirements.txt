@@ -17,3 +17,4 @@ aiohttp==3.10.8
 aiofiles==24.1.0
 cryptography==43.0.1
 wechatpayv3==2.0.2
+aiosmtplib==3.0.2

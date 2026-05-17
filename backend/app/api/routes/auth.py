@@ -4,12 +4,18 @@ from sqlalchemy import select, func
 from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel, EmailStr
 import uuid
+import secrets
+import logging
 
 from app.core.database import get_db
-from app.core.security import hash_password, verify_password, create_access_token, create_admin_token, get_current_user
+from app.core.security import hash_password, verify_password, create_access_token, create_admin_token, get_current_user, _validate_bcrypt_password
 from app.core.config import settings
+from app.core.redis import get_redis
+from app.core.email import send_verification_code
 from app.models.user import User, UserToken
 from app.models.token import TokenInventory
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -29,6 +35,16 @@ class LoginRequest(BaseModel):
 class AdminLoginRequest(BaseModel):
     username: str
     password: str
+
+
+class ForgotPasswordSendRequest(BaseModel):
+    email: EmailStr
+
+
+class ForgotPasswordResetRequest(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str
 
 
 @router.post("/register")
@@ -115,6 +131,82 @@ async def admin_login(req: AdminLoginRequest):
     if req.username != settings.ADMIN_USERNAME or req.password != settings.ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="管理员账号或密码错误")
     return {"access_token": create_admin_token(), "token_type": "bearer"}
+
+
+@router.post("/forgot-password/send-code")
+async def forgot_password_send_code(req: ForgotPasswordSendRequest, db: AsyncSession = Depends(get_db)):
+    email = req.email.strip().lower()
+    redis = get_redis()
+
+    rate_key = f"pwd:rate:{email}"
+    if await redis.exists(rate_key):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请60秒后重试")
+
+    lockout_key = f"pwd:lockout:{email}"
+    if await redis.exists(lockout_key):
+        raise HTTPException(status_code=429, detail="验证码尝试次数过多，请稍后再试")
+
+    await redis.setex(rate_key, 60, "1")
+
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
+
+    if user:
+        code = "".join(secrets.choice("0123456789") for _ in range(6))
+        code_key = f"pwd:code:{email}"
+        attempts_key = f"pwd:attempts:{email}"
+
+        await redis.setex(code_key, 300, code)
+        await redis.setex(attempts_key, 300, "0")
+
+        try:
+            await send_verification_code(email, code)
+        except Exception:
+            logger.exception("Failed to send verification code to %s", email)
+            raise HTTPException(status_code=500, detail="邮件发送失败，请稍后重试")
+
+    return {"message": "如果该邮箱已注册，验证码已发送"}
+
+
+@router.post("/forgot-password/reset")
+async def forgot_password_reset(req: ForgotPasswordResetRequest, db: AsyncSession = Depends(get_db)):
+    email = req.email.strip().lower()
+    redis = get_redis()
+
+    code_key = f"pwd:code:{email}"
+    attempts_key = f"pwd:attempts:{email}"
+    lockout_key = f"pwd:lockout:{email}"
+
+    if await redis.exists(lockout_key):
+        raise HTTPException(status_code=429, detail="验证码尝试次数过多，请稍后再试")
+
+    stored_code = await redis.get(code_key)
+    if not stored_code or stored_code != req.code:
+        attempts = int(await redis.get(attempts_key) or "0") + 1
+        await redis.setex(attempts_key, 300, str(attempts))
+
+        if attempts >= 5:
+            await redis.setex(lockout_key, 900, "1")
+            await redis.delete(code_key, attempts_key)
+            raise HTTPException(status_code=429, detail="验证码尝试次数过多，请稍后再试")
+
+        raise HTTPException(status_code=400, detail="验证码无效或已过期")
+
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=400, detail="验证码无效或已过期")
+
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="账号已被禁用")
+
+    _validate_bcrypt_password(req.new_password)
+    user.password_hash = hash_password(req.new_password)
+    await db.flush()
+
+    await redis.delete(code_key, attempts_key, f"pwd:rate:{email}")
+
+    return {"message": "密码重置成功"}
 
 
 @router.post("/upgrade-trial")
