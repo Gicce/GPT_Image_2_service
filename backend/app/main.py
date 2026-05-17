@@ -48,6 +48,24 @@ app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(usage.router, prefix="/api/usage", tags=["usage"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 
+@app.get("/api")
+@app.get("/api/")
+async def api_index():
+    return {
+        "status": "ok",
+        "base_url": "/api",
+        "routes": [
+            "/api/auth",
+            "/api/users",
+            "/api/tokens",
+            "/api/pay",
+            "/api/notice",
+            "/api/prompts",
+            "/api/models",
+            "/api/usage",
+        ],
+    }
+
 # Serve frontend admin panel
 if os.path.exists("/app/static"):
     app.mount("/admin", StaticFiles(directory="/app/static", html=True), name="admin")

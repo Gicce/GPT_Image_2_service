@@ -24,9 +24,11 @@ class Settings(BaseSettings):
     WECHAT_CERT_SERIAL_NO: str = ""
     WECHAT_PRIVATE_KEY_PATH: str = "/app/certs/apiclient_key.pem"
     WECHAT_NOTIFY_URL: str = ""
+    WECHAT_PUBLIC_KEY_PATH: str = ""
+    WECHAT_PUBLIC_KEY_ID: str = ""
 
     # Server
-    SERVER_BASE_URL: str = "http://150.158.124.224"
+    SERVER_BASE_URL: str = "https://www.zjcypc.com"
 
     # Exchange rate API (free tier)
     EXCHANGE_RATE_API: str = "https://open.er-api.com/v6/latest/USD"

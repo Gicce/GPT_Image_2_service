@@ -3,29 +3,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.core.database import get_db
-from app.core.security import get_current_user
 from app.models.token import TokenInventory
+from app.models.content import Group
 
 router = APIRouter()
 
 
 @router.get("/stock")
 async def get_stock(db: AsyncSession = Depends(get_db)):
-    """Public endpoint: returns stock count per token_type + package"""
-    packages = [10, 20, 50, 100]
+    """Public endpoint: returns available token stock per group."""
+    groups_result = await db.execute(select(Group).order_by(Group.sort_order))
+    groups = groups_result.scalars().all()
     result = {}
-    for token_type in ("image", "chat"):
-        result[token_type] = {}
-        for pkg in packages:
-            count_result = await db.execute(
-                select(func.count()).select_from(TokenInventory).where(
-                    TokenInventory.package_usd == pkg,
-                    TokenInventory.token_type == token_type,
-                    TokenInventory.is_trial == False,
-                    TokenInventory.is_assigned == False,
-                )
+    for group in groups:
+        count_result = await db.execute(
+            select(func.count()).select_from(TokenInventory).where(
+                TokenInventory.group == group.name,
+                TokenInventory.is_trial == False,
+                TokenInventory.is_assigned == False,
             )
-            result[token_type][str(pkg)] = count_result.scalar()
+        )
+        result[group.name] = count_result.scalar()
     return result
 
 
@@ -35,7 +33,7 @@ async def get_trial_stock(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(func.count()).select_from(TokenInventory).where(
             TokenInventory.is_trial == True,
-            TokenInventory.token_type == "image",
+            TokenInventory.group == "sora",
             TokenInventory.is_assigned == False,
         )
     )
