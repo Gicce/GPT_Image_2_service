@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     WECHAT_CERT_SERIAL_NO: str = ""
     WECHAT_PRIVATE_KEY_PATH: str = "/app/certs/apiclient_key.pem"
     WECHAT_NOTIFY_URL: str = ""
+    WECHAT_REFUND_NOTIFY_URL: str = ""
     WECHAT_PUBLIC_KEY_PATH: str = ""
     WECHAT_PUBLIC_KEY_ID: str = ""
 

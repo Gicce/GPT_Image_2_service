@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User, UserToken
-from app.models.token import TokenInventory
+from app.models.token import TokenInventory, UsageLog
 from app.models.content import AIModel
 
 router = APIRouter()
@@ -135,3 +135,35 @@ async def _check_trial_expired(user: User, db: AsyncSession):
         user.account_type = "normal"
         await db.commit()
         raise HTTPException(status_code=403, detail="试用期已过期，请购买套餐")
+
+
+@router.get("/records")
+async def list_usage_records(
+    model: str = Query(default=None, description="按模型名筛选"),
+    usage_type: str = Query(default=None, description="按类型筛选(chat/image)"),
+    limit: int = Query(default=100, ge=1, le=500, description="返回条数上限"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(UsageLog).where(UsageLog.user_id == user.id)
+    if model:
+        query = query.where(UsageLog.model == model)
+    if usage_type:
+        query = query.where(UsageLog.usage_type == usage_type)
+    query = query.order_by(UsageLog.created_at.desc()).limit(limit)
+
+    result = await db.execute(query)
+    records = result.scalars().all()
+    return [
+        {
+            "model": r.model,
+            "usage_type": r.usage_type,
+            "input_tokens": r.input_tokens,
+            "output_tokens": r.output_tokens,
+            "cached_tokens": r.cached_tokens,
+            "image_count": r.image_count,
+            "cost_usd": float(r.cost_usd),
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in records
+    ]

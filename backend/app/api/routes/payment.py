@@ -175,7 +175,7 @@ async def query_order(
         if code == 200 and wx_result.get("trade_state") == "SUCCESS":
             order.status = "paid"
             order.paid_at = datetime.now(timezone.utc)
-            order.transaction_id = wx_result.get("transaction_id")
+            order.trade_no = wx_result.get("transaction_id")
             user_res = await db.execute(select(User).where(User.id == user.id))
             u = user_res.scalar_one_or_none()
             if u:
@@ -229,6 +229,7 @@ async def close_order(
 
 class RefundRequest(BaseModel):
     reason: str = ""
+    refund_amount_cny: float | None = None
 
 
 @router.post("/refund/{out_trade_no}")
@@ -248,21 +249,101 @@ async def refund_order(
     out_refund_no = f"RF{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
     total_fee = int(round(float(order.amount_cny) * 100))
 
+    if req.refund_amount_cny is not None:
+        refund_fee = int(round(req.refund_amount_cny * 100))
+        if refund_fee <= 0 or refund_fee > total_fee:
+            raise HTTPException(status_code=400, detail="退款金额无效，需在 ¥0.01 ~ ¥{} 之间".format(float(order.amount_cny)))
+    else:
+        refund_fee = total_fee
+
+    refund_data = {
+        "out_refund_no": out_refund_no,
+        "out_trade_no": out_trade_no,
+        "reason": req.reason or "admin refund",
+        "amount": {"refund": refund_fee, "total": total_fee, "currency": "CNY"},
+    }
+    if settings.WECHAT_REFUND_NOTIFY_URL:
+        refund_data["notify_url"] = settings.WECHAT_REFUND_NOTIFY_URL
+
     code, wx_result = await wechatpay_request(
         "/v3/refund/domestic/refunds",
         method="POST",
-        data={
-            "out_refund_no": out_refund_no,
-            "out_trade_no": out_trade_no,
-            "reason": req.reason or "admin refund",
-            "amount": {"refund": total_fee, "total": total_fee, "currency": "CNY"},
-        },
+        data=refund_data,
     )
     if code != 200:
         raise HTTPException(status_code=502, detail=f"退款失败: {wx_result}")
 
     order.status = "refunded"
+    order.out_refund_no = out_refund_no
     return {"status": "refunded", "out_refund_no": out_refund_no}
+
+
+@router.get("/refund/query/{out_refund_no}")
+async def query_refund(
+    out_refund_no: str,
+    _=Depends(get_admin_user),
+):
+    path = f"/v3/refund/domestic/refunds/{out_refund_no}"
+    code, result = await wechatpay_request(path)
+    if code != 200:
+        raise HTTPException(status_code=502, detail=f"查询退款失败: {result}")
+    return json.loads(result)
+
+
+@router.post("/refund/notify")
+async def refund_notify(request: Request, db: AsyncSession = Depends(get_db)):
+    headers = {k: v for k, v in request.headers.items()}
+    body = (await request.body()).decode("utf-8")
+    wxpay = get_wxpay()
+    result = wxpay.callback(headers, body)
+    if not result:
+        return Response(
+            status_code=400,
+            content=json.dumps({"code": "FAIL", "message": "验签失败"}),
+            media_type="application/json",
+        )
+
+    data = json.loads(result)
+    out_trade_no = data.get("out_trade_no")
+    refund_status = data.get("refund_status")
+
+    if out_trade_no and refund_status:
+        res = await db.execute(select(Order).where(Order.out_trade_no == out_trade_no))
+        order = res.scalar_one_or_none()
+        if order:
+            if refund_status == "SUCCESS":
+                order.status = "refunded"
+            elif refund_status == "CHANGE":
+                order.status = "refund_change"
+
+    return Response(status_code=200)
+
+
+@router.get("/orders")
+async def list_user_orders(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Order)
+        .where(Order.user_id == user.id)
+        .order_by(Order.created_at.desc())
+    )
+    orders = result.scalars().all()
+    return [
+        {
+            "out_trade_no": o.out_trade_no,
+            "group": o.group,
+            "amount_usd": float(o.amount_usd),
+            "amount_cny": float(o.amount_cny),
+            "exchange_rate": float(o.exchange_rate) if o.exchange_rate else None,
+            "status": o.status,
+            "pay_type": o.pay_type,
+            "created_at": o.created_at.isoformat(),
+            "paid_at": o.paid_at.isoformat() if o.paid_at else None,
+        }
+        for o in orders
+    ]
 
 
 @router.get("/packages")

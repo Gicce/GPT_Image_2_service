@@ -38,6 +38,7 @@ class Order(Base):
     items_json: Mapped[str] = mapped_column(Text, nullable=True)
     pay_type: Mapped[str] = mapped_column(String(16), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="pending")
+    out_refund_no: Mapped[str] = mapped_column(String(64), nullable=True)
     token_id: Mapped[str] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)

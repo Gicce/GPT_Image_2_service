@@ -424,6 +424,7 @@ async def list_orders(_=Depends(get_admin_user), db: AsyncSession = Depends(get_
              "amount_usd": float(o.amount_usd), "amount_cny": float(o.amount_cny),
              "exchange_rate": float(o.exchange_rate) if o.exchange_rate else None,
              "pay_type": o.pay_type, "status": o.status,
+             "out_refund_no": o.out_refund_no,
              "token_value": token_map.get(o.token_id, "")[:12] if o.token_id else None,
              "created_at": o.created_at.isoformat(),
              "paid_at": o.paid_at.isoformat() if o.paid_at else None} for o in orders]
