@@ -38,6 +38,10 @@ async def get_models(
             "trial_allowed": m.trial_allowed,
             "group": m.group,
             "user_has_access": m.group in user_groups if user_groups else False,
+            "price_input": m.price_input,
+            "price_output": m.price_output,
+            "price_cached": m.price_cached,
+            "price_per_call": m.price_per_call,
         }
         for m in models
     ]

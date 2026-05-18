@@ -357,10 +357,12 @@ Authorization: Bearer <token>
 
 **计费公式：**
 ```
-cost = input_tokens / 1,000,000 * input_price
-     + output_tokens / 1,000,000 * output_price
-     + cached_tokens / 1,000,000 * cache_price
+cost = input_tokens / 1,000 * price_input
+     + output_tokens / 1,000 * price_output
+     + cached_tokens / 1,000 * price_cached
 ```
+
+> 价格单位为 $/1K tokens，即每千 token 的美元价格。
 
 ---
 
@@ -559,37 +561,63 @@ GET /api/models
 ```json
 [
   {
+    "id": "uuid",
     "name": "gpt-image-2",
     "display_name": "GPT Image 2",
+    "provider": "OpenAI",
+    "billing_type": "per_call",
     "model_type": "image",
     "trial_allowed": true,
-    "price_per_image": "0.04"
+    "group": "sora",
+    "user_has_access": true,
+    "price_input": null,
+    "price_output": null,
+    "price_cached": null,
+    "price_per_call": "0.04"
   },
   {
-    "name": "gpt-4.5",
-    "display_name": "GPT-4.5",
+    "id": "uuid",
+    "name": "gpt-5.5",
+    "display_name": "GPT-5.5",
+    "provider": "OpenAI",
+    "billing_type": "per_token",
     "model_type": "chat",
     "trial_allowed": false,
-    "price_input_per_m": "1.0",
-    "price_output_per_m": "6.0",
-    "price_cached_per_m": "0.1"
+    "group": "codex",
+    "user_has_access": true,
+    "price_input": "0.0025",
+    "price_output": "0.015",
+    "price_cached": "0.0003",
+    "price_per_call": null
   }
 ]
 ```
+
+**字段说明：**
+| 字段 | 说明 |
+|------|------|
+| billing_type | `per_call`（按次计费）或 `per_token`（按 token 计费） |
+| model_type | `image` 或 `chat` |
+| user_has_access | 当前用户是否有该模型的访问权限 |
+| price_input | 输入 token 单价（$/1K tokens），per_token 模型有效 |
+| price_output | 输出 token 单价（$/1K tokens），per_token 模型有效 |
+| price_cached | 缓存 token 单价（$/1K tokens），per_token 模型有效 |
+| price_per_call | 每次调用单价（$/次），per_call 模型有效 |
 
 **客户端逻辑：**
 - `model_type=image` 的模型使用 `image_api_token` 调用
 - `model_type=chat` 的模型使用 `chat_api_token` 调用
 - `trial_allowed=false` 的模型试用用户不可使用
+- `user_has_access=false` 表示用户未购买该模型所在分组的套餐
 
 ---
 
 ## 八、当前定价
 
-| 模型 | 类型 | input ($/M tokens) | output ($/M tokens) | cached ($/M tokens) | 图片 ($/张) |
+| 模型 | 类型 | input ($/1K tokens) | output ($/1K tokens) | cached ($/1K tokens) | 图片 ($/次) |
 |------|------|-----|--------|---------|------|
 | gpt-image-2 | image | - | - | - | $0.04 |
-| gpt-4.5 | chat | $1.0 | $6.0 | $0.1 | - |
+| gpt-5.5 | chat | $0.0025 | $0.015 | $0.0003 | - |
 
 ---
 
