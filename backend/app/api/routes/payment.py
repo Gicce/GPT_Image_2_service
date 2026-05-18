@@ -340,6 +340,85 @@ async def refund_notify(request: Request, db: AsyncSession = Depends(get_db)):
     return Response(status_code=200)
 
 
+@router.post("/refund_order/{out_trade_no}")
+async def client_refund_order(
+    out_trade_no: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Order).where(Order.out_trade_no == out_trade_no, Order.user_id == user.id)
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if order.status not in (OrderStatus.PAID, OrderStatus.ASSIGNED):
+        raise HTTPException(status_code=400, detail="只能退款已支付或已分配的订单")
+
+    # 冲正：对 ASSIGNED 订单扣除余额、撤销 Token
+    if order.status == OrderStatus.ASSIGNED:
+        items = json.loads(order.items_json) if order.items_json else [{"group": order.group, "amount_usd": float(order.amount_usd)}]
+        for item in items:
+            ut_result = await db.execute(
+                select(UserToken).where(UserToken.user_id == order.user_id, UserToken.group == item["group"])
+            )
+            ut = ut_result.scalar_one_or_none()
+            if ut:
+                new_balance = float(ut.balance_usd) - item["amount_usd"]
+                if new_balance <= 0:
+                    tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
+                    tok = tok_result.scalar_one_or_none()
+                    if tok:
+                        tok.is_assigned = False
+                        tok.assigned_to = None
+                        tok.assigned_at = None
+                    await db.delete(ut)
+                else:
+                    ut.balance_usd = new_balance
+
+    # 发起微信全额退款
+    out_refund_no = f"RF{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+    total_fee = int(round(float(order.amount_cny) * 100))
+    refund_data = {
+        "out_refund_no": out_refund_no,
+        "out_trade_no": out_trade_no,
+        "reason": "user refund",
+        "amount": {"refund": total_fee, "total": total_fee, "currency": "CNY"},
+    }
+    if settings.WECHAT_REFUND_NOTIFY_URL:
+        refund_data["notify_url"] = settings.WECHAT_REFUND_NOTIFY_URL
+
+    code, wx_result = await wechatpay_request(
+        "/v3/refund/domestic/refunds",
+        method="POST",
+        data=refund_data,
+    )
+    if code != 200:
+        raise HTTPException(status_code=502, detail=f"退款失败: {wx_result}")
+
+    order.out_refund_no = out_refund_no
+    return {"status": "refunding", "out_refund_no": out_refund_no}
+
+
+@router.get("/refund_status/{out_trade_no}")
+async def client_refund_status(
+    out_trade_no: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Order).where(Order.out_trade_no == out_trade_no, Order.user_id == user.id)
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    return {
+        "status": order.status,
+        "out_refund_no": order.out_refund_no,
+        "amount_cny": float(order.amount_cny),
+    }
+
+
 @router.get("/orders")
 async def list_user_orders(
     user: User = Depends(get_current_user),
