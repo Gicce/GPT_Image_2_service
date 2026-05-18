@@ -14,7 +14,7 @@ from app.core.config import settings
 from app.core.redis import get_redis
 from app.core.wechatpay import get_wxpay, wechatpay_request
 from app.models.user import User, UserToken
-from app.models.token import TokenInventory, Order
+from app.models.token import TokenInventory, Order, OrderStatus
 
 router = APIRouter()
 MIN_PAYMENT_CNY = 0.01
@@ -143,8 +143,8 @@ async def wechat_notify(request: Request, db: AsyncSession = Depends(get_db)):
     out_trade_no = data["out_trade_no"]
     res = await db.execute(select(Order).where(Order.out_trade_no == out_trade_no))
     order = res.scalar_one_or_none()
-    if order and order.status == "pending":
-        order.status = "paid"
+    if order and order.status == OrderStatus.PENDING:
+        order.status = OrderStatus.PAID
         order.paid_at = datetime.now(timezone.utc)
         order.trade_no = data.get("transaction_id")
         user_res = await db.execute(select(User).where(User.id == order.user_id))
@@ -168,12 +168,12 @@ async def query_order(
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
 
-    if order.status == "pending":
+    if order.status == OrderStatus.PENDING:
         path = f"/v3/pay/transactions/out-trade-no/{out_trade_no}?mchid={settings.WECHAT_MCHID}"
         code, wx_result = await wechatpay_request(path)
         wx_result = json.loads(wx_result) if wx_result else {}
         if code == 200 and wx_result.get("trade_state") == "SUCCESS":
-            order.status = "paid"
+            order.status = OrderStatus.PAID
             order.paid_at = datetime.now(timezone.utc)
             order.trade_no = wx_result.get("transaction_id")
             user_res = await db.execute(select(User).where(User.id == user.id))
@@ -211,7 +211,7 @@ async def close_order(
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
-    if order.status != "pending":
+    if order.status != OrderStatus.PENDING:
         raise HTTPException(status_code=400, detail="只能关闭待支付订单")
 
     path = f"/v3/pay/transactions/out-trade-no/{out_trade_no}/close"
@@ -223,8 +223,8 @@ async def close_order(
     if code not in (200, 204):
         raise HTTPException(status_code=502, detail=f"关闭订单失败: {wx_result}")
 
-    order.status = "closed"
-    return {"status": "closed", "out_trade_no": out_trade_no}
+    order.status = OrderStatus.CLOSED
+    return {"status": OrderStatus.CLOSED, "out_trade_no": out_trade_no}
 
 
 class RefundRequest(BaseModel):
@@ -243,8 +243,29 @@ async def refund_order(
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
-    if order.status != "paid":
-        raise HTTPException(status_code=400, detail="只能退款已支付订单")
+    if order.status not in (OrderStatus.PAID, OrderStatus.ASSIGNED):
+        raise HTTPException(status_code=400, detail="只能退款已支付或已分配的订单")
+
+    # 冲正：对 ASSIGNED 订单扣除余额、撤销 Token
+    if order.status == OrderStatus.ASSIGNED:
+        items = json.loads(order.items_json) if order.items_json else [{"group": order.group, "amount_usd": float(order.amount_usd)}]
+        for item in items:
+            ut_result = await db.execute(
+                select(UserToken).where(UserToken.user_id == order.user_id, UserToken.group == item["group"])
+            )
+            ut = ut_result.scalar_one_or_none()
+            if ut:
+                new_balance = float(ut.balance_usd) - item["amount_usd"]
+                if new_balance <= 0:
+                    tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
+                    tok = tok_result.scalar_one_or_none()
+                    if tok:
+                        tok.is_assigned = False
+                        tok.assigned_to = None
+                        tok.assigned_at = None
+                    await db.delete(ut)
+                else:
+                    ut.balance_usd = new_balance
 
     out_refund_no = f"RF{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
     total_fee = int(round(float(order.amount_cny) * 100))
@@ -312,9 +333,9 @@ async def refund_notify(request: Request, db: AsyncSession = Depends(get_db)):
         order = res.scalar_one_or_none()
         if order:
             if refund_status == "SUCCESS":
-                order.status = "refunded"
+                order.status = OrderStatus.REFUNDED
             elif refund_status == "CHANGE":
-                order.status = "refund_change"
+                order.status = OrderStatus.REFUND_CHANGE
 
     return Response(status_code=200)
 

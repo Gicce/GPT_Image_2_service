@@ -96,10 +96,10 @@
     <!-- 退款 -->
     <n-modal v-model:show="showRefund" preset="card" title="退款" style="width:420px">
       <n-form label-placement="left" label-width="100">
-        <n-form-item label="订单号">{{ refundOrder.out_trade_no }}</n-form-item>
-        <n-form-item label="订单金额">¥{{ Number(refundOrder.amount_cny).toFixed(2) }}</n-form-item>
+        <n-form-item label="订单号">{{ refundTarget.out_trade_no }}</n-form-item>
+        <n-form-item label="订单金额">¥{{ Number(refundTarget.amount_cny).toFixed(2) }}</n-form-item>
         <n-form-item label="退款金额(¥)">
-          <n-input-number v-model:value="refundAmount" :precision="2" :min="0.01" :max="Number(refundOrder.amount_cny)" placeholder="留空则全额退款" clearable style="width:100%" />
+          <n-input-number v-model:value="refundAmount" :precision="2" :min="0.01" :max="Number(refundTarget.amount_cny)" placeholder="留空则全额退款" clearable style="width:100%" />
         </n-form-item>
         <n-form-item label="退款原因">
           <n-input v-model:value="refundReason" placeholder="可选" />
@@ -138,7 +138,7 @@
         <p style="margin-top:12px;font-size:12px;color:var(--cy-text-dim)">订单号：{{ qrcodeOrder.out_trade_no }}</p>
         <p style="font-size:14px;font-weight:bold;color:var(--cy-text)">¥{{ qrcodeOrder.amount_cny }} (≈${{ qrcodeOrder.amount_usd }})</p>
         <n-button v-if="qrcodeOrder.status==='pending'" :loading="polling" style="margin-top:12px" @click="checkPayStatus">查询支付状态</n-button>
-        <n-tag v-if="qrcodeOrder.status==='paid'" type="success" style="margin-top:12px" bordered="false">支付成功</n-tag>
+        <n-tag v-if="qrcodeOrder.status==='paid'||qrcodeOrder.status==='assigned'" type="success" style="margin-top:12px" bordered="false">支付成功</n-tag>
       </div>
     </n-modal>
   </div>
@@ -179,7 +179,7 @@ const showQrcode = ref(false)
 
 // 退款
 const showRefund = ref(false)
-const refundOrder = ref({})
+const refundTarget = ref({})
 const refundAmount = ref(null)
 const refundReason = ref('')
 const refunding = ref(false)
@@ -191,7 +191,7 @@ const refundStatusTag = { SUCCESS: 'success', PROCESSING: 'warning', CHANGE: 'er
 const refundStatusLabel = { SUCCESS: '退款成功', PROCESSING: '退款处理中', CHANGE: '退款异常', CLOSED: '退款关闭' }
 
 function openRefund(row) {
-  refundOrder.value = row
+  refundTarget.value = row
   refundAmount.value = null
   refundReason.value = ''
   showRefund.value = true
@@ -202,7 +202,7 @@ async function submitRefund() {
   try {
     const body = { reason: refundReason.value }
     if (refundAmount.value) body.refund_amount_cny = refundAmount.value
-    const { data } = await http.post(`/api/pay/refund/${refundOrder.value.out_trade_no}`, body)
+    const { data } = await http.post(`/api/pay/refund/${refundTarget.value.out_trade_no}`, body)
     message.success(`退款申请已提交，退款单号：${data.out_refund_no}`)
     showRefund.value = false
     await loadOrders()
@@ -229,12 +229,13 @@ const polling = ref(false)
 const statusOptions = [
   { label: '待支付', value: 'pending' },
   { label: '已支付', value: 'paid' },
+  { label: '已分配', value: 'assigned' },
   { label: '已关闭', value: 'closed' },
   { label: '已退款', value: 'refunded' },
   { label: '退款异常', value: 'refund_change' },
 ]
-const statusTag = { pending: 'warning', paid: 'success', closed: 'default', refunded: 'info', refund_change: 'error' }
-const statusLabel = { pending: '待支付', paid: '已支付', closed: '已关闭', refunded: '已退款', refund_change: '退款异常' }
+const statusTag = { pending: 'warning', paid: 'success', assigned: 'info', closed: 'default', refunded: 'info', refund_change: 'error' }
+const statusLabel = { pending: '待支付', paid: '已支付', assigned: '已分配', closed: '已关闭', refunded: '已退款', refund_change: '退款异常' }
 
 function formatTime(v) { return v ? v.replace('T', ' ').slice(0, 19) : '-' }
 
@@ -269,19 +270,21 @@ const columns = [
         h(NButton, { size: 'small', quaternary: true, type: 'info', onClick: () => viewOrder(row) }, { default: () => '查看' }),
         h(NButton, { size: 'small', quaternary: true, type: 'warning', onClick: () => openEdit(row) }, { default: () => '编辑' }),
       ]
-      if (row.status === 'paid' && !row.token_value) {
+      if (row.status === 'paid') {
         btns.push(h(NButton, { size: 'small', quaternary: true, type: 'success', onClick: () => openAssign(row) }, { default: () => '分配' }))
       }
-      if (row.status === 'paid') {
+      if (row.status === 'pending') {
+        btns.push(h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => closeOrder(row) }, { default: () => '关闭' }))
+      }
+      if (row.status === 'paid' || row.status === 'assigned') {
         btns.push(h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => openRefund(row) }, { default: () => '退款' }))
       }
       if (row.status === 'refunded' || row.status === 'refund_change') {
         btns.push(h(NButton, { size: 'small', quaternary: true, type: 'info', onClick: () => queryRefundStatus(row.out_refund_no) }, { default: () => '退款查询' }))
       }
-      if (row.status === 'pending') {
-        btns.push(h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => closeOrder(row) }, { default: () => '关闭' }))
+      if (row.status !== 'paid' && row.status !== 'assigned') {
+        btns.push(h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => deleteOrder(row) }, { default: () => '删除' }))
       }
-      btns.push(h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => deleteOrder(row) }, { default: () => '删除' }))
       return btns
     }})
   },
@@ -371,7 +374,7 @@ async function checkPayStatus() {
   polling.value = true
   try {
     const { data } = await http.get(`/api/admin/orders/query_pay/${qrcodeOrder.value.out_trade_no}`)
-    if (data.status === 'paid') {
+    if (data.status === 'paid' || data.status === 'assigned') {
       qrcodeOrder.value.status = 'paid'
       message.success('支付成功')
       await loadOrders()

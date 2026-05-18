@@ -12,7 +12,7 @@ from app.core.redis import get_redis
 from app.core.config import settings
 from app.core.security import hash_password
 from app.models.user import User, UserToken
-from app.models.token import TokenInventory, Order, UsageLog
+from app.models.token import TokenInventory, Order, UsageLog, OrderStatus
 from app.models.content import Notice, Prompt, AIModel
 
 router = APIRouter()
@@ -474,6 +474,8 @@ async def assign_order_token(order_id: str, req: AssignTokenRequest, _=Depends(g
                 old_tok = tok_result.scalar_one_or_none()
                 if old_tok:
                     old_tok.token_value = token_val
+            if first_token_id is None:
+                first_token_id = ut.token_id
         else:
             # 分配：必须提供 Token
             if not token_val:
@@ -504,6 +506,7 @@ async def assign_order_token(order_id: str, req: AssignTokenRequest, _=Depends(g
 
     if first_token_id:
         order.token_id = first_token_id
+    order.status = OrderStatus.ASSIGNED
 
     user_result = await db.execute(select(User).where(User.id == order.user_id))
     u = user_result.scalar_one_or_none()
@@ -519,9 +522,20 @@ async def close_order(order_id: str, _=Depends(get_admin_user), db: AsyncSession
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
-    if order.status != "pending":
-        raise HTTPException(status_code=400, detail="只能关闭待支付订单")
-    order.status = "closed"
+    if order.status == OrderStatus.ASSIGNED:
+        raise HTTPException(status_code=400, detail="已分配订单请使用退款功能")
+    if order.status not in (OrderStatus.PENDING, OrderStatus.PAID):
+        raise HTTPException(status_code=400, detail="只能关闭待支付或已支付订单")
+    if order.status == OrderStatus.PENDING:
+        try:
+            from app.core.wechatpay import wechatpay_request
+            path = f"/v3/pay/transactions/out-trade-no/{order.out_trade_no}/close"
+            code, wx_result = await wechatpay_request(path, method="POST", data={"mchid": settings.WECHAT_MCHID})
+            if code not in (200, 204):
+                raise HTTPException(status_code=502, detail=f"微信关闭订单失败: {wx_result}")
+        except ImportError:
+            pass
+    order.status = OrderStatus.CLOSED
     return {"ok": True}
 
 
@@ -548,8 +562,8 @@ async def delete_order(order_id: str, _=Depends(get_admin_user), db: AsyncSessio
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
-    if order.status == "paid" and order.token_id:
-        raise HTTPException(status_code=400, detail="已分配 Token 的已支付订单不可删除")
+    if order.status in (OrderStatus.PAID, OrderStatus.ASSIGNED):
+        raise HTTPException(status_code=400, detail="已支付/已分配订单不可删除，请先退款")
     await db.delete(order)
     return {"ok": True}
 

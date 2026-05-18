@@ -9,6 +9,30 @@ def utcnow():
     return datetime.now(timezone.utc)
 
 
+class OrderStatus:
+    PENDING = "pending"
+    PAID = "paid"
+    ASSIGNED = "assigned"
+    CLOSED = "closed"
+    REFUNDED = "refunded"
+    REFUND_CHANGE = "refund_change"
+
+    ALL = {PENDING, PAID, ASSIGNED, CLOSED, REFUNDED, REFUND_CHANGE}
+
+    TRANSITIONS = {
+        PENDING:       {PAID, CLOSED},
+        PAID:          {ASSIGNED, REFUNDED},
+        ASSIGNED:      {REFUNDED},
+        CLOSED:        set(),
+        REFUNDED:      set(),
+        REFUND_CHANGE: {REFUNDED},
+    }
+
+    @classmethod
+    def can_transition(cls, current: str, target: str) -> bool:
+        return target in cls.TRANSITIONS.get(current, set())
+
+
 class TokenInventory(Base):
     __tablename__ = "token_inventory"
 
