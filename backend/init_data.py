@@ -11,8 +11,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.core.database import Base, engine
-from backend.app.models.content import AIModel, Group
+from app.core.database import Base, engine
+from app.models.content import AIModel, Group
 
 
 DEFAULT_GROUPS = [
