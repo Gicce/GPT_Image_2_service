@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -36,6 +34,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cyimage}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-cyimage}
       REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./certs:/app/certs:ro
+      - ./.env:/app/.env:rw
     depends_on:
       postgres:
         condition: service_healthy

@@ -2,36 +2,44 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # Database
     DATABASE_URL: str = "postgresql+asyncpg://cyimage:cyimage123@postgres:5432/cyimage"
-
-    # Redis
     REDIS_URL: str = "redis://redis:6379/0"
 
-    # JWT
     SECRET_KEY: str = "change-this-secret-key-in-production"
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7
 
-    # Admin
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
 
-    # 树杰支付
-    SHUJIE_PID: int = 1752
-    SHUJIE_MD5_KEY: str = "cA1DdJ1ODA2xoU0QEPD5pdE1C513D0V1"
-    SHUJIE_API_BASE: str = "https://www.shujiepay.com/api/pay"
-    SHUJIE_NOTIFY_URL: str = "http://150.158.124.224/api/pay/notify"
-    SHUJIE_RETURN_URL: str = "http://150.158.124.224/api/pay/return"
+    WECHAT_MCHID: str = ""
+    WECHAT_APPID: str = ""
+    WECHAT_APIV3_KEY: str = ""
+    WECHAT_CERT_SERIAL_NO: str = ""
+    WECHAT_PRIVATE_KEY_PATH: str = "/app/certs/apiclient_key.pem"
+    WECHAT_NOTIFY_URL: str = ""
+    WECHAT_REFUND_NOTIFY_URL: str = ""
+    WECHAT_PUBLIC_KEY_PATH: str = ""
+    WECHAT_PUBLIC_KEY_ID: str = ""
 
-    # Server
-    SERVER_BASE_URL: str = "http://150.158.124.224"
+    SERVER_BASE_URL: str = "https://www.zjcypc.com"
 
-    # Exchange rate API (free tier)
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 465
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_NAME: str = "CyImagePro"
+    SMTP_USE_SSL: bool = True
+
+    PAYMENT_MIN_TOTAL_USD: float = 0.01
+    PAYMENT_MAX_TOTAL_USD: float = 1000.0
+    PAYMENT_MIN_PER_ITEM_USD: float = 0.01
+
     EXCHANGE_RATE_API: str = "https://open.er-api.com/v6/latest/USD"
 
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 
 settings = Settings()
