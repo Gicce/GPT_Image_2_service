@@ -161,7 +161,7 @@ async def register_verify(req: RegisterVerifyRequest, db: AsyncSession = Depends
         trial_token = await db.execute(
             select(TokenInventory).where(
                 TokenInventory.is_trial == True,
-                TokenInventory.group == "sora",
+                TokenInventory.group == "image",
                 TokenInventory.is_assigned == False,
             ).limit(1)
         )
@@ -177,7 +177,7 @@ async def register_verify(req: RegisterVerifyRequest, db: AsyncSession = Depends
             id=str(uuid.uuid4()),
             user_id=user.id,
             token_id=trial_token.id,
-            group="sora",
+            group="image",
             balance_usd=1.0,
             is_trial=True,
         )
@@ -224,7 +224,7 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
         trial_token = await db.execute(
             select(TokenInventory).where(
                 TokenInventory.is_trial == True,
-                TokenInventory.group == "sora",
+                TokenInventory.group == "image",
                 TokenInventory.is_assigned == False,
             ).limit(1)
         )
@@ -240,7 +240,7 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
             id=str(uuid.uuid4()),
             user_id=user.id,
             token_id=trial_token.id,
-            group="sora",
+            group="image",
             balance_usd=1.0,
             is_trial=True,
         )
@@ -369,7 +369,7 @@ async def upgrade_trial(
         raise HTTPException(status_code=400, detail="仅普通账户可申请试用")
 
     existing_ut = await db.execute(
-        select(UserToken).where(UserToken.user_id == user.id, UserToken.group == "sora")
+        select(UserToken).where(UserToken.user_id == user.id, UserToken.group == "image")
     )
     if existing_ut.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="已拥有该分组的 Token")
@@ -377,7 +377,7 @@ async def upgrade_trial(
     trial_token = await db.execute(
         select(TokenInventory).where(
             TokenInventory.is_trial == True,
-            TokenInventory.group == "sora",
+            TokenInventory.group == "image",
             TokenInventory.is_assigned == False,
         ).limit(1)
     )
@@ -397,7 +397,7 @@ async def upgrade_trial(
         id=str(uuid.uuid4()),
         user_id=user.id,
         token_id=trial_token.id,
-        group="sora",
+        group="image",
         balance_usd=1.0,
         is_trial=True,
     )

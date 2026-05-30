@@ -18,6 +18,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import http from '../api/http'
+import { getTodayChina } from '../utils/time'
 
 const accentColors = [
   'linear-gradient(90deg, #00d4aa, #00d4aa00)',
@@ -49,8 +50,15 @@ onMounted(async () => {
       .filter(([k]) => k !== '1')
       .reduce((s, [, v]) => s + v, 0)
     const trialStock = (stock.data.image || {})['1'] ?? 0
-    const today = new Date().toISOString().slice(0, 10)
-    const todayOrders = orders.data.filter(o => o.created_at.startsWith(today) && o.status === 'paid').length
+    const today = getTodayChina()
+    const todayOrders = orders.data.filter(o => {
+      if (!o.created_at) return false
+      const orderDate = new Date(o.created_at)
+      const utcMs = orderDate.getTime() + orderDate.getTimezoneOffset() * 60 * 1000
+      const china = new Date(utcMs + 8 * 60 * 60 * 1000)
+      const orderDay = china.toISOString().slice(0, 10)
+      return orderDay === today && o.status === 'paid'
+    }).length
     stats.value = [
       { label: '用户总数', value: users.data.length },
       { label: '今日成功订单', value: todayOrders },

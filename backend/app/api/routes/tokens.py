@@ -33,7 +33,7 @@ async def get_trial_stock(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(func.count()).select_from(TokenInventory).where(
             TokenInventory.is_trial == True,
-            TokenInventory.group == "sora",
+            TokenInventory.group == "image",
             TokenInventory.is_assigned == False,
         )
     )

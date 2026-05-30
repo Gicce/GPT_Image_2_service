@@ -47,6 +47,9 @@ class AIModel(Base):
     price_cached: Mapped[str] = mapped_column(String(32), nullable=True)
     price_per_call: Mapped[str] = mapped_column(String(32), nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    context_window: Mapped[int] = mapped_column(Integer, default=32768)
+    supports_tools: Mapped[bool] = mapped_column(Boolean, default=False)
+    supports_vision: Mapped[bool] = mapped_column(Boolean, default=False)
 
     __table_args__ = (UniqueConstraint('name', 'group', name='uq_model_group'),)
 

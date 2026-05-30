@@ -6,7 +6,7 @@
 
     <div class="stat-card" style="margin-bottom:20px">
       <div class="stat-card-accent" style="background:linear-gradient(90deg,#00d4aa,#00d4aa00)"></div>
-      <div class="stat-card-label">sora 试用 Token 可用库存</div>
+      <div class="stat-card-label">image 试用 Token 可用库存</div>
       <div class="stat-card-value">{{ trialCount }}</div>
     </div>
 
@@ -34,7 +34,7 @@ const tokensRaw = ref('')
 
 async function loadStock() {
   const { data } = await http.get('/api/admin/tokens/stock')
-  trialCount.value = data.sora?.trial ?? 0
+  trialCount.value = data.image?.trial ?? 0
 }
 
 async function submit() {
@@ -44,7 +44,7 @@ async function submit() {
   try {
     const { data } = await http.post('/api/admin/tokens/batch', {
       tokens,
-      group: 'sora',
+      group: 'image',
       is_trial: true,
     })
     msg.success(`成功录入 ${data.added} 个 Token`)

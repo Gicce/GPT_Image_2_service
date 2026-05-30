@@ -28,6 +28,7 @@
           <n-descriptions-item label="支付方式">{{ detailOrder.pay_type }}</n-descriptions-item>
           <n-descriptions-item label="创建时间">{{ formatTime(detailOrder.created_at) }}</n-descriptions-item>
           <n-descriptions-item label="支付时间">{{ formatTime(detailOrder.paid_at) }}</n-descriptions-item>
+          <n-descriptions-item v-if="detailOrder.refund_requested_at" label="退款申请时间">{{ formatTime(detailOrder.refund_requested_at) }}</n-descriptions-item>
           <n-descriptions-item v-if="detailOrder.token_value" label="Token" :span="2">
             <code>{{ detailOrder.token_value }}...</code>
           </n-descriptions-item>
@@ -145,10 +146,11 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, h, nextTick, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, h, nextTick, watch } from 'vue'
 import { NTag, NButton, NSpace, useMessage, useDialog } from 'naive-ui'
 import QRCode from 'qrcode'
 import http from '../api/http'
+import { formatTime } from '../utils/time'
 
 const message = useMessage()
 const dialog = useDialog()
@@ -230,14 +232,29 @@ const statusOptions = [
   { label: '待支付', value: 'pending' },
   { label: '已支付', value: 'paid' },
   { label: '已分配', value: 'assigned' },
+  { label: '退款待确认', value: 'refunding' },
   { label: '已关闭', value: 'closed' },
   { label: '已退款', value: 'refunded' },
   { label: '退款异常', value: 'refund_change' },
 ]
-const statusTag = { pending: 'warning', paid: 'success', assigned: 'info', closed: 'default', refunded: 'info', refund_change: 'error' }
-const statusLabel = { pending: '待支付', paid: '已支付', assigned: '已分配', closed: '已关闭', refunded: '已退款', refund_change: '退款异常' }
+const statusTag = { pending: 'warning', paid: 'success', assigned: 'info', refunding: 'warning', closed: 'default', refunded: 'info', refund_change: 'error' }
+const statusLabel = { pending: '待支付', paid: '已支付', assigned: '已分配', refunding: '退款待确认', closed: '已关闭', refunded: '已退款', refund_change: '退款异常' }
 
-function formatTime(v) { return v ? v.replace('T', ' ').slice(0, 19) : '-' }
+function refundCountdown(refund_requested_at) {
+  if (!refund_requested_at) return ''
+  const requested = new Date(refund_requested_at)
+  const deadline = new Date(requested.getTime() + 15 * 60 * 1000)
+  const remaining = deadline - new Date()
+  if (remaining <= 0) return '即将自动批准'
+  const min = Math.floor(remaining / 60000)
+  const sec = Math.floor((remaining % 60000) / 1000)
+  return `${min}:${sec.toString().padStart(2, '0')} 后自动退款`
+}
+
+let countdownTimer = null
+const now = ref(Date.now())
+onMounted(() => { countdownTimer = setInterval(() => { now.value = Date.now() }, 1000) })
+onUnmounted(() => { if (countdownTimer) clearInterval(countdownTimer) })
 
 const filtered = computed(() => {
   let list = orders.value
@@ -259,9 +276,15 @@ const columns = [
     render: row => h(NTag, { size: 'small', bordered: false }, { default: () => row.group }) },
   { title: '金额(USD)', key: 'amount_usd', width: 90,
     render: row => `$${Number(row.amount_usd).toFixed(2)}` },
-  { title: '状态', key: 'status', width: 80,
-    render: row => h(NTag, { type: statusTag[row.status] || 'default', size: 'small', bordered: false },
-      { default: () => statusLabel[row.status] || row.status }) },
+  { title: '状态', key: 'status', width: 120,
+    render: row => h('div', [
+      h(NTag, { type: statusTag[row.status] || 'default', size: 'small', bordered: false },
+        { default: () => statusLabel[row.status] || row.status }),
+      row.status === 'refunding' && row.refund_requested_at
+        ? h('div', { style: 'font-size:11px;color:#f59e0b;margin-top:2px' },
+            refundCountdown(row.refund_requested_at))
+        : null
+    ]) },
   { title: '时间', key: 'created_at', width: 150,
     render: row => formatTime(row.created_at) },
   { title: '操作', key: 'actions', width: 260,
@@ -273,6 +296,10 @@ const columns = [
       if (row.status === 'paid') {
         btns.push(h(NButton, { size: 'small', quaternary: true, type: 'success', onClick: () => openAssign(row) }, { default: () => '分配' }))
       }
+      if (row.status === 'refunding') {
+        btns.push(h(NButton, { size: 'small', quaternary: true, type: 'success', onClick: () => approveRefund(row) }, { default: () => '批准退款' }))
+        btns.push(h(NButton, { size: 'small', quaternary: true, type: 'warning', onClick: () => rejectRefund(row) }, { default: () => '拒绝退款' }))
+      }
       if (row.status === 'pending') {
         btns.push(h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => closeOrder(row) }, { default: () => '关闭' }))
       }
@@ -282,7 +309,7 @@ const columns = [
       if (row.status === 'refunded' || row.status === 'refund_change') {
         btns.push(h(NButton, { size: 'small', quaternary: true, type: 'info', onClick: () => queryRefundStatus(row.out_refund_no) }, { default: () => '退款查询' }))
       }
-      if (row.status !== 'paid' && row.status !== 'assigned') {
+      if (row.status !== 'paid' && row.status !== 'assigned' && row.status !== 'refunding') {
         btns.push(h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => deleteOrder(row) }, { default: () => '删除' }))
       }
       return btns

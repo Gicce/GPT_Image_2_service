@@ -112,6 +112,7 @@
 import { ref, computed, onMounted, h } from 'vue'
 import { NTag, NButton, NSpace, useMessage, useDialog } from 'naive-ui'
 import http from '../api/http'
+import { formatTime } from '../utils/time'
 
 const message = useMessage()
 const dialog = useDialog()
@@ -142,11 +143,6 @@ const allTypeOptions = [
 
 const typeTag = { trial: 'warning', paid: 'success', normal: 'default' }
 const typeLabel = { trial: '试用', paid: '付费', normal: '普通' }
-
-function formatTime(iso) {
-  if (!iso) return '-'
-  return iso.replace('T', ' ').slice(0, 19)
-}
 
 function copyToken(token) {
   navigator.clipboard.writeText(token).then(
@@ -188,7 +184,7 @@ const columns = [
     render: row => h(NTag, { type: row.is_active ? 'success' : 'error', size: 'small', bordered: false },
       { default: () => row.is_active ? '正常' : '禁用' }) },
   { title: '注册时间', key: 'created_at', width: 160,
-    render: row => row.created_at?.replace('T', ' ').slice(0, 19) },
+    render: row => formatTime(row.created_at) },
   { title: '操作', key: 'actions', width: 200,
     render: row => h(NSpace, { size: 'small' }, {
       default: () => [
@@ -204,7 +200,7 @@ const usageColumns = [
   { title: '模型', key: 'model', width: 120 },
   { title: '类型', key: 'usage_type', width: 80 },
   { title: '费用($)', key: 'cost_usd', width: 100, render: row => `$${Number(row.cost_usd).toFixed(4)}` },
-  { title: '时间', key: 'created_at', width: 160, render: row => row.created_at?.replace('T', ' ').slice(0, 19) },
+  { title: '时间', key: 'created_at', width: 160, render: row => formatTime(row.created_at) },
 ]
 
 async function loadUsers() {

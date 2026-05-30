@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     # Exchange rate API (free tier)
     EXCHANGE_RATE_API: str = "https://open.er-api.com/v6/latest/USD"
 
+    # PackyAPI price sync
+    PACKYAPI_PRICING_URL: str = "https://www.packyapi.com/api/pricing"
+    PACKYAPI_SYNC_INTERVAL_MINUTES: int = 60
+    PACKYAPI_MARKUP_PERCENT: float = 15.0
+
     class Config:
         env_file = ".env"
         extra = "ignore"

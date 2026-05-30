@@ -9,6 +9,8 @@ from app.models.user import User, UserToken
 
 router = APIRouter()
 
+MODEL_TYPE_MAP = {"chat": "agent"}
+
 
 @router.get("")
 async def get_models(
@@ -34,7 +36,7 @@ async def get_models(
             "display_name": m.display_name,
             "provider": m.provider,
             "billing_type": m.billing_type,
-            "model_type": m.model_type,
+            "model_type": MODEL_TYPE_MAP.get(m.model_type, m.model_type),
             "trial_allowed": m.trial_allowed,
             "group": m.group,
             "user_has_access": m.group in user_groups if user_groups else False,
@@ -42,6 +44,9 @@ async def get_models(
             "price_output": m.price_output,
             "price_cached": m.price_cached,
             "price_per_call": m.price_per_call,
+            "context_window": m.context_window or 32768,
+            "supports_tools": m.supports_tools or False,
+            "supports_vision": m.supports_vision or False,
         }
         for m in models
     ]

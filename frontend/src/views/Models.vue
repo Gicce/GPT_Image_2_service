@@ -54,6 +54,19 @@
               </n-space>
             </n-form-item>
           </n-gi>
+          <n-gi>
+            <n-form-item label="上下文窗口">
+              <n-input-number v-model:value="form.context_window" :min="0" style="width:100%" />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="能力">
+              <n-space>
+                <n-switch v-model:value="form.supports_tools" /><span>工具</span>
+                <n-switch v-model:value="form.supports_vision" /><span>视觉</span>
+              </n-space>
+            </n-form-item>
+          </n-gi>
         </n-grid>
         <n-divider>计费参数</n-divider>
         <n-grid :cols="2" :x-gap="12" v-if="form.billing_type === 'per_call'">
@@ -104,14 +117,16 @@ const saving = ref(false)
 
 const defaultForm = () => ({
   name: '', display_name: '', provider: 'OpenAI', billing_type: 'per_token',
-  model_type: 'chat', group: '', is_enabled: true, trial_allowed: false,
+  model_type: 'agent', group: '', is_enabled: true, trial_allowed: false,
   sort_order: 0, price_input: '', price_output: '', price_cached: '', price_per_call: '',
+  context_window: 32768, supports_tools: false, supports_vision: false,
 })
 const form = ref(defaultForm())
 
 const typeOptions = [
   { label: '图片', value: 'image' },
-  { label: '对话', value: 'chat' },
+  { label: 'Agent', value: 'agent' },
+  { label: '后处理', value: 'postprocess' },
 ]
 const billingOptions = [
   { label: '按量计费（per token）', value: 'per_token' },

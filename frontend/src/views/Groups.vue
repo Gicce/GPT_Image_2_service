@@ -10,7 +10,7 @@
     <n-modal v-model:show="showModal" preset="card" :title="editId ? '编辑分组' : '添加分组'" style="width:420px">
       <n-form label-placement="left" label-width="70">
         <n-form-item label="名称">
-          <n-input v-model:value="form.name" placeholder="如 codex、sora" />
+          <n-input v-model:value="form.name" placeholder="如 image、agent" />
         </n-form-item>
         <n-form-item label="描述">
           <n-input v-model:value="form.description" placeholder="可选描述" />

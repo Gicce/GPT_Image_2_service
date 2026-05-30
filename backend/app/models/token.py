@@ -14,15 +14,17 @@ class OrderStatus:
     PAID = "paid"
     ASSIGNED = "assigned"
     CLOSED = "closed"
+    REFUNDING = "refunding"
     REFUNDED = "refunded"
     REFUND_CHANGE = "refund_change"
 
-    ALL = {PENDING, PAID, ASSIGNED, CLOSED, REFUNDED, REFUND_CHANGE}
+    ALL = {PENDING, PAID, ASSIGNED, CLOSED, REFUNDING, REFUNDED, REFUND_CHANGE}
 
     TRANSITIONS = {
         PENDING:       {PAID, CLOSED},
-        PAID:          {ASSIGNED, REFUNDED},
-        ASSIGNED:      {REFUNDED},
+        PAID:          {ASSIGNED, REFUNDING},
+        ASSIGNED:      {REFUNDING},
+        REFUNDING:     {REFUNDED, PAID, ASSIGNED},
         CLOSED:        set(),
         REFUNDED:      set(),
         REFUND_CHANGE: {REFUNDED},
@@ -66,6 +68,9 @@ class Order(Base):
     token_id: Mapped[str] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    refunded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    refund_requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    status_before_refund: Mapped[str] = mapped_column(String(16), nullable=True)
 
     user: Mapped["User"] = relationship("User", back_populates="orders")
 

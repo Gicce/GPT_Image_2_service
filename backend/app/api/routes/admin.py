@@ -254,12 +254,16 @@ class ModelCreate(BaseModel):
     price_cached: Optional[str] = None
     price_per_call: Optional[str] = None
     sort_order: int = 0
+    context_window: int = 32768
+    supports_tools: bool = False
+    supports_vision: bool = False
 
 
 class ModelUpdate(BaseModel):
     display_name: Optional[str] = None
     provider: Optional[str] = None
     billing_type: Optional[str] = None
+    model_type: Optional[str] = None
     is_enabled: Optional[bool] = None
     trial_allowed: Optional[bool] = None
     group: Optional[str] = None
@@ -268,6 +272,12 @@ class ModelUpdate(BaseModel):
     price_cached: Optional[str] = None
     price_per_call: Optional[str] = None
     sort_order: Optional[int] = None
+    context_window: Optional[int] = None
+    supports_tools: Optional[bool] = None
+    supports_vision: Optional[bool] = None
+
+
+MODEL_TYPE_MAP = {"chat": "agent"}
 
 
 @router.get("/models")
@@ -275,11 +285,14 @@ async def list_models(_=Depends(get_admin_user), db: AsyncSession = Depends(get_
     result = await db.execute(select(AIModel).order_by(AIModel.sort_order))
     return [{"id": m.id, "name": m.name, "display_name": m.display_name,
              "provider": m.provider, "billing_type": m.billing_type,
-             "model_type": m.model_type, "group": m.group,
+             "model_type": MODEL_TYPE_MAP.get(m.model_type, m.model_type), "group": m.group,
              "is_enabled": m.is_enabled, "trial_allowed": m.trial_allowed,
              "price_input": m.price_input, "price_output": m.price_output,
              "price_cached": m.price_cached, "price_per_call": m.price_per_call,
-             "sort_order": m.sort_order}
+             "sort_order": m.sort_order,
+             "context_window": m.context_window or 32768,
+             "supports_tools": m.supports_tools or False,
+             "supports_vision": m.supports_vision or False}
             for m in result.scalars().all()]
 
 
@@ -431,7 +444,7 @@ async def list_orders(_=Depends(get_admin_user), db: AsyncSession = Depends(get_
 
 
 class AssignTokenRequest(BaseModel):
-    tokens: dict[str, str]  # { "sora": "sk-xxx", "codex": "sk-yyy" }; value 可为空表示充值不换 Token
+    tokens: dict[str, str]  # { "image": "sk-xxx", "agent": "sk-yyy" }; value 可为空表示充值不换 Token
 
 
 @router.post("/orders/{order_id}/assign")
@@ -537,6 +550,83 @@ async def close_order(order_id: str, _=Depends(get_admin_user), db: AsyncSession
             pass
     order.status = OrderStatus.CLOSED
     return {"ok": True}
+
+
+@router.post("/orders/{order_id}/refund/approve")
+async def approve_refund(order_id: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    import json as _json
+    from app.core.wechatpay import wechatpay_request
+
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if order.status != OrderStatus.REFUNDING:
+        raise HTTPException(status_code=400, detail="订单不在退款待确认状态")
+
+    # 冲正：对 ASSIGNED 订单扣除余额、撤销 Token
+    if order.status_before_refund == OrderStatus.ASSIGNED:
+        items = _json.loads(order.items_json) if order.items_json else [{"group": order.group, "amount_usd": float(order.amount_usd)}]
+        for item in items:
+            ut_result = await db.execute(
+                select(UserToken).where(UserToken.user_id == order.user_id, UserToken.group == item["group"])
+            )
+            ut = ut_result.scalar_one_or_none()
+            if ut:
+                new_balance = float(ut.balance_usd) - item["amount_usd"]
+                if new_balance <= 0:
+                    tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
+                    tok = tok_result.scalar_one_or_none()
+                    if tok:
+                        tok.is_assigned = False
+                        tok.assigned_to = None
+                        tok.assigned_at = None
+                    await db.delete(ut)
+                else:
+                    ut.balance_usd = new_balance
+
+    out_refund_no = f"RF{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+    total_fee = int(round(float(order.amount_cny) * 100))
+    refund_data = {
+        "out_refund_no": out_refund_no,
+        "out_trade_no": order.out_trade_no,
+        "reason": "admin approved refund",
+        "amount": {"refund": total_fee, "total": total_fee, "currency": "CNY"},
+    }
+    if settings.WECHAT_REFUND_NOTIFY_URL:
+        refund_data["notify_url"] = settings.WECHAT_REFUND_NOTIFY_URL
+
+    code, wx_result = await wechatpay_request("/v3/refund/domestic/refunds", method="POST", data=refund_data)
+    if code != 200:
+        raise HTTPException(status_code=502, detail=f"退款失败: {wx_result}")
+
+    order.status = OrderStatus.REFUNDED
+    order.out_refund_no = out_refund_no
+    order.refunded_at = datetime.now(timezone.utc)
+
+    redis = get_redis()
+    await redis.delete(f"refund:auto:{order.out_trade_no}")
+
+    return {"status": "refunded", "out_refund_no": out_refund_no}
+
+
+@router.post("/orders/{order_id}/refund/reject")
+async def reject_refund(order_id: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if order.status != OrderStatus.REFUNDING:
+        raise HTTPException(status_code=400, detail="订单不在退款待确认状态")
+
+    order.status = order.status_before_refund or OrderStatus.PAID
+    order.status_before_refund = None
+    order.refund_requested_at = None
+
+    redis = get_redis()
+    await redis.delete(f"refund:auto:{order.out_trade_no}")
+
+    return {"status": order.status, "message": "退款已拒绝"}
 
 
 class OrderUpdate(BaseModel):
