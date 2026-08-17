@@ -1,154 +1,300 @@
+import json
+import os
+import re
+import uuid
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
-from pydantic import BaseModel
-from datetime import datetime, timezone
-from typing import Optional
-import uuid
+from sqlalchemy import select, func, or_
+from pydantic import BaseModel, Field
 
 from app.core.database import get_db
 from app.core.security import get_admin_user
 from app.core.redis import get_redis
 from app.core.config import settings
-from app.core.security import hash_password
-from app.models.user import User, UserToken
+from app.models.user import User
 from app.models.token import TokenInventory, Order, UsageLog, OrderStatus
-from app.models.content import Notice, Prompt, AIModel
+from app.models.content import Notice, AIModel
+from app.models.billing import BillingTransaction
+from app.models.audit import AdminAuditLog
+from app.services import billing
+from app.services import runtime_token as rt
 
 router = APIRouter()
 
+IMAGE2_MODEL_ID = "gpt-image-2"
 
-import re
+mask_token = rt.mask_token
 
-# ── Token Inventory ──────────────────────────────────────────────
+
+async def _record_audit(db: AsyncSession, admin: dict, action: str, detail: dict):
+    db.add(AdminAuditLog(
+        admin=(admin or {}).get("sub", "admin"),
+        action=action,
+        detail=json.dumps(detail, ensure_ascii=False),
+    ))
+
+
+# ── Image2 配置（唯一的“模型中心”） ──────────────────────────────
+
+class Image2ConfigUpdate(BaseModel):
+    display_name: Optional[str] = Field(default=None, max_length=128)
+    provider: Optional[str] = Field(default=None, max_length=32)
+    is_enabled: Optional[bool] = None
+    trial_allowed: Optional[bool] = None
+    price_per_call_usd: Optional[Decimal] = Field(default=None, gt=0, max_digits=18, decimal_places=6)
+
+
+@router.get("/image2-config")
+async def get_image2_config(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    cfg = await billing.get_image2_config(db)
+    if cfg is None:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "id": cfg.id,
+        "model_id": cfg.name,
+        "display_name": cfg.display_name,
+        "provider": cfg.provider,
+        "enabled": cfg.is_enabled,
+        "trial_enabled": cfg.trial_allowed,
+        "billing_mode": "per_call",
+        "price_per_call_usd": str(cfg.price_per_call) if cfg.price_per_call is not None else None,
+        "currency": cfg.currency,
+    }
+
+
+@router.put("/image2-config")
+async def update_image2_config(
+    req: Image2ConfigUpdate,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """仅允许修改 Image2 配置；model_id / 计费方式 / 币种为系统固定值，价格修改写审计日志。"""
+    cfg = await billing.get_image2_config(db)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="Image2 配置不存在")
+
+    changed = {}
+    if req.display_name is not None and req.display_name.strip():
+        cfg.display_name = req.display_name.strip()
+        changed["display_name"] = cfg.display_name
+    if req.provider is not None and req.provider.strip():
+        cfg.provider = req.provider.strip()
+        changed["provider"] = cfg.provider
+    if req.is_enabled is not None:
+        cfg.is_enabled = req.is_enabled
+        changed["enabled"] = req.is_enabled
+    if req.trial_allowed is not None:
+        cfg.trial_allowed = req.trial_allowed
+        changed["trial_enabled"] = req.trial_allowed
+    if req.price_per_call_usd is not None:
+        old_price = cfg.price_per_call
+        cfg.price_per_call = billing.q6(req.price_per_call_usd)
+        changed["price_per_call_usd"] = {
+            "from": str(old_price) if old_price is not None else None,
+            "to": str(cfg.price_per_call),
+        }
+
+    if "price_per_call_usd" in changed:
+        await _record_audit(db, admin, "image2_price_update", changed)
+
+    return {"ok": True, "changed": changed}
+
+
+# ── Token 库存（统一 Runtime Token 池） ──────────────────────────
 
 class TokenBatchInput(BaseModel):
     tokens: list[str]
-    group: str
     is_trial: bool = False
+
+
+# Runtime Token 合理长度下限：只拦截明显误输入，不校验具体格式（Token 格式未来可能变化）
+TOKEN_MIN_LENGTH = 8
+
+
+def _extract_token_value(line: str) -> str:
+    """提取行内 sk- 开头的 Token 片段（支持「名称 sk-xxx」整行粘贴）；无 sk- 时整行即 Token。
+    剥离复制粘贴常见带入的尾部标点。"""
+    t = line.strip()
+    match = re.search(r"(sk-\S+)", t)
+    value = match.group(1) if match else t
+    return value.rstrip(",;，；、.。)]）")
 
 
 @router.post("/tokens/batch")
 async def add_tokens(req: TokenBatchInput, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    if not req.group:
-        raise HTTPException(status_code=400, detail="必须指定分组")
-    added = 0
-    for t in req.tokens:
-        t = t.strip()
-        if not t:
+    """批量录入：解析 → 批内去重 → 库内查重 → 新增。
+    返回完整统计（total/added/duplicate/invalid + 脱敏明细），绝不静默吞掉任何输入。"""
+    added = duplicate = invalid = 0
+    details: list[dict] = []
+    seen: set[str] = set()
+
+    for raw in req.tokens:
+        value = _extract_token_value(raw)
+        if not value:
+            continue  # 空白行：不计入任何统计
+        if len(value) < TOKEN_MIN_LENGTH:
+            invalid += 1
+            details.append({"token": mask_token(value), "reason": "invalid"})
             continue
-        match = re.search(r'(sk-\S+)', t)
-        token_value = match.group(1) if match else t
-        existing = await db.execute(select(TokenInventory).where(TokenInventory.token_value == token_value))
-        if existing.scalar_one_or_none():
+        if value in seen:
+            duplicate += 1
+            details.append({"token": mask_token(value), "reason": "duplicate"})
             continue
-        db.add(TokenInventory(
-            id=str(uuid.uuid4()),
-            token_value=token_value,
-            group=req.group,
-            is_trial=req.is_trial,
-        ))
+        seen.add(value)
+        # limit(1)：旧库可能存在同 token 多 group 行，scalar_one_or_none 会抛 MultipleResultsFound
+        existing = await db.execute(
+            select(TokenInventory.id).where(TokenInventory.token_value == value).limit(1)
+        )
+        if existing.scalar_one_or_none() is not None:
+            duplicate += 1
+            details.append({"token": mask_token(value), "reason": "duplicate"})
+            continue
+        db.add(TokenInventory(id=str(uuid.uuid4()), token_value=value, is_trial=req.is_trial))
         added += 1
-    return {"added": added}
+
+    return {
+        "total": added + duplicate + invalid,
+        "added": added,
+        "duplicate": duplicate,
+        "invalid": invalid,
+        "details": details,
+    }
 
 
-@router.get("/tokens/stock")
-async def get_stock(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    from app.models.content import Group
-    groups_result = await db.execute(select(Group).order_by(Group.sort_order))
-    groups = groups_result.scalars().all()
-    result = {}
-    for g in groups:
-        count = await db.execute(
-            select(func.count()).select_from(TokenInventory).where(
-                TokenInventory.group == g.name,
-                TokenInventory.is_assigned == False,
-            )
+@router.get("/tokens/stats")
+async def get_token_stats(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    """统一 Token 池统计：总数 / 可用 / 试用可用 / 已分配 / 禁用。无任何模型分类维度。"""
+    async def _count(*conditions):
+        result = await db.execute(
+            select(func.count()).select_from(TokenInventory).where(*conditions)
         )
-        trial_count = await db.execute(
-            select(func.count()).select_from(TokenInventory).where(
-                TokenInventory.group == g.name,
-                TokenInventory.is_trial == True,
-                TokenInventory.is_assigned == False,
-            )
+        return result.scalar()
+
+    total = await _count()
+    available = await _count(TokenInventory.is_assigned == False, TokenInventory.is_disabled == False)
+    trial_available = await _count(
+        TokenInventory.is_trial == True,
+        TokenInventory.is_assigned == False,
+        TokenInventory.is_disabled == False,
+    )
+    assigned = await _count(TokenInventory.is_assigned == True)
+    disabled = await _count(TokenInventory.is_disabled == True)
+
+    return {
+        "total": total,
+        "available": available,
+        "trial_available": trial_available,
+        "assigned": assigned,
+        "disabled": disabled,
+    }
+
+
+@router.get("/tokens")
+async def list_tokens(
+    is_trial: Optional[bool] = None,
+    is_assigned: Optional[bool] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    _=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Token 列表（脱敏）。
+
+    search：匹配 分配用户名 / 邮箱 / Token 明文片段（如后四位）。
+    返回 assigned_username / assigned_email，管理员无需再对着 UUID 找人。
+    """
+    query = select(TokenInventory)
+    if is_trial is not None:
+        query = query.where(TokenInventory.is_trial == is_trial)
+    if is_assigned is not None:
+        query = query.where(TokenInventory.is_assigned == is_assigned)
+
+    if search:
+        s = f"%{search.strip()}%"
+        uid_res = await db.execute(
+            select(User.id).where(or_(User.username.ilike(s), User.email.ilike(s)))
         )
-        result[g.name] = {"available": count.scalar(), "trial": trial_count.scalar()}
-    return result
+        uid_list = [row.id for row in uid_res]
+        conditions = [TokenInventory.token_value.ilike(s)]
+        if uid_list:
+            conditions.append(TokenInventory.assigned_to.in_(uid_list))
+        query = query.where(or_(*conditions))
 
+    total_result = await db.execute(select(func.count()).select_from(query.subquery()))
+    total = total_result.scalar()
 
-@router.get("/tokens/available")
-async def list_available_tokens(group: str = None, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    query = select(TokenInventory).where(TokenInventory.is_assigned == False)
-    if group:
-        query = query.where(TokenInventory.group == group)
-    result = await db.execute(query.limit(100))
+    page = max(1, page)
+    page_size = max(1, min(200, page_size))
+    result = await db.execute(
+        query.order_by(TokenInventory.created_at.desc())
+        .offset((page - 1) * page_size).limit(page_size)
+    )
     tokens = result.scalars().all()
-    return [{"id": t.id, "token_value": t.token_value,
-             "group": t.group, "is_trial": t.is_trial} for t in tokens]
+
+    assigned_ids = list({t.assigned_to for t in tokens if t.assigned_to})
+    user_map: dict[str, User] = {}
+    if assigned_ids:
+        ures = await db.execute(select(User).where(User.id.in_(assigned_ids)))
+        user_map = {u.id: u for u in ures.scalars().all()}
+
+    def _assigned_info(t: TokenInventory) -> dict:
+        u = user_map.get(t.assigned_to) if t.assigned_to else None
+        return {"assigned_username": u.username if u else None, "assigned_email": u.email if u else None}
+
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "tokens": [
+            {
+                "id": t.id,
+                "token_value": mask_token(t.token_value),
+                "is_trial": t.is_trial,
+                "is_assigned": t.is_assigned,
+                "is_disabled": t.is_disabled,
+                "assigned_to": t.assigned_to,
+                "assigned_at": t.assigned_at.isoformat() if t.assigned_at else None,
+                "created_at": t.created_at.isoformat(),
+                **_assigned_info(t),
+            }
+            for t in tokens
+        ],
+    }
 
 
-# ── Groups ───────────────────────────────────────────────────────
-
-class GroupCreate(BaseModel):
-    name: str
-    description: str = ""
-    sort_order: int = 0
-
-class GroupUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    sort_order: Optional[int] = None
+class TokenUpdate(BaseModel):
+    is_disabled: Optional[bool] = None
+    is_trial: Optional[bool] = None
 
 
-@router.get("/groups")
-async def get_groups(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    from app.models.content import Group
-    result = await db.execute(select(Group).order_by(Group.sort_order))
-    groups = result.scalars().all()
-    return [{"id": g.id, "name": g.name, "description": g.description, "sort_order": g.sort_order} for g in groups]
+@router.put("/tokens/{token_id}")
+async def update_token(token_id: str, req: TokenUpdate, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(TokenInventory).where(TokenInventory.id == token_id))
+    t = result.scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Token 不存在")
+    if req.is_disabled is not None:
+        t.is_disabled = req.is_disabled
+    if req.is_trial is not None:
+        t.is_trial = req.is_trial
+    return {"ok": True}
 
 
-@router.post("/groups")
-async def create_group(req: GroupCreate, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    from app.models.content import Group
-    existing = await db.execute(select(Group).where(Group.name == req.name))
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="分组名称已存在")
-    if not req.sort_order:
-        max_order = await db.execute(select(func.coalesce(func.max(Group.sort_order), 0)))
-        req.sort_order = max_order.scalar() + 1
-    g = Group(id=str(uuid.uuid4()), name=req.name, description=req.description, sort_order=req.sort_order)
-    db.add(g)
-    await db.flush()
-    return {"id": g.id, "name": g.name, "description": g.description, "sort_order": g.sort_order}
-
-
-@router.put("/groups/{group_id}")
-async def update_group(group_id: str, req: GroupUpdate, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    from app.models.content import Group
-    result = await db.execute(select(Group).where(Group.id == group_id))
-    g = result.scalar_one_or_none()
-    if not g:
-        raise HTTPException(status_code=404, detail="分组不存在")
-    for k, v in req.model_dump(exclude_none=True).items():
-        setattr(g, k, v)
-    await db.flush()
-    return {"id": g.id, "name": g.name, "description": g.description, "sort_order": g.sort_order}
-
-
-@router.delete("/groups/{group_id}")
-async def delete_group(group_id: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    from app.models.content import Group
-    result = await db.execute(select(Group).where(Group.id == group_id))
-    g = result.scalar_one_or_none()
-    if not g:
-        raise HTTPException(status_code=404, detail="分组不存在")
-    model_count = await db.execute(select(func.count()).select_from(AIModel).where(AIModel.group == g.name))
-    token_count = await db.execute(select(func.count()).select_from(TokenInventory).where(TokenInventory.group == g.name))
-    if model_count.scalar() > 0 or token_count.scalar() > 0:
-        raise HTTPException(status_code=400, detail="该分组下有模型或Token在使用，无法删除")
-    await db.delete(g)
-    await db.flush()
+@router.delete("/tokens/{token_id}")
+async def delete_token(token_id: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(TokenInventory).where(TokenInventory.id == token_id))
+    t = result.scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Token 不存在")
+    if t.is_assigned:
+        raise HTTPException(status_code=400, detail="Token 已分配，无法删除")
+    await db.delete(t)
     return {"ok": True}
 
 
@@ -169,7 +315,6 @@ async def update_notice(req: NoticeUpdate, _=Depends(get_admin_user), db: AsyncS
         notice.updated_at = datetime.now(timezone.utc)
     else:
         db.add(Notice(id=str(uuid.uuid4()), content=req.content, is_active=req.is_active))
-    # Invalidate Redis cache
     redis = get_redis()
     await redis.delete("notice_content")
     return {"ok": True}
@@ -182,152 +327,7 @@ async def get_notice_admin(_=Depends(get_admin_user), db: AsyncSession = Depends
     return {"content": notice.content if notice else "", "is_active": notice.is_active if notice else True}
 
 
-# ── Prompts ──────────────────────────────────────────────────────
-
-class PromptCreate(BaseModel):
-    category: str
-    title: str
-    content: str
-    sort_order: int = 0
-
-
-class PromptUpdate(BaseModel):
-    category: Optional[str] = None
-    title: Optional[str] = None
-    content: Optional[str] = None
-    sort_order: Optional[int] = None
-    is_active: Optional[bool] = None
-
-
-@router.get("/prompts")
-async def list_prompts(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Prompt).order_by(Prompt.category, Prompt.sort_order))
-    prompts = result.scalars().all()
-    return [{"id": p.id, "category": p.category, "title": p.title, "content": p.content,
-             "sort_order": p.sort_order, "is_active": p.is_active} for p in prompts]
-
-
-@router.post("/prompts")
-async def create_prompt(req: PromptCreate, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    if not req.sort_order:
-        max_order = await db.execute(select(func.coalesce(func.max(Prompt.sort_order), 0)))
-        req.sort_order = max_order.scalar() + 1
-    p = Prompt(id=str(uuid.uuid4()), **req.model_dump())
-    db.add(p)
-    await db.flush()
-    return {"id": p.id}
-
-
-@router.put("/prompts/{prompt_id}")
-async def update_prompt(prompt_id: str, req: PromptUpdate, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Prompt).where(Prompt.id == prompt_id))
-    p = result.scalar_one_or_none()
-    if not p:
-        raise HTTPException(status_code=404, detail="提示词不存在")
-    for k, v in req.model_dump(exclude_none=True).items():
-        setattr(p, k, v)
-    return {"ok": True}
-
-
-@router.delete("/prompts/{prompt_id}")
-async def delete_prompt(prompt_id: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Prompt).where(Prompt.id == prompt_id))
-    p = result.scalar_one_or_none()
-    if p:
-        await db.delete(p)
-    return {"ok": True}
-
-
-# ── AI Models ────────────────────────────────────────────────────
-
-class ModelCreate(BaseModel):
-    name: str
-    display_name: str
-    provider: str = "OpenAI"
-    billing_type: str
-    model_type: str
-    group: str
-    is_enabled: bool = True
-    trial_allowed: bool = False
-    price_input: Optional[str] = None
-    price_output: Optional[str] = None
-    price_cached: Optional[str] = None
-    price_per_call: Optional[str] = None
-    sort_order: int = 0
-    context_window: int = 32768
-    supports_tools: bool = False
-    supports_vision: bool = False
-
-
-class ModelUpdate(BaseModel):
-    display_name: Optional[str] = None
-    provider: Optional[str] = None
-    billing_type: Optional[str] = None
-    model_type: Optional[str] = None
-    is_enabled: Optional[bool] = None
-    trial_allowed: Optional[bool] = None
-    group: Optional[str] = None
-    price_input: Optional[str] = None
-    price_output: Optional[str] = None
-    price_cached: Optional[str] = None
-    price_per_call: Optional[str] = None
-    sort_order: Optional[int] = None
-    context_window: Optional[int] = None
-    supports_tools: Optional[bool] = None
-    supports_vision: Optional[bool] = None
-
-
-MODEL_TYPE_MAP = {"chat": "agent"}
-
-
-@router.get("/models")
-async def list_models(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(AIModel).order_by(AIModel.sort_order))
-    return [{"id": m.id, "name": m.name, "display_name": m.display_name,
-             "provider": m.provider, "billing_type": m.billing_type,
-             "model_type": MODEL_TYPE_MAP.get(m.model_type, m.model_type), "group": m.group,
-             "is_enabled": m.is_enabled, "trial_allowed": m.trial_allowed,
-             "price_input": m.price_input, "price_output": m.price_output,
-             "price_cached": m.price_cached, "price_per_call": m.price_per_call,
-             "sort_order": m.sort_order,
-             "context_window": m.context_window or 32768,
-             "supports_tools": m.supports_tools or False,
-             "supports_vision": m.supports_vision or False}
-            for m in result.scalars().all()]
-
-
-@router.post("/models")
-async def create_model(req: ModelCreate, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    if not req.sort_order:
-        max_order = await db.execute(select(func.coalesce(func.max(AIModel.sort_order), 0)))
-        req.sort_order = max_order.scalar() + 1
-    m = AIModel(id=str(uuid.uuid4()), **req.model_dump())
-    db.add(m)
-    await db.flush()
-    return {"id": m.id}
-
-
-@router.put("/models/{model_id}")
-async def update_model(model_id: str, req: ModelUpdate, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(AIModel).where(AIModel.id == model_id))
-    m = result.scalar_one_or_none()
-    if not m:
-        raise HTTPException(status_code=404, detail="模型不存在")
-    for k, v in req.model_dump(exclude_none=True).items():
-        setattr(m, k, v)
-    return {"ok": True}
-
-
-@router.delete("/models/{model_id}")
-async def delete_model(model_id: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(AIModel).where(AIModel.id == model_id))
-    m = result.scalar_one_or_none()
-    if m:
-        await db.delete(m)
-    return {"ok": True}
-
-
-# ── Users ────────────────────────────────────────────────────────
+# ── Users（统一余额） ────────────────────────────────────────────
 
 class UserUpdate(BaseModel):
     username: Optional[str] = None
@@ -338,72 +338,139 @@ class UserUpdate(BaseModel):
 
 @router.get("/users")
 async def list_users(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    from app.models.user import UserToken
     result = await db.execute(select(User).order_by(User.created_at.desc()).limit(200))
     users = result.scalars().all()
-    out = []
-    for u in users:
-        ut_result = await db.execute(select(UserToken).where(UserToken.user_id == u.id))
-        tokens = ut_result.scalars().all()
-        out.append({
+    return [
+        {
             "id": u.id, "username": u.username, "email": u.email,
             "account_type": u.account_type,
             "is_active": u.is_active,
+            "balance_usd": str(billing.q6(billing.d(u.balance_usd))),
+            "trial_credit_usd": str(billing.q6(billing.d(u.trial_credit_usd))),
             "trial_expires_at": u.trial_expires_at.isoformat() if u.trial_expires_at else None,
             "created_at": u.created_at.isoformat(),
-            "tokens": [{"group": t.group, "balance_usd": float(t.balance_usd), "is_trial": t.is_trial} for t in tokens],
-        })
-    return out
+        }
+        for u in users
+    ]
 
 
 @router.get("/users/{user_id}")
 async def get_user(user_id: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    from app.models.user import UserToken
     result = await db.execute(select(User).where(User.id == user_id))
     u = result.scalar_one_or_none()
     if not u:
         raise HTTPException(status_code=404, detail="用户不存在")
 
-    ut_result = await db.execute(select(UserToken).where(UserToken.user_id == user_id))
-    user_tokens = ut_result.scalars().all()
-    tokens = []
-    for ut in user_tokens:
-        tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
-        tok = tok_result.scalar_one_or_none()
-        tokens.append({
-            "group": ut.group,
-            "balance_usd": float(ut.balance_usd),
-            "api_token": tok.token_value if tok else None,
-            "is_trial": ut.is_trial,
-        })
+    # 可靠统计：来自 billing_transactions / usage_logs 的真实聚合
+    recharge_row = await db.execute(
+        select(func.coalesce(func.sum(BillingTransaction.amount_usd), 0)).where(
+            BillingTransaction.user_id == user_id,
+            BillingTransaction.type == billing.RECHARGE,
+            BillingTransaction.status == "SUCCESS",
+        )
+    )
+    total_recharged = recharge_row.scalar()
+
+    spent_row = await db.execute(
+        select(func.coalesce(func.sum(UsageLog.cost_usd), 0)).where(UsageLog.user_id == user_id)
+    )
+    total_spent = spent_row.scalar()
+
+    usage_row = await db.execute(
+        select(func.count(UsageLog.id), func.coalesce(func.sum(UsageLog.image_count), 0)).where(
+            UsageLog.user_id == user_id
+        )
+    )
+    call_count, image_count = usage_row.one()
 
     usage_result = await db.execute(
         select(UsageLog).where(UsageLog.user_id == user_id).order_by(UsageLog.created_at.desc()).limit(20)
     )
     usage_logs = usage_result.scalars().all()
 
+    assigned = await rt.get_assigned_token(db, user_id)
+
     return {
         "id": u.id, "username": u.username, "email": u.email,
         "account_type": u.account_type,
         "is_active": u.is_active,
+        "balance_usd": str(billing.q6(billing.d(u.balance_usd))),
+        "trial_credit_usd": str(billing.q6(billing.d(u.trial_credit_usd))),
+        "total_recharged_usd": str(total_recharged),
+        "total_spent_usd": str(total_spent),
+        "image2_call_count": call_count,
+        "image2_image_count": image_count,
+        "runtime_token": rt.token_public_dict(assigned) if assigned else None,
         "trial_expires_at": u.trial_expires_at.isoformat() if u.trial_expires_at else None,
         "created_at": u.created_at.isoformat(),
-        "tokens": tokens,
-        "usage_logs": [{"model": log.model, "usage_type": log.usage_type,
-                        "cost_usd": float(log.cost_usd), "created_at": log.created_at.isoformat()}
-                       for log in usage_logs],
+        "usage_logs": [
+            {
+                "model": log.model, "usage_type": log.usage_type,
+                "image_count": log.image_count,
+                "unit_price": str(log.unit_price) if log.unit_price is not None else None,
+                "cost_usd": str(log.cost_usd),
+                "created_at": log.created_at.isoformat(),
+            }
+            for log in usage_logs
+        ],
     }
 
 
 @router.put("/users/{user_id}")
-async def update_user(user_id: str, req: UserUpdate, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+async def update_user(user_id: str, req: UserUpdate, admin: dict = Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.id == user_id))
     u = result.scalar_one_or_none()
     if not u:
         raise HTTPException(status_code=404, detail="用户不存在")
-    for k, v in req.model_dump(exclude_none=True).items():
+    changed = {k: v for k, v in req.model_dump(exclude_none=True).items()}
+    for k, v in changed.items():
         setattr(u, k, v)
+    if changed:
+        await _record_audit(db, admin, "user_update", {"user_id": user_id, **changed})
     return {"ok": True}
+
+
+class RuntimeTokenAssignRequest(BaseModel):
+    """管理员为用户分配/更换 Runtime Token。token_id 省略时自动挑选最旧的可用正式 Token。"""
+    token_id: Optional[str] = None
+
+
+@router.post("/users/{user_id}/runtime-token/assign")
+async def admin_assign_runtime_token(
+    user_id: str,
+    req: RuntimeTokenAssignRequest,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """管理员为用户分配或更换 Image2 Runtime Token（事务内完成，写分配历史 + 审计）。"""
+    exists = await db.execute(select(User.id).where(User.id == user_id))
+    if not exists.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    try:
+        token, released = await rt.assign_runtime_token(
+            db, user_id, token_id=req.token_id, source="admin_assign",
+        )
+    except rt.NoAvailableTokenError:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "NO_AVAILABLE_RUNTIME_TOKEN", "message": "Token 库存中没有可用 Token，请先录入"},
+        )
+    except rt.TokenNotAssignableError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    await _record_audit(db, admin, "runtime_token_assign", {
+        "user_id": user_id,
+        "token_id": token.id,
+        "released_token_id": released.id if released else None,
+    })
+
+    user = await db.get(User, user_id)
+    return {
+        "ok": True,
+        "runtime_token": rt.token_public_dict(token, user),
+        "released_token_id": released.id if released else None,
+    }
 
 
 @router.delete("/users/{user_id}")
@@ -414,6 +481,132 @@ async def delete_user(user_id: str, _=Depends(get_admin_user), db: AsyncSession 
         raise HTTPException(status_code=404, detail="用户不存在")
     await db.delete(u)
     return {"ok": True}
+
+
+class BalanceAdjustRequest(BaseModel):
+    balance_usd: Optional[Decimal] = Field(default=None, ge=0, max_digits=18, decimal_places=6)
+    trial_credit_usd: Optional[Decimal] = Field(default=None, ge=0, max_digits=18, decimal_places=6)
+    remark: str = Field(default="", max_length=255)
+
+
+@router.put("/users/{user_id}/balance")
+async def adjust_user_balance(
+    user_id: str,
+    req: BalanceAdjustRequest,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """管理员直接设置现金余额 / 试用额度（写 ADMIN_ADJUSTMENT 流水 + 审计）。"""
+    result = await db.execute(select(User).where(User.id == user_id).with_for_update())
+    u = result.scalar_one_or_none()
+    if not u:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    detail = {}
+    if req.balance_usd is not None:
+        before = billing.d(u.balance_usd)
+        u.balance_usd = billing.q6(req.balance_usd)
+        db.add(BillingTransaction(
+            user_id=user_id,
+            type=billing.ADMIN_ADJUSTMENT,
+            status="SUCCESS",
+            amount_usd=billing.q6(billing.d(u.balance_usd) - before),
+            trial_amount=Decimal("0"),
+            balance_amount=billing.q6(billing.d(u.balance_usd) - before),
+            billing_source="CASH",
+            balance_before=before,
+            balance_after=u.balance_usd,
+            remark=req.remark or "admin balance adjustment",
+        ))
+        detail["balance_usd"] = {"from": str(before), "to": str(u.balance_usd)}
+    if req.trial_credit_usd is not None:
+        before = billing.d(u.trial_credit_usd)
+        u.trial_credit_usd = billing.q6(req.trial_credit_usd)
+        db.add(BillingTransaction(
+            user_id=user_id,
+            type=billing.ADMIN_ADJUSTMENT,
+            status="SUCCESS",
+            amount_usd=billing.q6(billing.d(u.trial_credit_usd) - before),
+            trial_amount=billing.q6(billing.d(u.trial_credit_usd) - before),
+            balance_amount=Decimal("0"),
+            billing_source="TRIAL",
+            trial_before=before,
+            trial_after=u.trial_credit_usd,
+            remark=req.remark or "admin trial adjustment",
+        ))
+        detail["trial_credit_usd"] = {"from": str(before), "to": str(u.trial_credit_usd)}
+
+    if not detail:
+        raise HTTPException(status_code=400, detail="未指定任何调整项")
+    await _record_audit(db, admin, "balance_adjust", {"user_id": user_id, **detail, "remark": req.remark})
+
+    return {
+        "ok": True,
+        "balance_usd": str(billing.q6(billing.d(u.balance_usd))),
+        "trial_credit_usd": str(billing.q6(billing.d(u.trial_credit_usd))),
+    }
+
+
+# ── Billing Transactions（账务流水查询） ─────────────────────────
+
+@router.get("/billing/transactions")
+async def list_billing_transactions(
+    user_id: Optional[str] = None,
+    type: Optional[str] = None,
+    status: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    _=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(BillingTransaction)
+    if user_id:
+        query = query.where(BillingTransaction.user_id == user_id)
+    if type:
+        query = query.where(BillingTransaction.type == type)
+    if status:
+        query = query.where(BillingTransaction.status == status)
+
+    total_result = await db.execute(select(func.count()).select_from(query.subquery()))
+    total = total_result.scalar()
+
+    page = max(1, page)
+    page_size = max(1, min(200, page_size))
+    result = await db.execute(
+        query.order_by(BillingTransaction.created_at.desc())
+        .offset((page - 1) * page_size).limit(page_size)
+    )
+    txns = result.scalars().all()
+
+    user_ids = list({t.user_id for t in txns})
+    uname_map = {}
+    if user_ids:
+        ures = await db.execute(select(User.id, User.username).where(User.id.in_(user_ids)))
+        uname_map = {row.id: row.username for row in ures}
+
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "transactions": [billing._txn_dict(t) | {"username": uname_map.get(t.user_id, "")} for t in txns],
+    }
+
+
+@router.post("/billing/transactions/{txn_id}/refund")
+async def refund_billing_transaction(
+    txn_id: str,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """对 Image2 SUCCESS 扣费流水执行管理员退款（幂等）。"""
+    result = await billing.refund_image2_transaction(db, txn_id, reason="admin image2 refund")
+    if result is None:
+        raise HTTPException(status_code=404, detail="流水不存在")
+    txn, _user = result
+    if txn.status != "REFUNDED":
+        raise HTTPException(status_code=400, detail=f"当前状态 {txn.status} 不支持退款")
+    await _record_audit(db, admin, "image2_refund", {"txn_id": txn.id, "request_id": txn.request_id})
+    return {"ok": True, "status": txn.status}
 
 
 # ── Orders ───────────────────────────────────────────────────────
@@ -427,106 +620,21 @@ async def list_orders(_=Depends(get_admin_user), db: AsyncSession = Depends(get_
     if user_ids:
         ures = await db.execute(select(User.id, User.username).where(User.id.in_(user_ids)))
         uname_map = {row.id: row.username for row in ures}
-    token_ids = [o.token_id for o in orders if o.token_id]
-    token_map = {}
-    if token_ids:
-        tres = await db.execute(select(TokenInventory.id, TokenInventory.token_value).where(TokenInventory.id.in_(token_ids)))
-        token_map = {row.id: row.token_value for row in tres}
-    return [{"id": o.id, "user_id": o.user_id, "username": uname_map.get(o.user_id, ""),
-             "out_trade_no": o.out_trade_no, "group": o.group,
-             "amount_usd": float(o.amount_usd), "amount_cny": float(o.amount_cny),
-             "exchange_rate": float(o.exchange_rate) if o.exchange_rate else None,
-             "pay_type": o.pay_type, "status": o.status,
-             "out_refund_no": o.out_refund_no,
-             "token_value": token_map.get(o.token_id, "")[:12] if o.token_id else None,
-             "created_at": o.created_at.isoformat(),
-             "paid_at": o.paid_at.isoformat() if o.paid_at else None} for o in orders]
-
-
-class AssignTokenRequest(BaseModel):
-    tokens: dict[str, str]  # { "image": "sk-xxx", "agent": "sk-yyy" }; value 可为空表示充值不换 Token
-
-
-@router.post("/orders/{order_id}/assign")
-async def assign_order_token(order_id: str, req: AssignTokenRequest, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    import json as _json
-
-    result = await db.execute(select(Order).where(Order.id == order_id))
-    order = result.scalar_one_or_none()
-    if not order:
-        raise HTTPException(status_code=404, detail="订单不存在")
-    if order.status != "paid":
-        raise HTTPException(status_code=400, detail="订单未支付，无法操作")
-    if order.token_id:
-        raise HTTPException(status_code=400, detail="订单已处理")
-
-    now = datetime.now(timezone.utc)
-
-    # Parse items_json for merged orders, or fall back to single-group order
-    items = []
-    if order.items_json:
-        items = _json.loads(order.items_json)
-    else:
-        items = [{"group": order.group, "amount_usd": float(order.amount_usd)}]
-
-    first_token_id = None
-    for item in items:
-        group = item["group"]
-        token_val = req.tokens.get(group, "").strip()
-
-        ut_result = await db.execute(
-            select(UserToken).where(UserToken.user_id == order.user_id, UserToken.group == group)
-        )
-        ut = ut_result.scalar_one_or_none()
-
-        if ut:
-            # 充值：增加余额，有新 Token 则更新
-            ut.balance_usd = float(ut.balance_usd) + item["amount_usd"]
-            if token_val:
-                tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
-                old_tok = tok_result.scalar_one_or_none()
-                if old_tok:
-                    old_tok.token_value = token_val
-            if first_token_id is None:
-                first_token_id = ut.token_id
-        else:
-            # 分配：必须提供 Token
-            if not token_val:
-                raise HTTPException(status_code=400, detail=f"分组 {group} 需提供 Token（新分配）")
-            token = TokenInventory(
-                id=str(uuid.uuid4()),
-                token_value=token_val,
-                group=group,
-                is_trial=False,
-                is_assigned=True,
-                assigned_to=order.user_id,
-                assigned_at=now,
-            )
-            db.add(token)
-            await db.flush()
-
-            if first_token_id is None:
-                first_token_id = token.id
-
-            ut = UserToken(
-                id=str(uuid.uuid4()),
-                user_id=order.user_id,
-                token_id=token.id,
-                group=group,
-                balance_usd=item["amount_usd"],
-            )
-            db.add(ut)
-
-    if first_token_id:
-        order.token_id = first_token_id
-    order.status = OrderStatus.ASSIGNED
-
-    user_result = await db.execute(select(User).where(User.id == order.user_id))
-    u = user_result.scalar_one_or_none()
-    if u:
-        u.account_type = "paid"
-
-    return {"ok": True}
+    return [
+        {
+            "id": o.id, "user_id": o.user_id, "username": uname_map.get(o.user_id, ""),
+            "out_trade_no": o.out_trade_no,
+            "trade_no": o.trade_no,
+            "group": o.group,  # 历史订单保留展示；新订单为 null
+            "amount_usd": float(o.amount_usd), "amount_cny": float(o.amount_cny),
+            "exchange_rate": float(o.exchange_rate) if o.exchange_rate else None,
+            "pay_type": o.pay_type, "status": o.status,
+            "out_refund_no": o.out_refund_no,
+            "created_at": o.created_at.isoformat(),
+            "paid_at": o.paid_at.isoformat() if o.paid_at else None,
+        }
+        for o in orders
+    ]
 
 
 @router.post("/orders/{order_id}/close")
@@ -536,7 +644,7 @@ async def close_order(order_id: str, _=Depends(get_admin_user), db: AsyncSession
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
     if order.status == OrderStatus.ASSIGNED:
-        raise HTTPException(status_code=400, detail="已分配订单请使用退款功能")
+        raise HTTPException(status_code=400, detail="已入账订单请使用退款功能")
     if order.status not in (OrderStatus.PENDING, OrderStatus.PAID):
         raise HTTPException(status_code=400, detail="只能关闭待支付或已支付订单")
     if order.status == OrderStatus.PENDING:
@@ -553,9 +661,9 @@ async def close_order(order_id: str, _=Depends(get_admin_user), db: AsyncSession
 
 
 @router.post("/orders/{order_id}/refund/approve")
-async def approve_refund(order_id: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    import json as _json
+async def approve_refund(order_id: str, admin: dict = Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
     from app.core.wechatpay import wechatpay_request
+    from decimal import Decimal as D
 
     result = await db.execute(select(Order).where(Order.id == order_id))
     order = result.scalar_one_or_none()
@@ -564,26 +672,13 @@ async def approve_refund(order_id: str, _=Depends(get_admin_user), db: AsyncSess
     if order.status != OrderStatus.REFUNDING:
         raise HTTPException(status_code=400, detail="订单不在退款待确认状态")
 
-    # 冲正：对 ASSIGNED 订单扣除余额、撤销 Token
+    # 冲正：从统一现金余额扣回充值金额
     if order.status_before_refund == OrderStatus.ASSIGNED:
-        items = _json.loads(order.items_json) if order.items_json else [{"group": order.group, "amount_usd": float(order.amount_usd)}]
-        for item in items:
-            ut_result = await db.execute(
-                select(UserToken).where(UserToken.user_id == order.user_id, UserToken.group == item["group"])
-            )
-            ut = ut_result.scalar_one_or_none()
-            if ut:
-                new_balance = float(ut.balance_usd) - item["amount_usd"]
-                if new_balance <= 0:
-                    tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
-                    tok = tok_result.scalar_one_or_none()
-                    if tok:
-                        tok.is_assigned = False
-                        tok.assigned_to = None
-                        tok.assigned_at = None
-                    await db.delete(ut)
-                else:
-                    ut.balance_usd = new_balance
+        await billing.debit_balance_for_refund(
+            db, order.user_id, D(str(order.amount_usd)),
+            related_order_id=order.id,
+            remark=f"admin approved refund {order.out_trade_no}",
+        )
 
     out_refund_no = f"RF{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
     total_fee = int(round(float(order.amount_cny) * 100))
@@ -598,6 +693,7 @@ async def approve_refund(order_id: str, _=Depends(get_admin_user), db: AsyncSess
 
     code, wx_result = await wechatpay_request("/v3/refund/domestic/refunds", method="POST", data=refund_data)
     if code != 200:
+        await db.rollback()
         raise HTTPException(status_code=502, detail=f"退款失败: {wx_result}")
 
     order.status = OrderStatus.REFUNDED
@@ -606,12 +702,13 @@ async def approve_refund(order_id: str, _=Depends(get_admin_user), db: AsyncSess
 
     redis = get_redis()
     await redis.delete(f"refund:auto:{order.out_trade_no}")
+    await _record_audit(db, admin, "refund_approve", {"order_id": order.id, "out_trade_no": order.out_trade_no})
 
     return {"status": "refunded", "out_refund_no": out_refund_no}
 
 
 @router.post("/orders/{order_id}/refund/reject")
-async def reject_refund(order_id: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+async def reject_refund(order_id: str, admin: dict = Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Order).where(Order.id == order_id))
     order = result.scalar_one_or_none()
     if not order:
@@ -625,14 +722,13 @@ async def reject_refund(order_id: str, _=Depends(get_admin_user), db: AsyncSessi
 
     redis = get_redis()
     await redis.delete(f"refund:auto:{order.out_trade_no}")
+    await _record_audit(db, admin, "refund_reject", {"order_id": order.id, "out_trade_no": order.out_trade_no})
 
     return {"status": order.status, "message": "退款已拒绝"}
 
 
 class OrderUpdate(BaseModel):
     status: Optional[str] = None
-    amount_usd: Optional[float] = None
-    group: Optional[str] = None
 
 
 @router.put("/orders/{order_id}")
@@ -641,8 +737,8 @@ async def update_order(order_id: str, req: OrderUpdate, _=Depends(get_admin_user
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
-    for k, v in req.model_dump(exclude_none=True).items():
-        setattr(order, k, v)
+    if req.status is not None:
+        order.status = req.status
     return {"ok": True}
 
 
@@ -653,36 +749,22 @@ async def delete_order(order_id: str, _=Depends(get_admin_user), db: AsyncSessio
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
     if order.status in (OrderStatus.PAID, OrderStatus.ASSIGNED):
-        raise HTTPException(status_code=400, detail="已支付/已分配订单不可删除，请先退款")
+        raise HTTPException(status_code=400, detail="已支付/已入账订单不可删除，请先退款")
     await db.delete(order)
     return {"ok": True}
 
 
-class OrderItem(BaseModel):
-    group: str
-    amount_usd: float
-
 class AdminCreateOrderRequest(BaseModel):
-    items: list[OrderItem]
+    amount_usd: float = Field(gt=0)
     user_id: Optional[str] = None
 
 
 @router.post("/orders/create")
 async def admin_create_order(req: AdminCreateOrderRequest, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    if not req.items:
-        raise HTTPException(status_code=400, detail="至少选择一个分组")
-
-    for item in req.items:
-        if item.amount_usd < settings.PAYMENT_MIN_PER_ITEM_USD:
-            raise HTTPException(status_code=400, detail=f"分组 {item.group} 金额不能小于 ${settings.PAYMENT_MIN_PER_ITEM_USD}")
-
-    total_usd = sum(item.amount_usd for item in req.items)
-    if total_usd < settings.PAYMENT_MIN_TOTAL_USD or total_usd > settings.PAYMENT_MAX_TOTAL_USD:
-        raise HTTPException(status_code=400, detail=f"总金额需在 ${settings.PAYMENT_MIN_TOTAL_USD} ~ ${settings.PAYMENT_MAX_TOTAL_USD} 之间")
-
-    import httpx
-    import json
+    """管理员代客创建余额充值订单。"""
+    from datetime import timedelta as _td
     from app.core.wechatpay import get_wxpay
+    from app.api.routes.payment import is_wechat_pay_configured, should_use_dev_payment, _get_exchange_rate
 
     user_id = req.user_id
     if not user_id:
@@ -692,170 +774,151 @@ async def admin_create_order(req: AdminCreateOrderRequest, _=Depends(get_admin_u
             raise HTTPException(status_code=400, detail="系统中没有用户，请先创建用户")
         user_id = u.id
 
-    redis = get_redis()
-    cached = await redis.get("exchange_rate_usd_cny")
-    if cached:
-        rate = float(cached)
-    else:
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(settings.EXCHANGE_RATE_API)
-                data = resp.json()
-                rate = float(data["rates"]["CNY"])
-                await redis.setex("exchange_rate_usd_cny", 3600, str(rate))
-        except Exception:
-            rate = 7.25
-
-    amount_cny = round(total_usd * rate, 2)
+    rate = await _get_exchange_rate()
+    amount_cny = round(req.amount_usd * rate, 2)
     out_trade_no = f"CY{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
-    groups = ",".join(item.group for item in req.items)
-    items_json = json.dumps([{"group": item.group, "amount_usd": item.amount_usd} for item in req.items])
 
     order = Order(
         user_id=user_id,
         out_trade_no=out_trade_no,
-        group=groups,
-        amount_usd=total_usd,
-        amount_cny=amount_cny,
-        exchange_rate=rate,
-        items_json=items_json,
+        amount_usd=Decimal(str(req.amount_usd)),
+        amount_cny=Decimal(str(amount_cny)),
+        exchange_rate=Decimal(str(rate)),
         pay_type="wxpay",
         status="pending",
     )
     db.add(order)
     await db.flush()
 
-    wxpay = get_wxpay()
-    from datetime import timedelta
-    time_expire = (datetime.now(timezone(timedelta(hours=8))) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S+08:00")
-    code, result = await wxpay.pay(
-        description=f"CyImagePro充值-{groups}",
-        out_trade_no=out_trade_no,
-        amount={"total": int(round(amount_cny * 100)), "currency": "CNY"},
-        time_expire=time_expire,
-    )
-
-    if code != 200:
-        raise HTTPException(status_code=502, detail=f"微信支付下单失败: {result}")
+    if should_use_dev_payment():
+        code_url = f"dev://pay/{out_trade_no}"
+    else:
+        if not is_wechat_pay_configured():
+            raise HTTPException(status_code=500, detail="微信支付配置不完整")
+        wxpay = get_wxpay()
+        time_expire = (datetime.now(timezone(_td(hours=8))) + _td(hours=2)).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        code, result = await wxpay.pay(
+            description="CyImagePro 余额充值",
+            out_trade_no=out_trade_no,
+            amount={"total": int(round(amount_cny * 100)), "currency": "CNY"},
+            time_expire=time_expire,
+        )
+        if code != 200:
+            raise HTTPException(status_code=502, detail=f"微信支付下单失败: {result}")
+        code_url = result.get("code_url")
 
     return {
         "out_trade_no": out_trade_no,
-        "code_url": result.get("code_url"),
-        "amount_usd": total_usd,
+        "code_url": code_url,
+        "amount_usd": req.amount_usd,
         "amount_cny": amount_cny,
         "exchange_rate": rate,
-        "group": groups,
-        "items": [{"group": item.group, "amount_usd": item.amount_usd} for item in req.items],
         "status": "pending",
     }
 
 
 @router.get("/orders/query_pay/{out_trade_no}")
 async def admin_query_pay(out_trade_no: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Order).where(Order.out_trade_no == out_trade_no))
+    from app.core.wechatpay import get_wxpay
+    from app.api.routes.payment import is_wechat_pay_configured, should_use_dev_payment
+    from app.services.order_assignment import assign_paid_order, InvalidOrderStatusError
+
+    result = await db.execute(
+        select(Order).where(Order.out_trade_no == out_trade_no).with_for_update()
+    )
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
     if order.status != "pending":
         return {"status": order.status, "out_trade_no": order.out_trade_no}
 
-    from app.core.wechatpay import get_wxpay
-    wxpay = get_wxpay()
-    code, wx_result = await wxpay.query(out_trade_no=order.out_trade_no)
-    if code == 200 and wx_result.get("trade_state") == "SUCCESS":
-        order.status = "paid"
-        order.paid_at = datetime.now(timezone.utc)
-        order.trade_no = wx_result.get("transaction_id")
-        return {"status": "paid", "out_trade_no": order.out_trade_no}
+    if not should_use_dev_payment() and is_wechat_pay_configured():
+        wxpay = get_wxpay()
+        code, wx_result = await wxpay.query(out_trade_no=order.out_trade_no)
+        if code == 200 and wx_result.get("trade_state") == "SUCCESS":
+            order.status = "paid"
+            order.paid_at = datetime.now(timezone.utc)
+            order.trade_no = wx_result.get("transaction_id")
+
+    if order.status == "paid":
+        try:
+            await assign_paid_order(db, order, auto=True)
+        except InvalidOrderStatusError:
+            pass
 
     return {"status": order.status, "out_trade_no": order.out_trade_no}
 
 
-# ── User Token Management ────────────────────────────────────────
+# ── Dashboard Stats ──────────────────────────────────────────────
 
-class UserTokenInput(BaseModel):
-    group: str
-    token_value: str
-    balance_usd: float
-
-
-@router.post("/users/{user_id}/tokens")
-async def add_or_update_user_token(user_id: str, req: UserTokenInput, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    user_result = await db.execute(select(User).where(User.id == user_id))
-    if not user_result.scalar_one_or_none():
-        raise HTTPException(status_code=404, detail="用户不存在")
-
-    ut_result = await db.execute(
-        select(UserToken).where(UserToken.user_id == user_id, UserToken.group == req.group)
-    )
-    ut = ut_result.scalar_one_or_none()
+@router.get("/stats")
+async def get_stats(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
     now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    if ut:
-        tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
-        tok = tok_result.scalar_one_or_none()
-        if tok:
-            tok.token_value = req.token_value.strip()
-        ut.balance_usd = req.balance_usd
-    else:
-        # Check if TokenInventory already exists for this token_value + group
-        existing_tok = await db.execute(
-            select(TokenInventory).where(
-                TokenInventory.token_value == req.token_value.strip(),
-                TokenInventory.group == req.group,
-            )
+    users_total = (await db.execute(select(func.count()).select_from(User))).scalar()
+    orders_paid = (await db.execute(
+        select(func.count()).select_from(Order).where(Order.paid_at != None)
+    )).scalar()
+    revenue_result = await db.execute(
+        select(func.coalesce(func.sum(BillingTransaction.amount_usd), 0)).where(
+            BillingTransaction.type == billing.RECHARGE,
+            BillingTransaction.status == "SUCCESS",
         )
-        tok = existing_tok.scalar_one_or_none()
-        if not tok:
-            tok = TokenInventory(
-                id=str(uuid.uuid4()),
-                token_value=req.token_value.strip(),
-                group=req.group,
-                is_trial=False,
-                is_assigned=True,
-                assigned_to=user_id,
-                assigned_at=now,
-            )
-            db.add(tok)
-            await db.flush()
-        ut = UserToken(
-            id=str(uuid.uuid4()),
-            user_id=user_id,
-            token_id=tok.id,
-            group=req.group,
-            balance_usd=req.balance_usd,
+    )
+    total_revenue = revenue_result.scalar()
+
+    image2_today = (await db.execute(
+        select(func.count(UsageLog.id), func.coalesce(func.sum(UsageLog.image_count), 0)).where(
+            UsageLog.created_at >= day_start
         )
-        db.add(ut)
+    )).one()
+    image2_total = (await db.execute(
+        select(func.count(UsageLog.id), func.coalesce(func.sum(UsageLog.image_count), 0),
+               func.coalesce(func.sum(UsageLog.cost_usd), 0))
+    )).one()
 
-    return {"ok": True}
+    # 复用 token stats
+    token_stats = await get_token_stats(_=None, db=db)
+
+    return {
+        "users_total": users_total,
+        "orders_paid": orders_paid,
+        "total_revenue_usd": str(total_revenue),
+        "image2_today": {"calls": image2_today[0], "images": image2_today[1]},
+        "image2_total": {"calls": image2_total[0], "images": image2_total[1], "cost_usd": str(image2_total[2])},
+        "token_stats": token_stats,
+    }
 
 
-class BalanceUpdate(BaseModel):
-    balance_usd: float
+# ── Audit Logs ───────────────────────────────────────────────────
 
-
-@router.put("/users/{user_id}/tokens/{group}/balance")
-async def update_user_token_balance(user_id: str, group: str, req: BalanceUpdate, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    ut_result = await db.execute(
-        select(UserToken).where(UserToken.user_id == user_id, UserToken.group == group)
+@router.get("/audit-logs")
+async def list_audit_logs(
+    page: int = 1,
+    page_size: int = 50,
+    _=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(AdminAuditLog)
+    total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar()
+    page = max(1, page)
+    page_size = max(1, min(200, page_size))
+    result = await db.execute(
+        query.order_by(AdminAuditLog.created_at.desc())
+        .offset((page - 1) * page_size).limit(page_size)
     )
-    ut = ut_result.scalar_one_or_none()
-    if not ut:
-        raise HTTPException(status_code=404, detail="该用户没有此分组的 Token")
-    ut.balance_usd = req.balance_usd
-    return {"ok": True}
-
-
-@router.delete("/users/{user_id}/tokens/{group}")
-async def delete_user_token(user_id: str, group: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    ut_result = await db.execute(
-        select(UserToken).where(UserToken.user_id == user_id, UserToken.group == group)
-    )
-    ut = ut_result.scalar_one_or_none()
-    if not ut:
-        raise HTTPException(status_code=404, detail="该用户没有此分组的 Token")
-    await db.delete(ut)
-    return {"ok": True}
+    logs = result.scalars().all()
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "logs": [
+            {"id": l.id, "admin": l.admin, "action": l.action, "detail": l.detail,
+             "created_at": l.created_at.isoformat()}
+            for l in logs
+        ],
+    }
 
 
 # ── Admin password change ─────────────────────────────────────────
@@ -866,16 +929,13 @@ class PasswordChange(BaseModel):
 
 @router.put("/password")
 async def change_admin_password(req: PasswordChange, _=Depends(get_admin_user)):
-    # Update in-memory settings (persists until restart; for permanent change use .env)
     settings.ADMIN_PASSWORD = req.new_password
     return {"ok": True, "note": "重启后失效，如需永久修改请更新 .env 文件中的 ADMIN_PASSWORD"}
 
 
 # ── System Config (.env) ─────────────────────────────────────────
 
-import os
-
-SENSITIVE_KEYS = {"SECRET_KEY", "ADMIN_PASSWORD", "POSTGRES_PASSWORD", "WECHAT_APIV3_KEY", "SMTP_PASSWORD"}
+SENSITIVE_KEYS = {"SECRET_KEY", "ADMIN_PASSWORD", "POSTGRES_PASSWORD", "WECHAT_APIV3_KEY", "SMTP_PASSWORD", "PACKYAPI_IMAGE_MASTER_TOKEN", "PACKYAPI_MASTER_TOKEN"}
 MASK = "********"
 
 CONFIG_CATEGORIES = [
@@ -903,6 +963,13 @@ CONFIG_CATEGORIES = [
                          "WECHAT_NOTIFY_URL": "支付回调 URL"},
     },
     {
+        "label": "Runtime Token",
+        "icon": "server",
+        "keys": ["PACKYAPI_IMAGE_MASTER_TOKEN", "PACKYAPI_IMAGE_BASE_URL"],
+        "descriptions": {"PACKYAPI_IMAGE_MASTER_TOKEN": "Image2 上游 Master Token（服务端保存）",
+                         "PACKYAPI_IMAGE_BASE_URL": "Image2 上游地址"},
+    },
+    {
         "label": "邮件服务 (SMTP)",
         "icon": "smtp",
         "keys": ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM_NAME", "SMTP_USE_SSL"],
@@ -912,15 +979,16 @@ CONFIG_CATEGORIES = [
     {
         "label": "支付限额",
         "icon": "payment",
-        "keys": ["PAYMENT_MIN_TOTAL_USD", "PAYMENT_MAX_TOTAL_USD", "PAYMENT_MIN_PER_ITEM_USD"],
-        "descriptions": {"PAYMENT_MIN_TOTAL_USD": "最低总金额 ($)", "PAYMENT_MAX_TOTAL_USD": "最高总金额 ($)",
-                         "PAYMENT_MIN_PER_ITEM_USD": "单项最低金额 ($)"},
+        "keys": ["PAYMENT_MIN_TOTAL_USD", "PAYMENT_MAX_TOTAL_USD", "TRIAL_CREDIT_USD"],
+        "descriptions": {"PAYMENT_MIN_TOTAL_USD": "最低充值金额 ($)", "PAYMENT_MAX_TOTAL_USD": "最高充值金额 ($)",
+                         "TRIAL_CREDIT_USD": "注册试用额度 ($)"},
     },
     {
         "label": "服务器",
         "icon": "server",
-        "keys": ["SERVER_BASE_URL", "EXCHANGE_RATE_API"],
-        "descriptions": {"SERVER_BASE_URL": "服务器地址", "EXCHANGE_RATE_API": "汇率 API"},
+        "keys": ["SERVER_BASE_URL", "EXCHANGE_RATE_API", "RESERVATION_TTL_HOURS"],
+        "descriptions": {"SERVER_BASE_URL": "服务器地址", "EXCHANGE_RATE_API": "汇率 API",
+                         "RESERVATION_TTL_HOURS": "预占超时自动释放（小时）"},
     },
 ]
 
@@ -930,7 +998,7 @@ def _infer_field_type(key: str) -> str:
         return "password"
     if key.endswith("_USE_SSL"):
         return "boolean"
-    if key.endswith("_PORT") or key.endswith("_MIN") or key.endswith("_MAX") or key.endswith("_EXPIRE") or key.endswith("_MINUTES") or "_MIN_" in key or "_MAX_" in key:
+    if key.endswith("_PORT") or key.endswith("_MIN") or key.endswith("_MAX") or key.endswith("_EXPIRE") or key.endswith("_MINUTES") or key.endswith("_HOURS") or "_MIN_" in key or "_MAX_" in key:
         return "number"
     return "text"
 
@@ -1030,7 +1098,6 @@ async def update_config(req: ConfigUpdateRequest, _=Depends(get_admin_user)):
 
     if updated_keys:
         from app.core.config import Settings
-        # Clear env vars so Settings reads from the updated .env file
         for key in updated_keys:
             os.environ.pop(key, None)
         new_settings = Settings()
@@ -1056,3 +1123,54 @@ async def restart_backend(_=Depends(get_admin_user)):
         raise HTTPException(status_code=500, detail="docker SDK 未安装")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"重启失败: {exc}")
+
+
+# ── Online Devices ────────────────────────────────────────────────
+
+@router.get("/online-devices")
+async def list_online_devices(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    """List all currently online devices from Redis (TTL based)."""
+    redis = get_redis()
+    if not redis:
+        return {"devices": [], "message": "Redis unavailable"}
+
+    devices = []
+    cursor = 0
+    try:
+        while True:
+            cursor, keys = await redis.scan(cursor, match="online_device:*", count=100)
+            for key in keys:
+                data_str = await redis.get(key)
+                if not data_str:
+                    continue
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                user_id = data.get("user_id", "")
+                user_email = ""
+                if user_id:
+                    u_result = await db.execute(select(User).where(User.id == user_id))
+                    u = u_result.scalar_one_or_none()
+                    if u:
+                        user_email = u.email
+                devices.append({
+                    "device_id": data.get("device_id", ""),
+                    "device_name": data.get("device_name", ""),
+                    "user_id": user_id,
+                    "user_email": user_email,
+                    "app_version": data.get("app_version", ""),
+                    "platform": data.get("platform", ""),
+                    "last_seen": data.get("last_seen", ""),
+                    "ip": data.get("ip", ""),
+                    "server_url": data.get("server_url", ""),
+                })
+            if cursor == 0:
+                break
+    except Exception:
+        logger_exc = __import__("logging").getLogger(__name__)
+        logger_exc.exception("Redis scan failed")
+        return {"devices": [], "message": "Redis scan failed"}
+
+    devices.sort(key=lambda d: d.get("last_seen", ""), reverse=True)
+    return {"devices": devices, "total": len(devices)}

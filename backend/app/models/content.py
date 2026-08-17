@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, DateTime, Boolean, Integer, Text, JSON, UniqueConstraint
+from decimal import Decimal
+from sqlalchemy import String, DateTime, Boolean, Text, Numeric, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
 
@@ -18,47 +19,27 @@ class Notice(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
-class Prompt(Base):
-    __tablename__ = "prompts"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    category: Mapped[str] = mapped_column(String(64), nullable=False)
-    title: Mapped[str] = mapped_column(String(128), nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    sort_order: Mapped[int] = mapped_column(Integer, default=0)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-
 class AIModel(Base):
+    """V4 起系统仅有 gpt-image-2 一个收费模型，本表只保存这一行配置。
+
+    历史列（group / model_type / price_input 等）在旧库中保留但不再被 ORM 引用；
+    新库由 create_all 直接按本定义建表。
+    """
+
     __tablename__ = "ai_models"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     name: Mapped[str] = mapped_column(String(64), nullable=False)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
     provider: Mapped[str] = mapped_column(String(32), default="OpenAI")
-    billing_type: Mapped[str] = mapped_column(String(16), nullable=False)
-    model_type: Mapped[str] = mapped_column(String(16), nullable=False)
-    group: Mapped[str] = mapped_column(String(32), nullable=False)
+    billing_type: Mapped[str] = mapped_column(String(16), nullable=False, default="per_call")
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    trial_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
-    price_input: Mapped[str] = mapped_column(String(32), nullable=True)
-    price_output: Mapped[str] = mapped_column(String(32), nullable=True)
-    price_cached: Mapped[str] = mapped_column(String(32), nullable=True)
-    price_per_call: Mapped[str] = mapped_column(String(32), nullable=True)
-    sort_order: Mapped[int] = mapped_column(Integer, default=0)
-    context_window: Mapped[int] = mapped_column(Integer, default=32768)
-    supports_tools: Mapped[bool] = mapped_column(Boolean, default=False)
-    supports_vision: Mapped[bool] = mapped_column(Boolean, default=False)
+    trial_allowed: Mapped[bool] = mapped_column(Boolean, default=True)
+    price_per_call: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=True)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False, default="USD")
 
-    __table_args__ = (UniqueConstraint('name', 'group', name='uq_model_group'),)
+    __table_args__ = (UniqueConstraint("name", name="uq_model_name"),)
 
 
-class Group(Base):
-    __tablename__ = "groups"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    name: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
-    description: Mapped[str] = mapped_column(String(128), default="")
-    sort_order: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+# 历史表 prompts / groups（Prompt 资产库、服务分组）已废弃：
+# 代码不再引用；旧库中的表与数据保留作历史归档，不做物理 DROP。

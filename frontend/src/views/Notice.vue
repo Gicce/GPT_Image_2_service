@@ -1,7 +1,7 @@
 <template>
   <div>
     <div class="page-header">
-      <h2 class="page-header-title">通知栏</h2>
+      <h2 class="page-header-title">运营通知</h2>
     </div>
     <n-card :bordered="false" class="form-card">
       <n-form-item label="通知内容（留空则不显示跑马灯）">

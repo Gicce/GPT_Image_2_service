@@ -12,8 +12,9 @@ from app.core.security import hash_password, verify_password, create_access_toke
 from app.core.config import settings
 from app.core.redis import get_redis
 from app.core.email import send_verification_code
-from app.models.user import User, UserToken
-from app.models.token import TokenInventory
+from app.models.user import User
+from app.models.token import TokenInventory, TokenAssignmentLog
+from app.services import billing
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +63,55 @@ class RegisterVerifyRequest(BaseModel):
     account_type: str = "normal"
 
 
+async def _grant_trial(db: AsyncSession, user: User, days: int) -> bool:
+    """发放试用：消耗一张试用名额卡 + 发放试用额度（写流水）。不 commit。
+
+    返回 False 表示试用名额已满。
+    """
+    tok_result = await db.execute(
+        select(TokenInventory)
+        .where(
+            TokenInventory.is_trial == True,
+            TokenInventory.is_assigned == False,
+            TokenInventory.is_disabled == False,
+        )
+        .order_by(TokenInventory.created_at)
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    )
+    tok = tok_result.scalar_one_or_none()
+    if not tok:
+        return False
+
+    now = datetime.now(timezone.utc)
+    tok.is_assigned = True
+    tok.assigned_to = user.id
+    tok.assigned_at = now
+    db.add(TokenAssignmentLog(
+        token_id=tok.id,
+        user_id=user.id,
+        action="assign",
+        source="register_trial",
+    ))
+    user.account_type = "trial"
+    user.trial_expires_at = now + timedelta(days=days)
+    await billing.grant_trial_credit(
+        db, user, billing.Decimal(str(settings.TRIAL_CREDIT_USD))
+    )
+    return True
+
+
 @router.post("/register/send-code")
 async def register_send_code(req: RegisterSendCodeRequest, db: AsyncSession = Depends(get_db)):
+    # [临时诊断] 接口入口日志
+    print(f'[auth.send-code] ===== RECEIVED REQUEST =====')
+    print(f'[auth.send-code] email: {req.email}')
+    print(f'[auth.send-code] username: {req.username}')
+    print(f'[auth.send-code] account_type: {req.account_type}')
+    print(f'[auth.send-code] password length: {len(req.password)}')
+
     if req.account_type not in ("trial", "normal"):
+        print(f'[auth.send-code] INVALID account_type: {req.account_type}')
         raise HTTPException(status_code=400, detail="account_type 必须为 trial 或 normal")
 
     _validate_bcrypt_password(req.password)
@@ -73,6 +120,7 @@ async def register_send_code(req: RegisterSendCodeRequest, db: AsyncSession = De
         select(User).where((User.username == req.username) | (User.email == req.email))
     )
     if existing.scalar_one_or_none():
+        print(f'[auth.send-code] USER ALREADY EXISTS: {req.username} / {req.email}')
         raise HTTPException(status_code=400, detail="用户名或邮箱已存在")
 
     email = req.email.strip().lower()
@@ -80,15 +128,19 @@ async def register_send_code(req: RegisterSendCodeRequest, db: AsyncSession = De
 
     rate_key = f"reg:rate:{email}"
     if await redis.exists(rate_key):
+        print(f'[auth.send-code] RATE LIMITED: {email}')
         raise HTTPException(status_code=429, detail="请求过于频繁，请60秒后重试")
 
     lockout_key = f"reg:lockout:{email}"
     if await redis.exists(lockout_key):
+        print(f'[auth.send-code] LOCKED OUT: {email}')
         raise HTTPException(status_code=429, detail="验证码尝试次数过多，请稍后再试")
 
     await redis.setex(rate_key, 60, "1")
 
     code = "".join(secrets.choice("0123456789") for _ in range(6))
+    print(f'[auth.send-code] GENERATED CODE for {email}: {code}')
+
     code_key = f"reg:code:{email}"
     attempts_key = f"reg:attempts:{email}"
 
@@ -98,12 +150,20 @@ async def register_send_code(req: RegisterSendCodeRequest, db: AsyncSession = De
     await redis.setex(code_key, 300, json.dumps({"code": code, "data": reg_data}))
     await redis.setex(attempts_key, 300, "0")
 
+    print(f'[auth.send-code] CODE STORED IN REDIS, key={code_key}')
+
     try:
+        print(f'[auth.send-code] BEFORE SEND EMAIL to {email}')
         await send_verification_code(email, code, purpose="register")
-    except Exception:
+        print(f'[auth.send-code] EMAIL SENT OK to {email}')
+    except Exception as e:
+        print(f'[auth.send-code] EMAIL SEND FAILED: {e}')
+        import traceback
+        traceback.print_exc()
         logger.exception("Failed to send registration code to %s", email)
         raise HTTPException(status_code=500, detail="邮件发送失败，请稍后重试")
 
+    print(f'[auth.send-code] ===== RETURN SUCCESS =====')
     return {"message": "验证码已发送"}
 
 
@@ -158,32 +218,9 @@ async def register_verify(req: RegisterVerifyRequest, db: AsyncSession = Depends
     await db.flush()
 
     if req.account_type == "trial":
-        trial_token = await db.execute(
-            select(TokenInventory).where(
-                TokenInventory.is_trial == True,
-                TokenInventory.group == "image",
-                TokenInventory.is_assigned == False,
-            ).limit(1)
-        )
-        trial_token = trial_token.scalar_one_or_none()
-        if not trial_token:
+        granted = await _grant_trial(db, user, days=2)
+        if not granted:
             raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
-
-        trial_token.is_assigned = True
-        trial_token.assigned_to = user.id
-        trial_token.assigned_at = now
-
-        ut = UserToken(
-            id=str(uuid.uuid4()),
-            user_id=user.id,
-            token_id=trial_token.id,
-            group="image",
-            balance_usd=1.0,
-            is_trial=True,
-        )
-        db.add(ut)
-        user.account_type = "trial"
-        user.trial_expires_at = now + timedelta(days=2)
 
     await db.flush()
     access_token = create_access_token(user.id)
@@ -221,32 +258,9 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     await db.flush()
 
     if req.account_type == "trial":
-        trial_token = await db.execute(
-            select(TokenInventory).where(
-                TokenInventory.is_trial == True,
-                TokenInventory.group == "image",
-                TokenInventory.is_assigned == False,
-            ).limit(1)
-        )
-        trial_token = trial_token.scalar_one_or_none()
-        if not trial_token:
+        granted = await _grant_trial(db, user, days=2)
+        if not granted:
             raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
-
-        trial_token.is_assigned = True
-        trial_token.assigned_to = user.id
-        trial_token.assigned_at = now
-
-        ut = UserToken(
-            id=str(uuid.uuid4()),
-            user_id=user.id,
-            token_id=trial_token.id,
-            group="image",
-            balance_usd=1.0,
-            is_trial=True,
-        )
-        db.add(ut)
-        user.account_type = "trial"
-        user.trial_expires_at = now + timedelta(days=2)
 
     await db.flush()
     access_token = create_access_token(user.id)
@@ -368,40 +382,13 @@ async def upgrade_trial(
     if user.account_type != "normal":
         raise HTTPException(status_code=400, detail="仅普通账户可申请试用")
 
-    existing_ut = await db.execute(
-        select(UserToken).where(UserToken.user_id == user.id, UserToken.group == "image")
-    )
-    if existing_ut.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="已拥有该分组的 Token")
+    if billing.d(user.trial_credit_usd) > 0:
+        raise HTTPException(status_code=400, detail="已领取过试用额度")
 
-    trial_token = await db.execute(
-        select(TokenInventory).where(
-            TokenInventory.is_trial == True,
-            TokenInventory.group == "image",
-            TokenInventory.is_assigned == False,
-        ).limit(1)
-    )
-    trial_token = trial_token.scalar_one_or_none()
-    if not trial_token:
+    granted = await _grant_trial(db, user, days=3)
+    if not granted:
         raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
 
-    now = datetime.now(timezone.utc)
-    user.account_type = "trial"
-    user.trial_expires_at = now + timedelta(days=3)
-
-    trial_token.is_assigned = True
-    trial_token.assigned_to = user.id
-    trial_token.assigned_at = now
-
-    ut = UserToken(
-        id=str(uuid.uuid4()),
-        user_id=user.id,
-        token_id=trial_token.id,
-        group="image",
-        balance_usd=1.0,
-        is_trial=True,
-    )
-    db.add(ut)
     await db.commit()
 
     user_info = await _user_info(user, db)
@@ -421,22 +408,6 @@ async def _user_info(user: User, db: AsyncSession):
         and user.trial_expires_at.replace(tzinfo=timezone.utc) < now
     )
 
-    ut_result = await db.execute(
-        select(UserToken).where(UserToken.user_id == user.id)
-    )
-    user_tokens = ut_result.scalars().all()
-
-    tokens = []
-    for ut in user_tokens:
-        tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
-        tok = tok_result.scalar_one_or_none()
-        tokens.append({
-            "group": ut.group,
-            "balance_usd": float(ut.balance_usd),
-            "api_token": tok.token_value if tok else None,
-            "is_trial": ut.is_trial,
-        })
-
     return {
         "id": user.id,
         "username": user.username,
@@ -444,5 +415,6 @@ async def _user_info(user: User, db: AsyncSession):
         "account_type": user.account_type,
         "trial_expires_at": user.trial_expires_at.isoformat() if user.trial_expires_at else None,
         "trial_expired": trial_expired,
-        "tokens": tokens,
+        "balance_usd": str(billing.q6(billing.d(user.balance_usd))),
+        "trial_credit_usd": str(billing.q6(billing.d(user.trial_credit_usd))),
     }

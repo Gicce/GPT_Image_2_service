@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 
 import redis.asyncio as aioredis
@@ -27,43 +26,34 @@ async def auto_approve_refund(out_trade_no: str):
     """自动批准退款（15分钟超时后调用）"""
     from sqlalchemy import select
     from app.core.database import AsyncSessionLocal
-    from app.models.token import Order, OrderStatus, UserToken, TokenInventory
+    from app.models.token import Order, OrderStatus
     from app.core.wechatpay import wechatpay_request
+    from app.services import billing
+    from decimal import Decimal
+    from datetime import datetime, timezone
+    import uuid
 
     logger.info(f"Auto-approving refund for order {out_trade_no}")
 
     async with AsyncSessionLocal() as db:
         try:
-            result = await db.execute(select(Order).where(Order.out_trade_no == out_trade_no))
+            result = await db.execute(
+                select(Order).where(Order.out_trade_no == out_trade_no).with_for_update()
+            )
             order = result.scalar_one_or_none()
             if not order or order.status != OrderStatus.REFUNDING:
                 logger.info(f"Order {out_trade_no} not in REFUNDING state, skipping auto-approve")
                 return
 
-            # 冲正
+            # 冲正：从统一现金余额扣回充值金额（余额不足扣到 0 为止），写流水
             if order.status_before_refund == OrderStatus.ASSIGNED:
-                items = json.loads(order.items_json) if order.items_json else [{"group": order.group, "amount_usd": float(order.amount_usd)}]
-                for item in items:
-                    ut_result = await db.execute(
-                        select(UserToken).where(UserToken.user_id == order.user_id, UserToken.group == item["group"])
-                    )
-                    ut = ut_result.scalar_one_or_none()
-                    if ut:
-                        new_balance = float(ut.balance_usd) - item["amount_usd"]
-                        if new_balance <= 0:
-                            tok_result = await db.execute(select(TokenInventory).where(TokenInventory.id == ut.token_id))
-                            tok = tok_result.scalar_one_or_none()
-                            if tok:
-                                tok.is_assigned = False
-                                tok.assigned_to = None
-                                tok.assigned_at = None
-                            await db.delete(ut)
-                        else:
-                            ut.balance_usd = new_balance
+                await billing.debit_balance_for_refund(
+                    db, order.user_id, Decimal(str(order.amount_usd)),
+                    related_order_id=order.id,
+                    remark=f"auto refund {out_trade_no}",
+                )
 
             # 调用微信退款
-            from datetime import datetime, timezone
-            import uuid
             out_refund_no = f"RF{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
             total_fee = int(round(float(order.amount_cny) * 100))
             refund_data = {
@@ -77,6 +67,7 @@ async def auto_approve_refund(out_trade_no: str):
 
             code, wx_result = await wechatpay_request("/v3/refund/domestic/refunds", method="POST", data=refund_data)
             if code != 200:
+                await db.rollback()
                 logger.error(f"Auto-approve WeChat refund failed for {out_trade_no}: {wx_result}")
                 return
 
@@ -84,7 +75,7 @@ async def auto_approve_refund(out_trade_no: str):
             order.out_refund_no = out_refund_no
             order.refunded_at = datetime.now(timezone.utc)
             await db.commit()
-            logger.info(f"Auto-approved refund for order {out_trade_no}")
+            logger.info(f"Auto-approved refund for {out_trade_no}")
         except Exception:
             await db.rollback()
             logger.exception(f"Auto-approve refund error for {out_trade_no}")

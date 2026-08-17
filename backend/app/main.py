@@ -1,168 +1,223 @@
+import logging
+from contextlib import asynccontextmanager
+from decimal import Decimal
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from contextlib import asynccontextmanager
+from sqlalchemy import select, text
 import os
 import asyncio
 import traceback
 
-from app.core.database import engine, Base, AsyncSession
+from app.core.database import engine, Base, AsyncSessionLocal, AsyncSession
 from app.core.redis import init_redis, start_keyspace_listener, recover_pending_refunds
-from app.api.routes import auth, users, tokens, payment, notice, prompts, models, admin, usage
-from app.models.content import Group, AIModel
-from sqlalchemy import select, text
+from app.api.routes import auth, users, tokens, payment, notice, models, admin, usage, client
+from app.models.content import AIModel
+from app.services import billing
 
-DEFAULT_GROUPS = [
-    {"name": "image", "description": "图片生成组", "sort_order": 1},
-    {"name": "agent", "description": "Agent 对话组", "sort_order": 2},
-    {"name": "postprocess", "description": "后处理工具组", "sort_order": 3},
-]
+logger = logging.getLogger(__name__)
 
-DEFAULT_MODELS = [
-    # Image
-    {"name": "gpt-image-2", "display_name": "GPT Image 2", "provider": "OpenAI",
-     "billing_type": "per_call", "model_type": "image", "group": "image",
-     "is_enabled": True, "trial_allowed": True, "price_per_call": "0.046",
-     "context_window": 0, "supports_tools": False, "supports_vision": False, "sort_order": 1},
-    # Agent models (15% markup on PackyAPI prices)
-    {"name": "qwen3.5-flash", "display_name": "Qwen 3.5 Flash", "provider": "Alibaba",
-     "billing_type": "per_token", "model_type": "agent", "group": "agent",
-     "is_enabled": True, "trial_allowed": False,
-     "price_input": "0.000115", "price_output": "0.001150", "price_cached": "0.0000115",
-     "context_window": 131072, "supports_tools": True, "supports_vision": True, "sort_order": 10},
-    {"name": "qwen3.5-plus", "display_name": "Qwen 3.5 Plus", "provider": "Alibaba",
-     "billing_type": "per_token", "model_type": "agent", "group": "agent",
-     "is_enabled": True, "trial_allowed": False,
-     "price_input": "0.00046", "price_output": "0.00276", "price_cached": "0.000046",
-     "context_window": 131072, "supports_tools": True, "supports_vision": True, "sort_order": 11},
-    {"name": "qwen3.6-plus", "display_name": "Qwen 3.6 Plus", "provider": "Alibaba",
-     "billing_type": "per_token", "model_type": "agent", "group": "agent",
-     "is_enabled": True, "trial_allowed": False,
-     "price_input": "0.00115", "price_output": "0.0069", "price_cached": "0.000115",
-     "context_window": 131072, "supports_tools": True, "supports_vision": True, "sort_order": 12},
-    {"name": "qwen-max", "display_name": "Qwen Max", "provider": "Alibaba",
-     "billing_type": "per_token", "model_type": "agent", "group": "agent",
-     "is_enabled": True, "trial_allowed": False,
-     "price_input": "0.001438", "price_output": "0.00575", "price_cached": "0.000288",
-     "context_window": 32768, "supports_tools": True, "supports_vision": False, "sort_order": 13},
-    {"name": "deepseek-v4-flash", "display_name": "DeepSeek V4 Flash", "provider": "DeepSeek",
-     "billing_type": "per_token", "model_type": "agent", "group": "agent",
-     "is_enabled": True, "trial_allowed": False,
-     "price_input": "0.000575", "price_output": "0.00115", "price_cached": "0.0000115",
-     "context_window": 131072, "supports_tools": True, "supports_vision": False, "sort_order": 20},
-    {"name": "deepseek-v4-pro", "display_name": "DeepSeek V4 Pro", "provider": "DeepSeek",
-     "billing_type": "per_token", "model_type": "agent", "group": "agent",
-     "is_enabled": True, "trial_allowed": False,
-     "price_input": "0.0069", "price_output": "0.0138", "price_cached": "0.0000575",
-     "context_window": 131072, "supports_tools": True, "supports_vision": False, "sort_order": 21},
-    {"name": "glm-5", "display_name": "GLM-5", "provider": "Zhipu",
-     "billing_type": "per_token", "model_type": "agent", "group": "agent",
-     "is_enabled": True, "trial_allowed": False,
-     "price_input": "0.0023", "price_output": "0.01035", "price_cached": "0.00046",
-     "context_window": 131072, "supports_tools": True, "supports_vision": True, "sort_order": 30},
-    {"name": "kimi-k2.5", "display_name": "Kimi K2.5", "provider": "Moonshot",
-     "billing_type": "per_token", "model_type": "agent", "group": "agent",
-     "is_enabled": True, "trial_allowed": False,
-     "price_input": "0.0023", "price_output": "0.012075", "price_cached": "0.0004025",
-     "context_window": 131072, "supports_tools": True, "supports_vision": False, "sort_order": 31},
-    {"name": "gpt-5.4-mini", "display_name": "GPT-5.4 Mini", "provider": "OpenAI",
-     "billing_type": "per_token", "model_type": "agent", "group": "agent",
-     "is_enabled": True, "trial_allowed": False,
-     "price_input": "0.000431", "price_output": "0.002588", "price_cached": "0.0000431",
-     "context_window": 131072, "supports_tools": True, "supports_vision": False, "sort_order": 40},
-    {"name": "gpt-5.4", "display_name": "GPT-5.4", "provider": "OpenAI",
-     "billing_type": "per_token", "model_type": "agent", "group": "agent",
-     "is_enabled": True, "trial_allowed": False,
-     "price_input": "0.001438", "price_output": "0.008625", "price_cached": "0.0001438",
-     "context_window": 131072, "supports_tools": True, "supports_vision": False, "sort_order": 41},
-    {"name": "claude-sonnet-4-6", "display_name": "Claude Sonnet 4.6", "provider": "Anthropic",
-     "billing_type": "per_token", "model_type": "agent", "group": "agent",
-     "is_enabled": True, "trial_allowed": False,
-     "price_input": "0.001725", "price_output": "0.008625", "price_cached": "0.0001725",
-     "context_window": 200000, "supports_tools": True, "supports_vision": True, "sort_order": 50},
-    # Postprocess
-    {"name": "remove_bg", "display_name": "Remove Background", "provider": "Internal",
-     "billing_type": "per_call", "model_type": "postprocess", "group": "postprocess",
-     "is_enabled": True, "trial_allowed": False, "price_per_call": "0.010",
-     "context_window": 0, "supports_tools": False, "supports_vision": False, "sort_order": 100},
-]
+IMAGE2_MODEL_ID = "gpt-image-2"
 
+# V4：系统仅提供 Image2 一个收费模型，seed 只保证它存在，不再创建任何其他默认模型。
+IMAGE2_SEED = {
+    "name": IMAGE2_MODEL_ID,
+    "display_name": "Image2",
+    "provider": "OpenAI",
+    "billing_type": "per_call",
+    "is_enabled": True,
+    "trial_allowed": True,
+    "price_per_call": Decimal("0.046"),
+    "currency": "USD",
+}
 
-async def _migrate_groups(session):
-    """Migrate old group names to new ones in all related tables."""
-    import json
-    from sqlalchemy import update as sa_update, delete as sa_delete
-    from app.models.user import UserToken
-    from app.models.token import TokenInventory, Order
-
-    group_map = {"sora": "image", "codex": "agent", "codex-sale": "agent"}
-
-    for old_name, new_name in group_map.items():
-        result = await session.execute(select(Group).where(Group.name == old_name))
-        if not result.scalar_one_or_none():
-            continue
-
-        # Update AIModel.group
-        await session.execute(sa_update(AIModel).where(AIModel.group == old_name).values(group=new_name))
-        # Update UserToken.group
-        await session.execute(sa_update(UserToken).where(UserToken.group == old_name).values(group=new_name))
-        # Update TokenInventory.group
-        await session.execute(sa_update(TokenInventory).where(TokenInventory.group == old_name).values(group=new_name))
-
-        # Update Order.group (comma-separated) and Order.items_json
-        order_result = await session.execute(select(Order).where(Order.group.contains(old_name)))
-        orders = order_result.scalars().all()
-        for order in orders:
-            groups_list = [group_map.get(g.strip(), g.strip()) for g in order.group.split(",")]
-            order.group = ",".join(groups_list)
-            if order.items_json:
-                try:
-                    items = json.loads(order.items_json)
-                    for item in items:
-                        if item.get("group") in group_map:
-                            item["group"] = group_map[item["group"]]
-                    order.items_json = json.dumps(items)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-        # Delete old Group row
-        await session.execute(sa_delete(Group).where(Group.name == old_name))
-
-    # Migrate model_type chat -> agent in existing AIModel records
-    await session.execute(sa_update(AIModel).where(AIModel.model_type == "chat").values(model_type="agent"))
-
-    await session.commit()
+MIGRATION_VERSION = "v4_single_model"
 
 
 async def seed_defaults():
     async with AsyncSession(engine) as session:
-        await _migrate_groups(session)
-        for g in DEFAULT_GROUPS:
-            result = await session.execute(select(Group).where(Group.name == g["name"]))
-            if not result.scalar_one_or_none():
-                session.add(Group(**g))
-        for m in DEFAULT_MODELS:
-            result = await session.execute(select(AIModel).where(AIModel.name == m["name"], AIModel.group == m["group"]))
-            if not result.scalar_one_or_none():
-                session.add(AIModel(**m))
+        result = await session.execute(select(AIModel).where(AIModel.name == IMAGE2_MODEL_ID))
+        if not result.scalar_one_or_none():
+            session.add(AIModel(**IMAGE2_SEED))
         await session.commit()
+
+
+async def _column_exists(conn, table: str, column: str) -> bool:
+    result = await conn.execute(text(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = :table AND column_name = :column"
+    ), {"table": table, "column": column})
+    return bool(result.scalar())
 
 
 async def _ensure_columns(conn):
     """Add new columns to existing tables if they don't exist (PostgreSQL)."""
     new_columns = [
-        ("ai_models", "context_window", "INTEGER DEFAULT 32768"),
-        ("ai_models", "supports_tools", "BOOLEAN DEFAULT FALSE"),
-        ("ai_models", "supports_vision", "BOOLEAN DEFAULT FALSE"),
+        ("users", "balance_usd", "NUMERIC(18,6) NOT NULL DEFAULT 0"),
+        ("users", "trial_credit_usd", "NUMERIC(18,6) NOT NULL DEFAULT 0"),
+        ("ai_models", "currency", "VARCHAR(8) NOT NULL DEFAULT 'USD'"),
+        ("token_inventory", "is_disabled", "BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("usage_logs", "request_id", "VARCHAR(64)"),
     ]
     for table, column, col_type in new_columns:
-        result = await conn.execute(text(
-            f"SELECT 1 FROM information_schema.columns "
-            f"WHERE table_name='{table}' AND column_name='{column}'"
-        ))
-        if not result.scalar():
+        if not await _column_exists(conn, table, column):
             await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
+
+
+async def _ensure_indexes(conn):
+    index_ddls = [
+        "CREATE INDEX IF NOT EXISTS ix_usage_logs_user_created ON usage_logs (user_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_usage_logs_user_model ON usage_logs (user_id, model)",
+        "CREATE INDEX IF NOT EXISTS ix_usage_logs_user_type ON usage_logs (user_id, usage_type)",
+        "CREATE INDEX IF NOT EXISTS ix_usage_logs_user_model_created ON usage_logs (user_id, model, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_usage_logs_request_id ON usage_logs (request_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_usage_logs_request_id ON usage_logs (request_id) WHERE request_id IS NOT NULL",
+    ]
+    for ddl in index_ddls:
+        await conn.execute(text(ddl))
+
+    # 微信 transaction_id 唯一兜底（历史数据存在重复时不创建，避免迁移失败）
+    dup = await conn.execute(text(
+        "SELECT COUNT(*) FROM (SELECT trade_no FROM orders "
+        "WHERE trade_no IS NOT NULL GROUP BY trade_no HAVING COUNT(*) > 1) t"
+    ))
+    if not dup.scalar():
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_orders_trade_no ON orders (trade_no) "
+            "WHERE trade_no IS NOT NULL"
+        ))
+
+    # token_inventory 唯一兜底（旧库 UNIQUE(token_value, group) 收敛后单列约束可能缺失；
+    # 历史数据存在同 token 多行重复时不创建，避免迁移失败）
+    tdup = await conn.execute(text(
+        "SELECT COUNT(*) FROM (SELECT token_value FROM token_inventory "
+        "GROUP BY token_value HAVING COUNT(*) > 1) t"
+    ))
+    if not tdup.scalar():
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_token_value ON token_inventory (token_value)"
+        ))
+
+
+async def _drop_not_null(conn, table: str, column: str):
+    await conn.execute(text(f'ALTER TABLE {table} ALTER COLUMN "{column}" DROP NOT NULL'))
+
+
+async def _migrate_v4_single_model(conn):
+    """V4 一次性数据迁移：统一余额、单模型收敛。
+
+    - user_tokens 分组余额 → users.balance_usd / trial_credit_usd
+      迁移规则（保守，不高估现金）：非试用行全额计现金；试用行前 $1 视为赠送试用额度，
+      超出部分视为现金（agent/postprocess 历史余额均为真实付费，计现金）。
+    - ai_models 删除全部非 gpt-image-2 模型；price_per_call 由 VARCHAR 迁移为 NUMERIC(18,6)。
+    - 旧 NOT NULL 分组列放宽为可空（代码不再写入）。
+    - 旧表 prompts / groups / user_tokens 保留数据，不再被代码引用。
+    """
+    await conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS schema_migrations ("
+        "version VARCHAR(64) PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    ))
+    applied = await conn.execute(text(
+        "SELECT 1 FROM schema_migrations WHERE version = :v"
+    ), {"v": MIGRATION_VERSION})
+    if applied.scalar():
+        return
+
+    logger.info("running migration %s ...", MIGRATION_VERSION)
+
+    # 1) 放宽历史 NOT NULL 分组列
+    for table, column in [
+        ("ai_models", "group"), ("token_inventory", "group"), ("orders", "group"),
+        ("ai_models", "model_type"),
+    ]:
+        if await _column_exists(conn, table, column):
+            try:
+                await _drop_not_null(conn, table, column)
+            except Exception:
+                logger.warning("drop not null failed: %s.%s", table, column)
+
+    # 2) ai_models.price_per_call VARCHAR → NUMERIC(18,6)（先清掉非 Image2 模型再转）
+    if await _column_exists(conn, "ai_models", "price_per_call"):
+        col_type = await conn.execute(text(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_name = 'ai_models' AND column_name = 'price_per_call'"
+        ))
+        if (col_type.scalar() or "") in ("character varying", "text"):
+            await conn.execute(text(
+                "DELETE FROM ai_models WHERE name <> :name"
+            ), {"name": IMAGE2_MODEL_ID})
+            await conn.execute(text(
+                "ALTER TABLE ai_models ALTER COLUMN price_per_call TYPE NUMERIC(18,6) "
+                "USING NULLIF(TRIM(price_per_call), '')::numeric"
+            ))
+        else:
+            await conn.execute(text(
+                "DELETE FROM ai_models WHERE name <> :name"
+            ), {"name": IMAGE2_MODEL_ID})
+
+    # 3) 分组余额 → 统一余额
+    if await _column_exists(conn, "user_tokens", "balance_usd"):
+        await conn.execute(text("""
+            UPDATE users u SET
+                balance_usd = COALESCE(agg.cash, 0),
+                trial_credit_usd = COALESCE(agg.trial, 0)
+            FROM (
+                SELECT ut.user_id,
+                       SUM(CASE WHEN ut.is_trial = false THEN ut.balance_usd
+                                ELSE GREATEST(ut.balance_usd - 1.0, 0) END) AS cash,
+                       SUM(CASE WHEN ut.is_trial = true THEN LEAST(ut.balance_usd, 1.0)
+                                ELSE 0 END) AS trial
+                FROM user_tokens ut
+                GROUP BY ut.user_id
+            ) agg
+            WHERE u.id = agg.user_id
+              AND (u.balance_usd = 0 AND u.trial_credit_usd = 0)
+        """))
+        # 迁移入账流水（金额 > 0 的用户），保证账务可追溯
+        await conn.execute(text("""
+            INSERT INTO billing_transactions
+                (id, user_id, type, status, image_count, amount_usd, trial_amount,
+                 balance_amount, billing_source, balance_before, balance_after,
+                 trial_before, trial_after, remark, created_at, updated_at)
+            SELECT gen_random_uuid()::text, u.id, 'MIGRATION', 'SUCCESS', 0,
+                   COALESCE(agg.cash, 0) + COALESCE(agg.trial, 0),
+                   COALESCE(agg.trial, 0), COALESCE(agg.cash, 0),
+                   CASE WHEN COALESCE(agg.trial,0) > 0 AND COALESCE(agg.cash,0) > 0 THEN 'MIXED'
+                        WHEN COALESCE(agg.trial,0) > 0 THEN 'TRIAL'
+                        WHEN COALESCE(agg.cash,0) > 0 THEN 'CASH'
+                        ELSE 'NONE' END,
+                   0, u.balance_usd, 0, u.trial_credit_usd,
+                   'v4 unified balance migration (user_tokens -> users)', now(), now()
+            FROM users u
+            JOIN (
+                SELECT ut.user_id,
+                       SUM(CASE WHEN ut.is_trial = false THEN ut.balance_usd
+                                ELSE GREATEST(ut.balance_usd - 1.0, 0) END) AS cash,
+                       SUM(CASE WHEN ut.is_trial = true THEN LEAST(ut.balance_usd, 1.0)
+                                ELSE 0 END) AS trial
+                FROM user_tokens ut
+                GROUP BY ut.user_id
+            ) agg ON agg.user_id = u.id
+            WHERE COALESCE(agg.cash, 0) + COALESCE(agg.trial, 0) > 0
+        """))
+
+    await conn.execute(text(
+        "INSERT INTO schema_migrations (version) VALUES (:v) ON CONFLICT DO NOTHING"
+    ), {"v": MIGRATION_VERSION})
+    logger.info("migration %s done", MIGRATION_VERSION)
+
+
+async def start_reservation_gc_loop():
+    """周期释放超时未结算的 Image2 预占（客户端崩溃兜底）。"""
+    while True:
+        try:
+            async with AsyncSessionLocal() as session:
+                await billing.release_stale_reservations(session)
+        except Exception:
+            logger.exception("reservation gc loop failed")
+        await asyncio.sleep(600)
 
 
 @asynccontextmanager
@@ -171,9 +226,12 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await _ensure_columns(conn)
+        await _ensure_indexes(conn)
+        await _migrate_v4_single_model(conn)
     await seed_defaults()
-    from app.core.packy_sync import start_price_sync_loop
-    asyncio.create_task(start_price_sync_loop())
+
+    # 启动即清理一次超时预占，再进入周期任务
+    asyncio.create_task(start_reservation_gc_loop())
 
     # 恢复未处理的退款（超时自动退款，未超时重设过期键）
     await recover_pending_refunds()
@@ -184,7 +242,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="CyImagePro Service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="CyImagePro Service", version="4.0.0", lifespan=lifespan)
 
 
 @app.exception_handler(Exception)
@@ -208,10 +266,11 @@ app.include_router(users.router, prefix="/api/users", tags=["users"])
 app.include_router(tokens.router, prefix="/api/tokens", tags=["tokens"])
 app.include_router(payment.router, prefix="/api/pay", tags=["payment"])
 app.include_router(notice.router, prefix="/api/notice", tags=["notice"])
-app.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
 app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(usage.router, prefix="/api/usage", tags=["usage"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
+app.include_router(client.router, prefix="/api/client", tags=["client"])
+
 
 @app.get("/api")
 @app.get("/api/")
@@ -225,7 +284,6 @@ async def api_index():
             "/api/tokens",
             "/api/pay",
             "/api/notice",
-            "/api/prompts",
             "/api/models",
             "/api/usage",
         ],
@@ -238,4 +296,9 @@ if os.path.exists("/app/static"):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"ok": True, "service": "cyimagepro-server", "version": "4.0.0"}
+
+
+@app.get("/api/health")
+async def api_health():
+    return {"ok": True, "service": "cyimagepro-server", "version": "4.0.0"}

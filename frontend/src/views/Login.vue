@@ -4,13 +4,25 @@
     <div class="login-container">
       <div class="login-brand">
         <div class="login-logo">
-          <svg width="36" height="36" viewBox="0 0 36 36" fill="none">
-            <rect x="2" y="2" width="32" height="32" rx="8" stroke="#00d4aa" stroke-width="2" fill="#00d4aa1a"/>
-            <path d="M12 18L16 22L24 14" stroke="#00d4aa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <svg width="48" height="48" viewBox="0 0 40 40" fill="none">
+            <!-- 主背景 -->
+            <rect x="2" y="2" width="36" height="36" rx="10" fill="url(#loginBrandGrad)" />
+            <!-- 云形装饰 -->
+            <path d="M12 22c0-4 3-7 7-7 2.5 0 4.5 1.5 5.5 3.5 2.5-.5 4.5 1 4.5 3.5 0 2-1.5 3.5-3.5 3.5H14c-2.2 0-4-1.8-4-4v1z" fill="white" fill-opacity="0.9"/>
+            <!-- 节点装饰 -->
+            <circle cx="26" cy="16" r="3" fill="white" fill-opacity="0.95"/>
+            <circle cx="30" cy="22" r="2" fill="white" fill-opacity="0.85"/>
+            <defs>
+              <linearGradient id="loginBrandGrad" x1="2" y1="2" x2="38" y2="38" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#00BFA6"/>
+                <stop offset="1" stop-color="#0F766E"/>
+              </linearGradient>
+            </defs>
           </svg>
         </div>
-        <h1 class="login-title">CyImagePro</h1>
-        <p class="login-subtitle">管理后台</p>
+        <h1 class="login-title">晨阳云枢</h1>
+        <p class="login-title-en">CyCloudHub</p>
+        <p class="login-subtitle">CyImagePro 云端运营与计费中枢</p>
       </div>
       <n-card class="login-card" :bordered="false">
         <div class="login-card-header">
@@ -27,7 +39,7 @@
           <n-button type="primary" block attr-type="submit" :loading="loading" size="large" class="login-btn">登录</n-button>
         </n-form>
       </n-card>
-      <p class="login-footer">CyImagePro v1.0 &middot; AI Image & Chat API Platform</p>
+      <p class="login-footer">晨阳云枢 · CyCloudHub &middot; 企业级云端运营平台</p>
     </div>
   </div>
 </template>
@@ -63,7 +75,7 @@ async function login() {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #0e0e16;
+  background: linear-gradient(135deg, #F6F8FB 0%, #EEF2F7 100%);
   position: relative;
   overflow: hidden;
 }
@@ -72,15 +84,9 @@ async function login() {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(ellipse 600px 400px at 20% 50%, #00d4aa0d 0%, transparent 70%),
-    radial-gradient(ellipse 500px 300px at 80% 30%, #6366f10a 0%, transparent 70%),
-    radial-gradient(ellipse 400px 400px at 60% 80%, #00d4aa08 0%, transparent 70%);
-  animation: bgShift 20s ease-in-out infinite alternate;
-}
-
-@keyframes bgShift {
-  0% { opacity: 0.6; transform: scale(1); }
-  100% { opacity: 1; transform: scale(1.05); }
+    radial-gradient(ellipse 600px 400px at 20% 50%, rgba(0, 191, 166, 0.06) 0%, transparent 70%),
+    radial-gradient(ellipse 500px 300px at 80% 30%, rgba(59, 130, 246, 0.05) 0%, transparent 70%),
+    radial-gradient(ellipse 400px 400px at 60% 80%, rgba(0, 191, 166, 0.04) 0%, transparent 70%);
 }
 
 .login-container {
@@ -91,51 +97,52 @@ async function login() {
   align-items: center;
   gap: 24px;
   width: 100%;
-  max-width: 400px;
+  max-width: 420px;
   padding: 0 20px;
 }
 
 .login-brand {
   text-align: center;
-  margin-bottom: 4px;
+  margin-bottom: 8px;
 }
 
 .login-logo {
-  margin-bottom: 12px;
-  animation: logoPulse 3s ease-in-out infinite;
-}
-
-@keyframes logoPulse {
-  0%, 100% { filter: drop-shadow(0 0 8px #00d4aa44); }
-  50% { filter: drop-shadow(0 0 16px #00d4aa66); }
+  margin-bottom: 16px;
+  filter: drop-shadow(0 4px 12px rgba(0, 191, 166, 0.2));
 }
 
 .login-title {
-  font-family: 'Space Mono', monospace;
   font-size: 28px;
   font-weight: 700;
-  color: #e4e4ef;
+  color: var(--cy-text);
   letter-spacing: -0.02em;
+  margin: 0 0 4px;
+}
+
+.login-title-en {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--cy-primary);
+  letter-spacing: 0.05em;
+  margin: 0 0 8px;
 }
 
 .login-subtitle {
-  font-size: 14px;
-  color: #8888a0;
-  margin-top: 4px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: 13px;
+  color: var(--cy-text-muted);
+  margin: 0;
 }
 
 .login-card {
   width: 100%;
-  background: #1e1e2e !important;
-  border: 1px solid #2a2a3e !important;
-  border-radius: 12px !important;
-  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.4), 0 0 0 1px #2a2a3e;
+  background: #FFFFFF !important;
+  border: 1px solid var(--cy-border) !important;
+  border-radius: 16px !important;
+  box-shadow: 0 8px 32px rgba(15, 23, 42, 0.08), 0 0 0 1px var(--cy-border);
 }
 
 .login-card :deep(.n-card__content) {
-  padding: 28px 28px 24px !important;
+  padding: 32px 32px 28px !important;
 }
 
 .login-card-header {
@@ -145,13 +152,14 @@ async function login() {
 .login-card-title {
   font-size: 18px;
   font-weight: 600;
-  color: #e4e4ef;
-  margin-bottom: 6px;
+  color: var(--cy-text);
+  margin: 0 0 6px;
 }
 
 .login-card-desc {
   font-size: 13px;
-  color: #8888a0;
+  color: var(--cy-text-muted);
+  margin: 0;
 }
 
 .login-btn {
@@ -161,12 +169,12 @@ async function login() {
   font-size: 15px;
   letter-spacing: 0.02em;
   border-radius: 8px !important;
-  box-shadow: 0 4px 16px #00d4aa33;
-  transition: box-shadow 0.3s, transform 0.15s;
+  box-shadow: 0 4px 16px rgba(0, 191, 166, 0.25);
+  transition: all 0.2s;
 }
 
 .login-btn:hover {
-  box-shadow: 0 6px 24px #00d4aa55;
+  box-shadow: 0 6px 24px rgba(0, 191, 166, 0.35);
   transform: translateY(-1px);
 }
 
@@ -176,7 +184,7 @@ async function login() {
 
 .login-footer {
   font-size: 12px;
-  color: #5c5c72;
+  color: var(--cy-text-dim);
   letter-spacing: 0.02em;
 }
 </style>
