@@ -338,13 +338,18 @@ async function loadUsers() {
   }
 }
 
+// 5xx 时后端 detail 是通用文案，仍避免把任何内部信息弹给管理员
+function apiError(e, fallback) {
+  return e.response?.status && e.response.status >= 500 ? fallback : (e.response?.data?.detail || fallback)
+}
+
 async function viewUser(row) {
   try {
     const { data } = await http.get(`/api/admin/users/${row.id}`)
     detailUser.value = data
     showDetail.value = true
   } catch (e) {
-    message.error(e.response?.data?.detail || '加载用户详情失败')
+    message.error(apiError(e, '获取用户详情失败，请稍后重试'))
   }
 }
 
@@ -360,7 +365,7 @@ async function openEdit(row) {
     }
     showEdit.value = true
   } catch (e) {
-    message.error(e.response?.data?.detail || '加载用户失败')
+    message.error(apiError(e, '获取用户详情失败，请稍后重试'))
   }
 }
 

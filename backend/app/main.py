@@ -9,7 +9,6 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, text
 import os
 import asyncio
-import traceback
 
 from app.core.database import engine, Base, AsyncSessionLocal, AsyncSession
 from app.core.redis import init_redis, start_keyspace_listener, recover_pending_refunds
@@ -20,6 +19,9 @@ from app.services import billing
 logger = logging.getLogger(__name__)
 
 IMAGE2_MODEL_ID = "gpt-image-2"
+
+# 服务版本唯一来源：/health、/api/health 与 FastAPI 元数据均引用此常量
+APP_VERSION = "4.0.1"
 
 # V4：系统仅提供 Image2 一个收费模型，seed 只保证它存在，不再创建任何其他默认模型。
 IMAGE2_SEED = {
@@ -60,6 +62,8 @@ async def _ensure_columns(conn):
         ("ai_models", "currency", "VARCHAR(8) NOT NULL DEFAULT 'USD'"),
         ("token_inventory", "is_disabled", "BOOLEAN NOT NULL DEFAULT FALSE"),
         ("usage_logs", "request_id", "VARCHAR(64)"),
+        # V4 结算单价快照：历史记录无法可靠还原单价，保持 NULL（API 对 NULL 已兼容）
+        ("usage_logs", "unit_price", "NUMERIC(10,6)"),
     ]
     for table, column, col_type in new_columns:
         if not await _column_exists(conn, table, column):
@@ -242,15 +246,16 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="CyImagePro Service", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="CyImagePro Service", version=APP_VERSION, lifespan=lifespan)
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    traceback.print_exc()
+    # 详细堆栈只进服务端日志，不向客户端外泄 SQL/驱动/路径等内部信息
+    logger.exception("unhandled error on %s %s", request.method, request.url.path)
     return JSONResponse(
         status_code=500,
-        content={"detail": f"服务器内部错误：{str(exc)}"},
+        content={"detail": "服务器内部错误，请稍后重试"},
     )
 
 app.add_middleware(
@@ -296,9 +301,9 @@ if os.path.exists("/app/static"):
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "cyimagepro-server", "version": "4.0.0"}
+    return {"ok": True, "service": "cyimagepro-server", "version": APP_VERSION}
 
 
 @app.get("/api/health")
 async def api_health():
-    return {"ok": True, "service": "cyimagepro-server", "version": "4.0.0"}
+    return {"ok": True, "service": "cyimagepro-server", "version": APP_VERSION}

@@ -219,8 +219,31 @@ async def test_create_order_accepts_legacy_total_usd(client, monkeypatch):
     assert body["amount_usd"] == 5
     assert body["status"] == "pending"
 
+    r = await client.post("/api/pay/create_order", json={"amount_usd": 6}, headers=headers)
+    assert r.status_code == 200
+
+
+async def test_create_order_debounces_rapid_duplicates(client, monkeypatch):
+    """服务端防连击：10 秒内同用户已有待支付订单 → 429，不再重复创建微信订单。"""
+    from app.api.routes import payment as payment_routes
+    monkeypatch.setattr(payment_routes, "should_use_dev_payment", lambda: True)
+    user = await make_user("buyer3", "0", "0")
+
+    headers = {"Authorization": f"Bearer {create_access_token(user.id)}"}
     r = await client.post("/api/pay/create_order", json={"amount_usd": 5}, headers=headers)
     assert r.status_code == 200
+    first_no = r.json()["out_trade_no"]
+
+    r = await client.post("/api/pay/create_order", json={"amount_usd": 5}, headers=headers)
+    assert r.status_code == 429
+
+    from sqlalchemy import select
+    from app.models.token import Order
+    async with AsyncSessionLocal() as db:
+        orders = (await db.execute(
+            select(Order.out_trade_no).where(Order.user_id == user.id)
+        )).scalars().all()
+    assert orders == [first_no]
 
 
 async def test_create_order_missing_amount_returns_explicit_422(client, monkeypatch):

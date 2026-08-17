@@ -114,6 +114,19 @@ async def create_order(
     amount_usd = _resolve_amount_usd(req)
     amount_cny, rate = await _validate_amount(amount_usd)
 
+    # 服务端防连击：10 秒内同用户已创建同金额待支付订单则拒绝（前端 loading 防抖的兜底；
+    # 不同金额视为用户主动改单，放行）
+    recent = await db.execute(
+        select(Order.id).where(
+            Order.user_id == user.id,
+            Order.status == OrderStatus.PENDING,
+            Order.amount_usd == Decimal(str(amount_usd)),
+            Order.created_at > datetime.now(timezone.utc) - timedelta(seconds=10),
+        ).limit(1)
+    )
+    if recent.scalar_one_or_none():
+        raise HTTPException(status_code=429, detail="请求过于频繁，请先完成或取消当前待支付订单")
+
     out_trade_no = f"CY{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
 
     order = Order(

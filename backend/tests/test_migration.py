@@ -59,12 +59,14 @@ LEGACY_DDL = [
         out_refund_no VARCHAR(64), token_id VARCHAR(36), created_at TIMESTAMPTZ DEFAULT now(),
         paid_at TIMESTAMPTZ, refunded_at TIMESTAMPTZ, refund_requested_at TIMESTAMPTZ,
         status_before_refund VARCHAR(16))""",
+    # 真实 V3 旧库形态：usage_logs 无 unit_price / request_id（回归守卫：
+    # 曾因 fixture 误含 unit_price 掩盖 _ensure_columns 遗漏，导致生产 UndefinedColumnError）
     """CREATE TABLE usage_logs (
         id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36) NOT NULL REFERENCES users(id),
         model VARCHAR(64) NOT NULL, usage_type VARCHAR(16) NOT NULL,
         image_count INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0,
         output_tokens INTEGER DEFAULT 0, cached_tokens INTEGER DEFAULT 0,
-        unit_price NUMERIC(10,6), cost_usd NUMERIC(10,6) NOT NULL,
+        cost_usd NUMERIC(10,6) NOT NULL,
         created_at TIMESTAMPTZ DEFAULT now())""",
 ]
 
@@ -90,6 +92,8 @@ LEGACY_DATA = [
     "('ut5','U4','ti1','agent',3.000000,false)",       # agent 非试用 → U4 = 3.42 现金
     "INSERT INTO orders (id, user_id, out_trade_no, \"group\", amount_usd, amount_cny, exchange_rate, status) VALUES "
     "('o1','U4','CYOLD0000000001','image',0.42,3.05,7.25,'assigned')",
+    "INSERT INTO usage_logs (id, user_id, model, usage_type, image_count, cost_usd, created_at) VALUES "
+    "('ul1','U4','gpt-image-1','image',2,0.092000,now())",
 ]
 
 
@@ -219,3 +223,57 @@ def test_seed_idempotent_single_model():
     """Test 13：迁移+seed 后（含重复执行）始终只有 gpt-image-2。"""
     rows = q("SELECT name FROM ai_models")
     assert rows == [("gpt-image-2",)]
+
+
+def test_usage_logs_missing_columns_added():
+    """回归守卫：V3 旧库 usage_logs 无 unit_price/request_id，启动迁移必须补齐。
+
+    生产事故：ORM 含 unit_price 但 _ensure_columns 遗漏，旧库升级后
+    admin 用户详情 select(UsageLog) 抛 UndefinedColumnError。
+    """
+    cols = {r[0]: (r[1], r[2]) for r in q(
+        "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+        "WHERE table_name='usage_logs'")}
+    assert cols["unit_price"] == ("numeric", "YES")
+    assert cols["request_id"] == ("character varying", "YES")
+
+
+def test_usage_logs_history_unit_price_stays_null():
+    """历史行 unit_price 保持 NULL，不伪造价格；数据不丢。"""
+    rows = q("SELECT model, image_count, cost_usd, unit_price, request_id FROM usage_logs")
+    assert rows == [("gpt-image-1", 2, Decimal("0.092000"), None, None)]
+
+
+def test_usage_logs_orm_full_select_works():
+    """迁移后 ORM 全列查询可用（即 admin 用户详情的真实查询路径）。"""
+    import asyncio
+    from sqlalchemy import select as sa_select
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from app.models.token import UsageLog
+
+    async def run():
+        engine = create_async_engine(f"{PG}/{LEGACY_DB}")
+        try:
+            async with AsyncSession(engine) as session:
+                rows = (await session.execute(sa_select(UsageLog))).scalars().all()
+                return [(r.model, r.unit_price) for r in rows]
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(run()) == [("gpt-image-1", None)]
+
+
+def test_ensure_columns_idempotent_on_legacy():
+    """_ensure_columns 重复执行不失败（幂等）。"""
+    import asyncio
+    from app.main import _ensure_columns
+
+    async def run():
+        engine = create_async_engine(f"{PG}/{LEGACY_DB}")
+        try:
+            async with engine.begin() as conn:
+                await _ensure_columns(conn)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
