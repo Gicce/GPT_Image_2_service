@@ -73,8 +73,9 @@ LEGACY_DDL = [
 LEGACY_DATA = [
     "INSERT INTO groups (id, name, description, sort_order) VALUES ('g1','image','图片生成组',1),('g2','agent','Agent 对话组',2)",
     "INSERT INTO prompts (id, category, title, content) VALUES ('p1','电商详情图','旧提示词','内容保留')",
-    "INSERT INTO token_inventory (id, token_value, \"group\", is_trial, is_assigned) VALUES "
-    "('ti1','sk-trial-001','image',true,true),('ti2','sk-norm-001','image',false,false)",
+    "INSERT INTO token_inventory (id, token_value, \"group\", is_trial, is_assigned, assigned_to, assigned_at) VALUES "
+    "('ti1','sk-trial-001','image',true,true,'U2',now()),('ti2','sk-norm-001','image',false,true,'U4',now()),"
+    "('ti3','sk-norm-002','image',false,false,NULL,NULL)",
     "INSERT INTO ai_models (id, name, display_name, provider, billing_type, model_type, \"group\", trial_allowed, price_per_call) VALUES "
     "('am1','gpt-image-2','GPT Image 2','OpenAI','per_call','image','image',true,'0.046'),"
     "('am2','qwen3.5-flash','Qwen','Alibaba','per_token','agent','agent',false,null),"
@@ -91,7 +92,11 @@ LEGACY_DATA = [
     "('ut4','U4','ti1','image',0.420000,false),"       # image 非试用
     "('ut5','U4','ti1','agent',3.000000,false)",       # agent 非试用 → U4 = 3.42 现金
     "INSERT INTO orders (id, user_id, out_trade_no, \"group\", amount_usd, amount_cny, exchange_rate, status) VALUES "
-    "('o1','U4','CYOLD0000000001','image',0.42,3.05,7.25,'assigned')",
+    "('o1','U4','CYOLD0000000001','image',0.42,3.05,7.25,'assigned'),"
+    "('o2','U4','CYOLDREFUNDING1','image',1.00,7.25,7.25,'refunding'),"
+    "('o3','U1','CYOLDREFUNDED001','image',2.00,14.50,7.25,'refunded')",
+    "UPDATE orders SET refund_requested_at = now() - interval '5 minutes' WHERE id = 'o2'",
+    "UPDATE orders SET out_refund_no = 'RFOLD0000000001', refunded_at = now() WHERE id = 'o3'",
     "INSERT INTO usage_logs (id, user_id, model, usage_type, image_count, cost_usd, created_at) VALUES "
     "('ul1','U4','gpt-image-1','image',2,0.092000,now())",
 ]
@@ -110,7 +115,10 @@ def _recreate_legacy_db():
 async def _run_migration_on_legacy():
     from app.core.database import Base
     import app.models  # noqa: F401 注册全部 ORM 模型
-    from app.main import _ensure_columns, _ensure_indexes, _migrate_v4_single_model, seed_defaults
+    from app.main import (
+        _ensure_columns, _ensure_indexes, _migrate_v4_single_model,
+        _migrate_v4_shared_token_refund, seed_defaults,
+    )
     from sqlalchemy.ext.asyncio import AsyncSession
 
     engine = create_async_engine(f"{PG}/{LEGACY_DB}")
@@ -120,6 +128,7 @@ async def _run_migration_on_legacy():
             await _ensure_columns(conn)
             await _ensure_indexes(conn)
             await _migrate_v4_single_model(conn)
+            await _migrate_v4_shared_token_refund(conn)
         # seed 走独立 session（不走全局 engine，它指向测试主库）
         async with AsyncSession(engine) as session:
             from sqlalchemy import select
@@ -135,6 +144,7 @@ async def _run_migration_on_legacy():
         # 迁移幂等：再次执行应为 no-op
         async with engine.begin() as conn:
             await _migrate_v4_single_model(conn)
+            await _migrate_v4_shared_token_refund(conn)
     finally:
         await engine.dispose()
 
@@ -277,3 +287,30 @@ def test_ensure_columns_idempotent_on_legacy():
             await engine.dispose()
 
     asyncio.run(run())
+
+
+# ── V4.1 共享 Token + 退款申请迁移 ────────────────────────────────
+
+def test_legacy_one_to_one_bindings_migrated_to_assignments():
+    """旧 1:1 绑定（is_assigned + assigned_to）迁入共享 assignments，且幂等不重复。"""
+    rows = q("SELECT token_id, user_id, status FROM runtime_token_assignments ORDER BY token_id, user_id")
+    assert ("ti1", "U2", "active") in rows
+    assert ("ti2", "U4", "active") in rows
+    assert len([r for r in rows if r[0] == "ti1"]) == 1  # 不重复
+
+
+def test_legacy_refunding_orders_become_refund_requested():
+    """旧 refunding 订单（15 分钟自动批准遗留）→ refund_requests(requested) + 订单待审核。"""
+    status = q("SELECT status FROM orders WHERE id = 'o2'")[0][0]
+    assert status == "refund_requested"
+    rows = q("SELECT order_id, user_id, source, status FROM refund_requests")
+    assert rows == [("o2", "U4", "user", "requested")]
+
+
+def test_legacy_refunded_orders_backfill_accumulators():
+    """已退款历史订单回填累计退款字段（展示用，幂等）。"""
+    row = q("SELECT refunded_cny, refunded_usd FROM orders WHERE id = 'o3'")[0]
+    assert row == (Decimal("14.50"), Decimal("2.00"))
+    # 未退款订单保持 0
+    row1 = q("SELECT refunded_cny, refunded_usd FROM orders WHERE id = 'o1'")[0]
+    assert row1 == (Decimal("0.00"), Decimal("0.000000"))

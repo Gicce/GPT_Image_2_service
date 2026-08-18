@@ -11,7 +11,7 @@ import os
 import asyncio
 
 from app.core.database import engine, Base, AsyncSessionLocal, AsyncSession
-from app.core.redis import init_redis, start_keyspace_listener, recover_pending_refunds
+from app.core.redis import init_redis, recover_processing_refunds
 from app.api.routes import auth, users, tokens, payment, notice, models, admin, usage, client
 from app.models.content import AIModel
 from app.services import billing
@@ -36,6 +36,7 @@ IMAGE2_SEED = {
 }
 
 MIGRATION_VERSION = "v4_single_model"
+MIGRATION_VERSION_SHARED_TOKEN_REFUND = "v4_shared_token_refund"
 
 
 async def seed_defaults():
@@ -64,6 +65,14 @@ async def _ensure_columns(conn):
         ("usage_logs", "request_id", "VARCHAR(64)"),
         # V4 结算单价快照：历史记录无法可靠还原单价，保持 NULL（API 对 NULL 已兼容）
         ("usage_logs", "unit_price", "NUMERIC(10,6)"),
+        # V4.1 共享 Token 池
+        ("token_inventory", "name", "VARCHAR(128)"),
+        ("token_inventory", "is_default", "BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("token_inventory", "quota_usd", "NUMERIC(18,6)"),
+        ("token_inventory", "expires_at", "TIMESTAMPTZ"),
+        # V4.1 退款累计（部分退款多次累计，快照语义）
+        ("orders", "refunded_cny", "NUMERIC(10,2) NOT NULL DEFAULT 0"),
+        ("orders", "refunded_usd", "NUMERIC(18,6) NOT NULL DEFAULT 0"),
     ]
     for table, column, col_type in new_columns:
         if not await _column_exists(conn, table, column):
@@ -224,6 +233,71 @@ async def start_reservation_gc_loop():
         await asyncio.sleep(600)
 
 
+async def _migrate_v4_shared_token_refund(conn):
+    """V4.1 一次性数据迁移：共享 Token 池 + 退款申请体系。
+
+    - token_inventory 新列（name/is_default/quota_usd/expires_at）由 _ensure_columns 补齐
+    - 旧 1:1 绑定（is_assigned/assigned_to）→ runtime_token_assignments
+    - 旧 status='refunding' 订单 → refund_requests(requested) + 订单状态 refund_requested
+      （旧 15 分钟自动批准机制已移除，改为人工审核）
+    - 已退款历史订单回填累计退款字段（refunded_cny/refunded_usd，展示用）
+    """
+    applied = await conn.execute(text(
+        "SELECT 1 FROM schema_migrations WHERE version = :v"
+    ), {"v": MIGRATION_VERSION_SHARED_TOKEN_REFUND})
+    if applied.scalar():
+        return
+
+    logger.info("running migration %s ...", MIGRATION_VERSION_SHARED_TOKEN_REFUND)
+
+    # 0) 订单状态列加宽：新状态 partially_refunded(18) / refund_requested(17) 超出旧 VARCHAR(16)
+    await conn.execute(text("ALTER TABLE orders ALTER COLUMN status TYPE VARCHAR(24)"))
+    await conn.execute(text("ALTER TABLE orders ALTER COLUMN status_before_refund TYPE VARCHAR(24)"))
+
+    # 1) 旧 1:1 绑定迁入共享 assignments（幂等：ON CONFLICT DO NOTHING）
+    await conn.execute(text("""
+        INSERT INTO runtime_token_assignments (id, token_id, user_id, status, source, assigned_at)
+        SELECT gen_random_uuid()::text, t.id, t.assigned_to, 'active', 'legacy_migration',
+               COALESCE(t.assigned_at, now())
+        FROM token_inventory t
+        WHERE t.is_assigned = true AND t.assigned_to IS NOT NULL
+        ON CONFLICT DO NOTHING
+    """))
+
+    # 2) 旧 refunding（15 分钟自动批准机制的遗留）→ 退款申请待审核
+    await conn.execute(text("""
+        INSERT INTO refund_requests (
+            id, order_id, user_id, source,
+            requested_amount_fen, requested_amount_cny, requested_amount_usd,
+            reason, status, requested_at, created_at, updated_at
+        )
+        SELECT gen_random_uuid()::text, o.id, o.user_id, 'user',
+               ROUND(o.amount_cny * 100)::int,
+               o.amount_cny,
+               o.amount_usd - COALESCE(o.refunded_usd, 0),
+               'legacy refunding order migrated', 'requested',
+               COALESCE(o.refund_requested_at, now()), now(), now()
+        FROM orders o
+        WHERE o.status = 'refunding'
+        ON CONFLICT DO NOTHING
+    """))
+    await conn.execute(text(
+        "UPDATE orders SET status = 'refund_requested' WHERE status = 'refunding'"
+    ))
+
+    # 3) 已退款历史订单回填累计退款字段（幂等：只补 NULL/0）
+    await conn.execute(text("""
+        UPDATE orders SET refunded_cny = amount_cny, refunded_usd = amount_usd
+        WHERE status = 'refunded' AND out_refund_no IS NOT NULL
+          AND COALESCE(refunded_cny, 0) = 0
+    """))
+
+    await conn.execute(text(
+        "INSERT INTO schema_migrations (version) VALUES (:v) ON CONFLICT DO NOTHING"
+    ), {"v": MIGRATION_VERSION_SHARED_TOKEN_REFUND})
+    logger.info("migration %s done", MIGRATION_VERSION_SHARED_TOKEN_REFUND)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_redis()
@@ -232,16 +306,14 @@ async def lifespan(app: FastAPI):
         await _ensure_columns(conn)
         await _ensure_indexes(conn)
         await _migrate_v4_single_model(conn)
+        await _migrate_v4_shared_token_refund(conn)
     await seed_defaults()
 
     # 启动即清理一次超时预占，再进入周期任务
     asyncio.create_task(start_reservation_gc_loop())
 
-    # 恢复未处理的退款（超时自动退款，未超时重设过期键）
-    await recover_pending_refunds()
-
-    # 启动 Redis keyspace 监听器（15分钟自动退款）
-    asyncio.create_task(start_keyspace_listener())
+    # 恢复微信退款处理中的申请（主动查询状态并结算；旧 15 分钟自动批准机制已移除）
+    await recover_processing_refunds()
 
     yield
 

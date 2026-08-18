@@ -13,15 +13,19 @@ from pydantic import BaseModel, Field
 
 from app.core.database import get_db
 from app.core.security import get_admin_user
-from app.core.redis import get_redis
+from app.core.redis import get_redis, publish_notice_update
 from app.core.config import settings
 from app.models.user import User
-from app.models.token import TokenInventory, Order, UsageLog, OrderStatus
+from app.models.token import (
+    TokenInventory, RuntimeTokenAssignment, Order, UsageLog, OrderStatus,
+    RefundRequest, RefundRequestStatus,
+)
 from app.models.content import Notice, AIModel
 from app.models.billing import BillingTransaction
 from app.models.audit import AdminAuditLog
 from app.services import billing
 from app.services import runtime_token as rt
+from app.services import refund as refund_service
 
 router = APIRouter()
 
@@ -105,11 +109,12 @@ async def update_image2_config(
     return {"ok": True, "changed": changed}
 
 
-# ── Token 库存（统一 Runtime Token 池） ──────────────────────────
+# ── Token 库存（统一 Runtime Token 共享池） ──────────────────────
 
 class TokenBatchInput(BaseModel):
     tokens: list[str]
     is_trial: bool = False
+    name: Optional[str] = Field(default=None, max_length=128)
 
 
 # Runtime Token 合理长度下限：只拦截明显误输入，不校验具体格式（Token 格式未来可能变化）
@@ -126,13 +131,12 @@ def _extract_token_value(line: str) -> str:
 
 
 @router.post("/tokens/batch")
-async def add_tokens(req: TokenBatchInput, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    """批量录入：解析 → 批内去重 → 库内查重 → 新增。
+async def add_tokens(req: TokenBatchInput, admin: dict = Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    """批量录入：解析 → 批内去重 → 库内查重 → 新增（可命名）。
     返回完整统计（total/added/duplicate/invalid + 脱敏明细），绝不静默吞掉任何输入。"""
     added = duplicate = invalid = 0
     details: list[dict] = []
     seen: set[str] = set()
-
     for raw in req.tokens:
         value = _extract_token_value(raw)
         if not value:
@@ -154,8 +158,18 @@ async def add_tokens(req: TokenBatchInput, _=Depends(get_admin_user), db: AsyncS
             duplicate += 1
             details.append({"token": mask_token(value), "reason": "duplicate"})
             continue
-        db.add(TokenInventory(id=str(uuid.uuid4()), token_value=value, is_trial=req.is_trial))
+        db.add(TokenInventory(
+            id=str(uuid.uuid4()),
+            token_value=value,
+            name=req.name,
+            is_trial=req.is_trial,
+        ))
         added += 1
+
+    if added:
+        await _record_audit(db, admin, "token_batch_add", {
+            "count": added, "is_trial": req.is_trial, "name": req.name,
+        })
 
     return {
         "total": added + duplicate + invalid,
@@ -168,62 +182,97 @@ async def add_tokens(req: TokenBatchInput, _=Depends(get_admin_user), db: AsyncS
 
 @router.get("/tokens/stats")
 async def get_token_stats(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    """统一 Token 池统计：总数 / 可用 / 试用可用 / 已分配 / 禁用。无任何模型分类维度。"""
+    """共享 Token 池统计：总 Token / 正常 / 正式 / 试用 / 默认 / 不可用 / 活跃绑定数。"""
     async def _count(*conditions):
         result = await db.execute(
             select(func.count()).select_from(TokenInventory).where(*conditions)
         )
         return result.scalar()
 
+    now = datetime.now(timezone.utc)
     total = await _count()
-    available = await _count(TokenInventory.is_assigned == False, TokenInventory.is_disabled == False)
-    trial_available = await _count(
-        TokenInventory.is_trial == True,
-        TokenInventory.is_assigned == False,
-        TokenInventory.is_disabled == False,
-    )
-    assigned = await _count(TokenInventory.is_assigned == True)
+    paid = await _count(TokenInventory.is_trial == False)
+    trial = await _count(TokenInventory.is_trial == True)
+    defaults = await _count(TokenInventory.is_default == True)
     disabled = await _count(TokenInventory.is_disabled == True)
+    expired = await _count(
+        TokenInventory.is_disabled == False,
+        TokenInventory.expires_at != None,
+        TokenInventory.expires_at <= now,
+    )
+    active_bindings = (await db.execute(
+        select(func.count()).select_from(RuntimeTokenAssignment).where(
+            RuntimeTokenAssignment.status == "active"
+        )
+    )).scalar()
 
     return {
         "total": total,
-        "available": available,
-        "trial_available": trial_available,
-        "assigned": assigned,
+        "available": total - disabled - expired,
+        "paid": paid,
+        "trial": trial,
+        "defaults": defaults,
         "disabled": disabled,
+        "expired": expired,
+        "active_bindings": active_bindings,
+    }
+
+
+def _token_row(t: TokenInventory, user_count: int, used_usd, status: str) -> dict:
+    return {
+        "id": t.id,
+        "name": t.name,
+        "token_value": mask_token(t.token_value),
+        "is_trial": t.is_trial,
+        "is_default": t.is_default,
+        "is_disabled": t.is_disabled,
+        "quota_usd": str(t.quota_usd) if t.quota_usd is not None else None,
+        "used_usd": str(billing.q6(billing.d(used_usd))) if used_usd is not None else None,
+        "expires_at": t.expires_at.isoformat() if t.expires_at else None,
+        "status": status,
+        "user_count": user_count,
+        "created_at": t.created_at.isoformat(),
     }
 
 
 @router.get("/tokens")
 async def list_tokens(
     is_trial: Optional[bool] = None,
-    is_assigned: Optional[bool] = None,
+    status: Optional[str] = None,
+    is_default: Optional[bool] = None,
     search: Optional[str] = None,
     page: int = 1,
     page_size: int = 50,
     _=Depends(get_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Token 列表（脱敏）。
+    """共享 Token 列表（脱敏）：名称 / 类型 / 额度 / 默认 / 状态 / 过期 / 关联用户数。
 
-    search：匹配 分配用户名 / 邮箱 / Token 明文片段（如后四位）。
-    返回 assigned_username / assigned_email，管理员无需再对着 UUID 找人。
+    search：匹配名称 / Token 明文片段 / 关联用户名或邮箱。
     """
     query = select(TokenInventory)
     if is_trial is not None:
         query = query.where(TokenInventory.is_trial == is_trial)
-    if is_assigned is not None:
-        query = query.where(TokenInventory.is_assigned == is_assigned)
+    if is_default is not None:
+        query = query.where(TokenInventory.is_default == is_default)
 
     if search:
         s = f"%{search.strip()}%"
         uid_res = await db.execute(
-            select(User.id).where(or_(User.username.ilike(s), User.email.ilike(s)))
+            select(RuntimeTokenAssignment.token_id).where(
+                RuntimeTokenAssignment.user_id.in_(
+                    select(User.id).where(or_(User.username.ilike(s), User.email.ilike(s)))
+                ),
+                RuntimeTokenAssignment.status == "active",
+            )
         )
-        uid_list = [row.id for row in uid_res]
-        conditions = [TokenInventory.token_value.ilike(s)]
-        if uid_list:
-            conditions.append(TokenInventory.assigned_to.in_(uid_list))
+        bound_ids = [row.token_id for row in uid_res]
+        conditions = [
+            TokenInventory.token_value.ilike(s),
+            TokenInventory.name.ilike(s),
+        ]
+        if bound_ids:
+            conditions.append(TokenInventory.id.in_(bound_ids))
         query = query.where(or_(*conditions))
 
     total_result = await db.execute(select(func.count()).select_from(query.subquery()))
@@ -237,67 +286,199 @@ async def list_tokens(
     )
     tokens = result.scalars().all()
 
-    assigned_ids = list({t.assigned_to for t in tokens if t.assigned_to})
+    token_ids = [t.id for t in tokens]
+    count_map: dict[str, int] = {}
+    if token_ids:
+        counts = await db.execute(
+            select(RuntimeTokenAssignment.token_id, func.count())
+            .where(
+                RuntimeTokenAssignment.token_id.in_(token_ids),
+                RuntimeTokenAssignment.status == "active",
+            )
+            .group_by(RuntimeTokenAssignment.token_id)
+        )
+        count_map = {row[0]: row[1] for row in counts.all()}
+
+    rows = []
+    for t in tokens:
+        user_count = count_map.get(t.id, 0)
+        used = await rt.get_token_used_usd(db, t.id) if t.quota_usd is not None else None
+        token_status = await rt.token_effective_status(db, t, used_usd=used)
+        if status is not None and token_status != status:
+            continue
+        rows.append(_token_row(t, user_count, used, token_status))
+
+    return {"total": total, "page": page, "page_size": page_size, "tokens": rows}
+
+
+@router.get("/tokens/{token_id}")
+async def get_token_detail(
+    token_id: str,
+    search: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    _=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Token 详情：基本信息 + 当前关联用户列表（支持搜索，分页）。"""
+    t = await db.get(TokenInventory, token_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Token 不存在")
+
+    query = select(RuntimeTokenAssignment).where(
+        RuntimeTokenAssignment.token_id == token_id,
+        RuntimeTokenAssignment.status == "active",
+    )
+    if search:
+        s = f"%{search.strip()}%"
+        query = query.where(RuntimeTokenAssignment.user_id.in_(
+            select(User.id).where(or_(User.username.ilike(s), User.email.ilike(s)))
+        ))
+
+    total_result = await db.execute(select(func.count()).select_from(query.subquery()))
+    total = total_result.scalar()
+
+    page = max(1, page)
+    page_size = max(1, min(200, page_size))
+    result = await db.execute(
+        query.order_by(RuntimeTokenAssignment.assigned_at.desc())
+        .offset((page - 1) * page_size).limit(page_size)
+    )
+    assignments = result.scalars().all()
+
     user_map: dict[str, User] = {}
-    if assigned_ids:
-        ures = await db.execute(select(User).where(User.id.in_(assigned_ids)))
+    if assignments:
+        ures = await db.execute(
+            select(User).where(User.id.in_([a.user_id for a in assignments]))
+        )
         user_map = {u.id: u for u in ures.scalars().all()}
 
-    def _assigned_info(t: TokenInventory) -> dict:
-        u = user_map.get(t.assigned_to) if t.assigned_to else None
-        return {"assigned_username": u.username if u else None, "assigned_email": u.email if u else None}
-
+    used = await rt.get_token_used_usd(db, token_id)
     return {
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "tokens": [
+        **_token_row(t, total, used, await rt.token_effective_status(db, t, used_usd=used)),
+        "users": [
             {
-                "id": t.id,
-                "token_value": mask_token(t.token_value),
-                "is_trial": t.is_trial,
-                "is_assigned": t.is_assigned,
-                "is_disabled": t.is_disabled,
-                "assigned_to": t.assigned_to,
-                "assigned_at": t.assigned_at.isoformat() if t.assigned_at else None,
-                "created_at": t.created_at.isoformat(),
-                **_assigned_info(t),
+                "user_id": a.user_id,
+                "username": user_map[a.user_id].username if a.user_id in user_map else None,
+                "email": user_map[a.user_id].email if a.user_id in user_map else None,
+                "account_type": user_map[a.user_id].account_type if a.user_id in user_map else None,
+                "assigned_at": a.assigned_at.isoformat() if a.assigned_at else None,
+                "assignment_status": a.status,
             }
-            for t in tokens
+            for a in assignments
         ],
     }
 
 
 class TokenUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=128)
     is_disabled: Optional[bool] = None
     is_trial: Optional[bool] = None
+    quota_usd: Optional[Decimal] = Field(default=None, max_digits=18, decimal_places=6)
+    quota_unlimited: bool = False  # True 时把 quota_usd 置 NULL（无限）
+    expires_at: Optional[str] = None  # ISO 日期时间；空串 = 永久有效
+    keep_expires: bool = False  # True 时不动过期时间
 
 
 @router.put("/tokens/{token_id}")
-async def update_token(token_id: str, req: TokenUpdate, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(TokenInventory).where(TokenInventory.id == token_id))
-    t = result.scalar_one_or_none()
+async def update_token(
+    token_id: str,
+    req: TokenUpdate,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    t = await db.get(TokenInventory, token_id)
     if not t:
         raise HTTPException(status_code=404, detail="Token 不存在")
+
+    changed: dict = {}
+    if req.name is not None:
+        t.name = req.name.strip() or None
+        changed["name"] = t.name
     if req.is_disabled is not None:
         t.is_disabled = req.is_disabled
+        changed["is_disabled"] = t.is_disabled
     if req.is_trial is not None:
         t.is_trial = req.is_trial
-    return {"ok": True}
+        changed["is_trial"] = t.is_trial
+    if req.quota_unlimited:
+        t.quota_usd = None
+        changed["quota_usd"] = None
+    elif req.quota_usd is not None:
+        if req.quota_usd < 0:
+            raise HTTPException(status_code=400, detail="额度不能为负")
+        t.quota_usd = billing.q6(req.quota_usd)
+        changed["quota_usd"] = str(t.quota_usd)
+    if not req.keep_expires:
+        if req.expires_at:
+            try:
+                from datetime import datetime as _dt
+                t.expires_at = _dt.fromisoformat(req.expires_at.replace("Z", "+00:00"))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="过期时间格式无效")
+        else:
+            t.expires_at = None
+        changed["expires_at"] = t.expires_at.isoformat() if t.expires_at else None
+
+    if changed:
+        await _record_audit(db, admin, "token_update", {"token_id": token_id, **changed})
+    return {"ok": True, "changed": changed}
+
+
+@router.post("/tokens/{token_id}/set-default")
+async def set_token_default(
+    token_id: str,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """设为该类型默认 Token：事务内先清同类型旧默认，再设新默认。
+
+    只影响之后的新绑定（注册试用/支付自动绑定/管理员自动挑选），已绑定用户不迁移。
+    """
+    t = await db.get(TokenInventory, token_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Token 不存在")
+    if t.is_disabled:
+        raise HTTPException(status_code=400, detail="已禁用的 Token 不能设为默认")
+
+    result = await db.execute(
+        select(TokenInventory).where(
+            TokenInventory.is_trial == t.is_trial,
+            TokenInventory.is_default == True,
+            TokenInventory.id != t.id,
+        )
+    )
+    for old in result.scalars().all():
+        old.is_default = False
+    # 部分唯一索引要求同类型任一时刻至多一个 default：先落库清除旧默认再设新
+    await db.flush()
+    t.is_default = True
+    await _record_audit(db, admin, "token_set_default", {
+        "token_id": token_id, "is_trial": t.is_trial,
+    })
+    return {"ok": True, "is_trial": t.is_trial}
 
 
 @router.delete("/tokens/{token_id}")
-async def delete_token(token_id: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(TokenInventory).where(TokenInventory.id == token_id))
-    t = result.scalar_one_or_none()
+async def delete_token(token_id: str, admin: dict = Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(func.count()).select_from(RuntimeTokenAssignment).where(
+            RuntimeTokenAssignment.token_id == token_id,
+            RuntimeTokenAssignment.status == "active",
+        )
+    )
+    active_users = result.scalar()
+    if active_users > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"当前关联 {active_users} 个用户，禁止直接删除；请先解绑用户或改为禁用",
+        )
+    t = await db.get(TokenInventory, token_id)
     if not t:
         raise HTTPException(status_code=404, detail="Token 不存在")
-    if t.is_assigned:
-        raise HTTPException(status_code=400, detail="Token 已分配，无法删除")
     await db.delete(t)
+    await _record_audit(db, admin, "token_delete", {"token_id": token_id})
     return {"ok": True}
-
-
 # ── Notice ───────────────────────────────────────────────────────
 
 class NoticeUpdate(BaseModel):
@@ -315,8 +496,11 @@ async def update_notice(req: NoticeUpdate, _=Depends(get_admin_user), db: AsyncS
         notice.updated_at = datetime.now(timezone.utc)
     else:
         db.add(Notice(id=str(uuid.uuid4()), content=req.content, is_active=req.is_active))
+    await db.commit()
     redis = get_redis()
     await redis.delete("notice_content")
+    # 实时广播：在线客户端（SSE）收到后立即重新拉取最新通知
+    await publish_notice_update()
     return {"ok": True}
 
 
@@ -388,7 +572,8 @@ async def get_user(user_id: str, _=Depends(get_admin_user), db: AsyncSession = D
     )
     usage_logs = usage_result.scalars().all()
 
-    assigned = await rt.get_assigned_token(db, user_id)
+    assignment = await rt.get_user_active_assignment(db, user_id)
+    assigned = await db.get(TokenInventory, assignment.token_id) if assignment else None
 
     return {
         "id": u.id, "username": u.username, "email": u.email,
@@ -400,7 +585,10 @@ async def get_user(user_id: str, _=Depends(get_admin_user), db: AsyncSession = D
         "total_spent_usd": str(total_spent),
         "image2_call_count": call_count,
         "image2_image_count": image_count,
-        "runtime_token": rt.token_public_dict(assigned) if assigned else None,
+        "runtime_token": (
+            rt.token_public_dict(assigned, assigned_at=assignment.assigned_at)
+            if assigned else None
+        ),
         "trial_expires_at": u.trial_expires_at.isoformat() if u.trial_expires_at else None,
         "created_at": u.created_at.isoformat(),
         "usage_logs": [
@@ -465,12 +653,30 @@ async def admin_assign_runtime_token(
         "released_token_id": released.id if released else None,
     })
 
-    user = await db.get(User, user_id)
+    assignment = await rt.get_user_active_assignment(db, user_id)
     return {
         "ok": True,
-        "runtime_token": rt.token_public_dict(token, user),
+        "runtime_token": rt.token_public_dict(
+            token, assigned_at=assignment.assigned_at if assignment else None
+        ),
         "released_token_id": released.id if released else None,
     }
+
+
+@router.post("/users/{user_id}/runtime-token/release")
+async def admin_release_runtime_token(
+    user_id: str,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """管理员解除用户当前 Runtime Token 绑定（共享池：只影响该用户）。"""
+    released = await rt.release_user_token(db, user_id, source="admin_release")
+    if released is None:
+        raise HTTPException(status_code=400, detail="该用户当前没有绑定的 Runtime Token")
+    await _record_audit(db, admin, "runtime_token_release", {
+        "user_id": user_id, "token_id": released.id,
+    })
+    return {"ok": True, "released_token_id": released.id}
 
 
 @router.delete("/users/{user_id}")
@@ -612,14 +818,34 @@ async def refund_billing_transaction(
 # ── Orders ───────────────────────────────────────────────────────
 
 @router.get("/orders")
-async def list_orders(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Order).order_by(Order.created_at.desc()).limit(200))
+async def list_orders(
+    status: Optional[str] = None,
+    _=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """订单列表：金额成对语义（付款 CNY / 到账 USD）+ 累计退款 + 最新退款申请。"""
+    query = select(Order).order_by(Order.created_at.desc()).limit(200)
+    if status:
+        query = select(Order).where(Order.status == status).order_by(Order.created_at.desc()).limit(200)
+    result = await db.execute(query)
     orders = result.scalars().all()
     user_ids = list({o.user_id for o in orders})
     uname_map = {}
     if user_ids:
         ures = await db.execute(select(User.id, User.username).where(User.id.in_(user_ids)))
         uname_map = {row.id: row.username for row in ures}
+
+    order_ids = [o.id for o in orders]
+    latest_requests: dict[str, RefundRequest] = {}
+    if order_ids:
+        reqs = await db.execute(
+            select(RefundRequest)
+            .where(RefundRequest.order_id.in_(order_ids))
+            .order_by(RefundRequest.requested_at.asc())
+        )
+        for r in reqs.scalars().all():
+            latest_requests[r.order_id] = r  # asc 迭代 → 保留最新
+
     return [
         {
             "id": o.id, "user_id": o.user_id, "username": uname_map.get(o.user_id, ""),
@@ -628,13 +854,55 @@ async def list_orders(_=Depends(get_admin_user), db: AsyncSession = Depends(get_
             "group": o.group,  # 历史订单保留展示；新订单为 null
             "amount_usd": float(o.amount_usd), "amount_cny": float(o.amount_cny),
             "exchange_rate": float(o.exchange_rate) if o.exchange_rate else None,
+            "refunded_cny": float(o.refunded_cny),
+            "refunded_usd": float(o.refunded_usd),
+            "remaining_refundable_cny": float(refund_service.fen_to_cny(refund_service.order_remaining_fen(o))),
             "pay_type": o.pay_type, "status": o.status,
             "out_refund_no": o.out_refund_no,
             "created_at": o.created_at.isoformat(),
             "paid_at": o.paid_at.isoformat() if o.paid_at else None,
+            "refund_requested_at": o.refund_requested_at.isoformat() if o.refund_requested_at else None,
+            "refund_request": refund_service.refund_request_public_dict(latest_requests.get(o.id)),
         }
         for o in orders
     ]
+
+
+@router.get("/orders/{order_id}/refund/summary")
+async def get_refund_summary(order_id: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    """退款审核/退款 Modal 数据：订单金额全景 + 用户余额 + 最新退款申请。"""
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+
+    user = await db.get(User, order.user_id)
+    latest = await db.execute(
+        select(RefundRequest)
+        .where(RefundRequest.order_id == order.id)
+        .order_by(RefundRequest.requested_at.desc())
+        .limit(1)
+    )
+    req = latest.scalar_one_or_none()
+
+    remaining_fen = refund_service.order_remaining_fen(order)
+    remaining_cny = refund_service.fen_to_cny(remaining_fen)
+    return {
+        "order_id": order.id,
+        "out_trade_no": order.out_trade_no,
+        "username": user.username if user else None,
+        "user_balance_usd": str(billing.q6(billing.d(user.balance_usd))) if user else None,
+        "user_trial_credit_usd": str(billing.q6(billing.d(user.trial_credit_usd))) if user else None,
+        "amount_usd": float(order.amount_usd),
+        "amount_cny": float(order.amount_cny),
+        "exchange_rate": float(order.exchange_rate) if order.exchange_rate else None,
+        "refunded_cny": float(order.refunded_cny),
+        "refunded_usd": float(order.refunded_usd),
+        "remaining_refundable_cny": float(remaining_cny),
+        "max_usd_reversal": float(refund_service.compute_usd_reversal(order, remaining_fen)),
+        "order_status": order.status,
+        "refund_request": refund_service.refund_request_public_dict(req),
+    }
 
 
 @router.post("/orders/{order_id}/close")
@@ -660,72 +928,154 @@ async def close_order(order_id: str, _=Depends(get_admin_user), db: AsyncSession
     return {"ok": True}
 
 
-@router.post("/orders/{order_id}/refund/approve")
-async def approve_refund(order_id: str, admin: dict = Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    from app.core.wechatpay import wechatpay_request
-    from decimal import Decimal as D
+class RefundReviewRequest(BaseModel):
+    review_note: str = Field(default="", max_length=500)
 
+
+@router.post("/orders/{order_id}/refund/approve")
+async def approve_refund(
+    order_id: str,
+    req: RefundReviewRequest = RefundReviewRequest(),
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """批准用户退款申请：APPROVED → 调微信 → PROCESSING（微信确认 SUCCESS 才冲正）。"""
     result = await db.execute(select(Order).where(Order.id == order_id))
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
-    if order.status != OrderStatus.REFUNDING:
-        raise HTTPException(status_code=400, detail="订单不在退款待确认状态")
 
-    # 冲正：从统一现金余额扣回充值金额
-    if order.status_before_refund == OrderStatus.ASSIGNED:
-        await billing.debit_balance_for_refund(
-            db, order.user_id, D(str(order.amount_usd)),
-            related_order_id=order.id,
-            remark=f"admin approved refund {order.out_trade_no}",
-        )
+    open_req = await refund_service.get_open_request(db, order.id)
+    if open_req is None:
+        raise HTTPException(status_code=400, detail="该订单没有待处理的退款申请")
 
-    out_refund_no = f"RF{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
-    total_fee = int(round(float(order.amount_cny) * 100))
-    refund_data = {
-        "out_refund_no": out_refund_no,
-        "out_trade_no": order.out_trade_no,
-        "reason": "admin approved refund",
-        "amount": {"refund": total_fee, "total": total_fee, "currency": "CNY"},
-    }
-    if settings.WECHAT_REFUND_NOTIFY_URL:
-        refund_data["notify_url"] = settings.WECHAT_REFUND_NOTIFY_URL
-
-    code, wx_result = await wechatpay_request("/v3/refund/domestic/refunds", method="POST", data=refund_data)
-    if code != 200:
+    admin_name = (admin or {}).get("sub", "admin")
+    try:
+        await refund_service.approve_refund_request(db, open_req, admin=admin_name, review_note=req.review_note or None)
+        await refund_service.execute_refund(db, open_req)
+        await db.commit()
+    except refund_service.RefundError as exc:
         await db.rollback()
-        raise HTTPException(status_code=502, detail=f"退款失败: {wx_result}")
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        await db.rollback()
+        logger_exc = __import__("logging").getLogger(__name__)
+        logger_exc.exception("approve refund failed for order %s", order_id)
+        raise HTTPException(status_code=502, detail=f"退款执行失败: {exc}")
 
-    order.status = OrderStatus.REFUNDED
-    order.out_refund_no = out_refund_no
-    order.refunded_at = datetime.now(timezone.utc)
+    await _record_audit(db, admin, "refund_approve", {
+        "order_id": order.id, "out_trade_no": order.out_trade_no,
+        "refund_request_id": open_req.id, "out_refund_no": open_req.out_refund_no,
+        "requested_amount_fen": open_req.requested_amount_fen,
+        "result_status": open_req.status,
+    })
+    await db.commit()
 
-    redis = get_redis()
-    await redis.delete(f"refund:auto:{order.out_trade_no}")
-    await _record_audit(db, admin, "refund_approve", {"order_id": order.id, "out_trade_no": order.out_trade_no})
-
-    return {"status": "refunded", "out_refund_no": out_refund_no}
+    return {
+        "status": open_req.status,
+        "order_status": order.status,
+        "out_refund_no": open_req.out_refund_no,
+        "message": (
+            "微信退款已受理，等待微信确认后完成冲正"
+            if open_req.status == RefundRequestStatus.PROCESSING
+            else f"退款状态: {open_req.status}"
+        ),
+    }
 
 
 @router.post("/orders/{order_id}/refund/reject")
-async def reject_refund(order_id: str, admin: dict = Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+async def reject_refund(
+    order_id: str,
+    req: RefundReviewRequest,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """拒绝用户退款申请：订单回到申请前状态，拒绝原因对用户可见。"""
+    if not (req.review_note or "").strip():
+        raise HTTPException(status_code=400, detail="拒绝退款必须填写原因")
+
     result = await db.execute(select(Order).where(Order.id == order_id))
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
-    if order.status != OrderStatus.REFUNDING:
-        raise HTTPException(status_code=400, detail="订单不在退款待确认状态")
 
-    order.status = order.status_before_refund or OrderStatus.PAID
-    order.status_before_refund = None
-    order.refund_requested_at = None
+    open_req = await refund_service.get_open_request(db, order.id)
+    if open_req is None:
+        raise HTTPException(status_code=400, detail="该订单没有待处理的退款申请")
 
-    redis = get_redis()
-    await redis.delete(f"refund:auto:{order.out_trade_no}")
-    await _record_audit(db, admin, "refund_reject", {"order_id": order.id, "out_trade_no": order.out_trade_no})
+    admin_name = (admin or {}).get("sub", "admin")
+    try:
+        await refund_service.reject_refund_request(
+            db, open_req, admin=admin_name, review_note=req.review_note.strip()
+        )
+        await db.commit()
+    except refund_service.RefundError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
 
-    return {"status": order.status, "message": "退款已拒绝"}
+    await _record_audit(db, admin, "refund_reject", {
+        "order_id": order.id, "out_trade_no": order.out_trade_no,
+        "refund_request_id": open_req.id, "review_note": req.review_note.strip(),
+    })
+    await db.commit()
 
+    return {"status": order.status, "refund_request_status": open_req.status, "message": "退款已拒绝"}
+
+
+class AdminDirectRefundRequest(BaseModel):
+    refund_amount_cny: Optional[Decimal] = Field(default=None, gt=0, decimal_places=2)
+    reason: str = Field(default="", max_length=255)
+
+
+@router.post("/orders/{order_id}/refund")
+async def admin_direct_refund(
+    order_id: str,
+    req: AdminDirectRefundRequest = AdminDirectRefundRequest(),
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """管理员主动退款（无需用户申请）：统一走 RefundService 执行/结算链路。"""
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+
+    admin_name = (admin or {}).get("sub", "admin")
+    try:
+        refund_req = await refund_service.admin_direct_refund(
+            db, order,
+            admin=admin_name,
+            refund_amount_cny=req.refund_amount_cny,
+            reason=req.reason or None,
+        )
+        await db.commit()
+    except refund_service.RefundError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        await db.rollback()
+        logger_exc = __import__("logging").getLogger(__name__)
+        logger_exc.exception("admin direct refund failed for order %s", order_id)
+        raise HTTPException(status_code=502, detail=f"退款执行失败: {exc}")
+
+    await _record_audit(db, admin, "admin_direct_refund", {
+        "order_id": order.id, "out_trade_no": order.out_trade_no,
+        "refund_request_id": refund_req.id, "out_refund_no": refund_req.out_refund_no,
+        "amount_fen": refund_req.requested_amount_fen,
+        "result_status": refund_req.status,
+    })
+    await db.commit()
+
+    return {
+        "status": refund_req.status,
+        "order_status": order.status,
+        "out_refund_no": refund_req.out_refund_no,
+        "message": (
+            "微信退款已受理，等待微信确认后完成冲正"
+            if refund_req.status == RefundRequestStatus.PROCESSING
+            else f"退款状态: {refund_req.status}"
+        ),
+    }
 
 class OrderUpdate(BaseModel):
     status: Optional[str] = None

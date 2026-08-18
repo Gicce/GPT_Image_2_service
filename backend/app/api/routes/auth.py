@@ -13,8 +13,8 @@ from app.core.config import settings
 from app.core.redis import get_redis
 from app.core.email import send_verification_code
 from app.models.user import User
-from app.models.token import TokenInventory, TokenAssignmentLog
 from app.services import billing
+from app.services import runtime_token as rt
 
 logger = logging.getLogger(__name__)
 
@@ -64,35 +64,16 @@ class RegisterVerifyRequest(BaseModel):
 
 
 async def _grant_trial(db: AsyncSession, user: User, days: int) -> bool:
-    """发放试用：消耗一张试用名额卡 + 发放试用额度（写流水）。不 commit。
+    """发放试用：绑定默认试用 Token（共享池，不消耗库存）+ 发放试用额度（写流水）。不 commit。
 
-    返回 False 表示试用名额已满。
+    返回 False 表示试用通道未开放（无有效默认试用 Token）。
     """
-    tok_result = await db.execute(
-        select(TokenInventory)
-        .where(
-            TokenInventory.is_trial == True,
-            TokenInventory.is_assigned == False,
-            TokenInventory.is_disabled == False,
-        )
-        .order_by(TokenInventory.created_at)
-        .limit(1)
-        .with_for_update(skip_locked=True)
-    )
-    tok = tok_result.scalar_one_or_none()
-    if not tok:
+    trial_token = await rt.resolve_default_token(db, is_trial=True)
+    if trial_token is None:
         return False
 
     now = datetime.now(timezone.utc)
-    tok.is_assigned = True
-    tok.assigned_to = user.id
-    tok.assigned_at = now
-    db.add(TokenAssignmentLog(
-        token_id=tok.id,
-        user_id=user.id,
-        action="assign",
-        source="register_trial",
-    ))
+    await rt.bind_token_to_user(db, user.id, trial_token, source="register_trial")
     user.account_type = "trial"
     user.trial_expires_at = now + timedelta(days=days)
     await billing.grant_trial_credit(

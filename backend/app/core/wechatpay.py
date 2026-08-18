@@ -15,6 +15,18 @@ from app.core.config import settings
 _wxpay: AsyncWeChatPay | None = None
 
 
+def is_configured() -> bool:
+    """微信支付凭证是否完整可用（私钥文件存在）。"""
+    return bool(
+        settings.WECHAT_MCHID
+        and settings.WECHAT_APPID
+        and settings.WECHAT_APIV3_KEY
+        and settings.WECHAT_CERT_SERIAL_NO
+        and settings.WECHAT_PRIVATE_KEY_PATH
+        and os.path.exists(settings.WECHAT_PRIVATE_KEY_PATH)
+    )
+
+
 def get_wxpay() -> AsyncWeChatPay:
     global _wxpay
     if _wxpay is None:

@@ -61,9 +61,14 @@
             </div>
           </template>
           <p v-else class="runtime-token-empty">尚未分配 Image2 Runtime Token（生成时回落使用服务端 Master Token）</p>
-          <n-button size="small" type="primary" secondary :loading="assignLoading" @click="openAssignToken">
-            {{ detailUser.runtime_token ? '更换 Token' : '分配 Token' }}
-          </n-button>
+          <n-space size="small">
+            <n-button size="small" type="primary" secondary :loading="assignSubmitting" @click="openAssignToken">
+              {{ detailUser.runtime_token ? '更换 Token' : '分配 Token' }}
+            </n-button>
+            <n-button v-if="detailUser.runtime_token" size="small" type="warning" secondary :loading="releaseLoading" @click="releaseToken">
+              解除绑定
+            </n-button>
+          </n-space>
         </div>
 
         <n-divider style="margin:16px 0 12px">余额与消费</n-divider>
@@ -433,7 +438,9 @@ async function submitBalance() {
   }
 }
 
-// ── Runtime Token 分配 / 更换 ──────────────────────────────
+// ── Runtime Token 分配 / 更换 / 解绑 ──────────────────────────
+
+const releaseLoading = ref(false)
 
 async function openAssignToken() {
   if (!detailUser.value) return
@@ -442,13 +449,27 @@ async function openAssignToken() {
   assignTokensLoading.value = true
   try {
     const { data } = await http.get('/api/admin/tokens', {
-      params: { is_assigned: false, page: 1, page_size: 100 },
+      params: { status: 'active', page: 1, page_size: 200 },
     })
-    availableTokens.value = (data.tokens || []).filter(t => !t.is_disabled)
+    availableTokens.value = (data.tokens || []).filter(t => t.status === 'active')
   } catch (e) {
     message.error(e.response?.data?.detail || '加载可用 Token 失败')
   } finally {
     assignTokensLoading.value = false
+  }
+}
+
+async function releaseToken() {
+  if (!detailUser.value) return
+  releaseLoading.value = true
+  try {
+    await http.post(`/api/admin/users/${detailUser.value.id}/runtime-token/release`)
+    message.success('已解除绑定')
+    await viewUser({ id: detailUser.value.id })
+  } catch (e) {
+    message.error(e.response?.data?.detail || '解绑失败')
+  } finally {
+    releaseLoading.value = false
   }
 }
 

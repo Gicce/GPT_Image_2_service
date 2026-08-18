@@ -46,7 +46,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import engine, Base, AsyncSessionLocal
-from app.main import _ensure_columns, _ensure_indexes, _migrate_v4_single_model, seed_defaults
+from app.main import (
+    _ensure_columns, _ensure_indexes, _migrate_v4_single_model,
+    _migrate_v4_shared_token_refund, seed_defaults,
+)
 from app.models.user import User
 from app.models.content import AIModel
 from app.core.security import hash_password
@@ -59,6 +62,7 @@ async def init_backend():
         await _ensure_columns(conn)
         await _ensure_indexes(conn)
         await _migrate_v4_single_model(conn)
+        await _migrate_v4_shared_token_refund(conn)
     await seed_defaults()
     yield
     await engine.dispose()
@@ -69,8 +73,9 @@ async def clean_tables(init_backend):
     """每个测试前清空业务表并重置 Image2 配置。"""
     async with AsyncSessionLocal() as session:
         for table in [
-            "billing_transactions", "admin_audit_logs", "usage_logs", "orders",
-            "token_assignment_logs", "token_inventory", "users", "ai_models",
+            "billing_transactions", "admin_audit_logs", "usage_logs", "refund_requests",
+            "orders", "runtime_token_assignments", "token_assignment_logs",
+            "token_inventory", "users", "ai_models",
         ]:
             await session.execute(text(f"DELETE FROM {table}"))
         await session.execute(text(

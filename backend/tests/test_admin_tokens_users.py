@@ -33,20 +33,21 @@ async def client():
         yield c
 
 
-async def test_token_stats_unified_pool(client):
-    """Test 11：Token 统计只有 总量/可用/试用可用/已分配/禁用，无 Image2/ChatGPT 分类。"""
-    await insert_token(trial=False, assigned=False)          # 可用
-    await insert_token(trial=False, assigned=False)          # 可用
+async def test_token_stats_shared_pool(client):
+    """共享池统计：总 Token / 正常 / 正式 / 试用 / 默认 / 不可用 / 活跃绑定数。"""
+    await insert_token(trial=False, assigned=False)          # 正式可用
+    await insert_token(trial=False, assigned=False)          # 正式可用
     await insert_token(trial=True, assigned=False)           # 试用可用
-    await insert_token(trial=False, assigned=True)           # 已分配
     await insert_token(trial=False, assigned=False, disabled=True)  # 禁用
 
     r = await client.get("/api/admin/tokens/stats", headers=ADMIN_HEADERS)
     assert r.status_code == 200
     stats = r.json()
-    assert stats == {
-        "total": 5, "available": 3, "trial_available": 1, "assigned": 1, "disabled": 1,
-    }
+    assert stats["total"] == 4
+    assert stats["available"] == 3
+    assert stats["paid"] == 3
+    assert stats["trial"] == 1
+    assert stats["disabled"] == 1
     # 不存在 image/chatgpt 分类键
     assert "image" not in stats and "chat" not in stats and "chatgpt" not in stats
 

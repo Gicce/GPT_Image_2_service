@@ -1,6 +1,5 @@
 import uuid
 import logging
-import os
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Optional
@@ -16,10 +15,12 @@ from app.core.security import get_current_user, get_admin_user
 from app.core.config import settings
 from app.core.redis import get_redis
 from app.core.wechatpay import get_wxpay, wechatpay_request
+from app.core import wechatpay as wxpay_core
 from app.models.user import User
-from app.models.token import Order, OrderStatus
+from app.models.token import Order, OrderStatus, RefundRequest
 from app.services.order_assignment import assign_paid_order, InvalidOrderStatusError
 from app.services import billing
+from app.services import refund as refund_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -32,14 +33,7 @@ def _wechatpay_error(exc: Exception) -> HTTPException:
 
 def is_wechat_pay_configured() -> bool:
     """Check if WeChat Pay is fully configured with valid credentials."""
-    return bool(
-        settings.WECHAT_MCHID
-        and settings.WECHAT_APPID
-        and settings.WECHAT_APIV3_KEY
-        and settings.WECHAT_CERT_SERIAL_NO
-        and settings.WECHAT_PRIVATE_KEY_PATH
-        and os.path.exists(settings.WECHAT_PRIVATE_KEY_PATH)
-    )
+    return wxpay_core.is_configured()
 
 
 def should_use_dev_payment() -> bool:
@@ -263,7 +257,10 @@ async def wechat_notify(request: Request, db: AsyncSession = Depends(get_db)):
         logger.info(f"Notify: Order {out_trade_no} already credited (idempotent)")
         return Response(status_code=200)
 
-    if order.status in (OrderStatus.CLOSED, OrderStatus.REFUNDING, OrderStatus.REFUNDED):
+    if order.status in (
+        OrderStatus.CLOSED, OrderStatus.REFUND_REQUESTED, OrderStatus.REFUNDING,
+        OrderStatus.PARTIALLY_REFUNDED, OrderStatus.REFUNDED, OrderStatus.REFUND_CHANGE,
+    ):
         logger.info(f"Notify: Order {out_trade_no} status is {order.status}, ignoring")
         return Response(status_code=200)
 
@@ -381,81 +378,22 @@ async def close_order(
     return {"status": OrderStatus.CLOSED, "out_trade_no": out_trade_no}
 
 
-class RefundRequest(BaseModel):
+class UserRefundRequest(BaseModel):
     reason: str = ""
-    refund_amount_cny: float | None = None
-
-
-async def _recharge_refund_common(db: AsyncSession, order: Order) -> None:
-    """退款冲正：从用户现金余额扣回充值金额（余额不足扣到 0 为止），写流水。"""
-    amount = Decimal(str(order.amount_usd))
-    await billing.debit_balance_for_refund(
-        db, order.user_id, amount,
-        related_order_id=order.id,
-        remark=f"recharge refund {order.out_trade_no}",
-    )
-
-
-@router.post("/refund/{out_trade_no}")
-async def refund_order(
-    out_trade_no: str,
-    req: RefundRequest = RefundRequest(),
-    _=Depends(get_admin_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(select(Order).where(Order.out_trade_no == out_trade_no))
-    order = result.scalar_one_or_none()
-    if not order:
-        raise HTTPException(status_code=404, detail="订单不存在")
-    if order.status not in (OrderStatus.PAID, OrderStatus.ASSIGNED):
-        raise HTTPException(status_code=400, detail="只能退款已支付或已入账的订单")
-
-    if order.status == OrderStatus.ASSIGNED:
-        await _recharge_refund_common(db, order)
-
-    out_refund_no = f"RF{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
-    total_fee = int(round(float(order.amount_cny) * 100))
-
-    if req.refund_amount_cny is not None:
-        refund_fee = int(round(req.refund_amount_cny * 100))
-        if refund_fee <= 0 or refund_fee > total_fee:
-            raise HTTPException(status_code=400, detail="退款金额无效，需在 ¥0.01 ~ ¥{} 之间".format(float(order.amount_cny)))
-    else:
-        refund_fee = total_fee
-
-    refund_data = {
-        "out_refund_no": out_refund_no,
-        "out_trade_no": out_trade_no,
-        "reason": req.reason or "admin refund",
-        "amount": {"refund": refund_fee, "total": total_fee, "currency": "CNY"},
-    }
-    if settings.WECHAT_REFUND_NOTIFY_URL:
-        refund_data["notify_url"] = settings.WECHAT_REFUND_NOTIFY_URL
-
-    code, wx_result = await wechatpay_request(
-        "/v3/refund/domestic/refunds",
-        method="POST",
-        data=refund_data,
-    )
-    if code != 200:
-        await db.rollback()
-        raise HTTPException(status_code=502, detail=f"退款失败: {wx_result}")
-
-    order.status = OrderStatus.REFUNDED
-    order.out_refund_no = out_refund_no
-    order.refunded_at = datetime.now(timezone.utc)
-
-    redis = get_redis()
-    await redis.delete(f"refund:auto:{out_trade_no}")
-
-    return {"status": "refunded", "out_refund_no": out_refund_no}
 
 
 @router.get("/refund/query/{out_refund_no}")
 async def query_refund(
     out_refund_no: str,
     _=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
 ):
+    """管理员查询微信退款状态：查询同时驱动结算（回调丢失兜底）。"""
+    req = await refund_service.get_request_by_out_refund_no(db, out_refund_no)
+    if req is not None and req.status == "processing":
+        await refund_service.sync_refund_from_wechat(db, req)
+        await db.commit()
+        await db.refresh(req)
     path = f"/v3/refund/domestic/refunds/{out_refund_no}"
     code, result = await wechatpay_request(path)
     if code != 200:
@@ -483,18 +421,41 @@ async def refund_notify(request: Request, db: AsyncSession = Depends(get_db)):
             media_type="application/json",
         )
 
+    out_refund_no = data.get("out_refund_no")
     out_trade_no = data.get("out_trade_no")
     refund_status = data.get("refund_status")
 
+    if out_refund_no:
+        req = await refund_service.get_request_by_out_refund_no(db, out_refund_no)
+        if req is not None:
+            try:
+                if refund_status == "SUCCESS":
+                    await refund_service.settle_refund_success(
+                        db, req, wechat_refund_id=data.get("refund_id")
+                    )
+                elif refund_status in ("ABNORMAL", "CLOSED"):
+                    await refund_service.mark_refund_failed(
+                        db, req, f"wechat notify status {refund_status}"
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                logger.exception("refund notify settle failed for %s", out_refund_no)
+            return Response(status_code=200)
+
+    # 旧数据兜底：无 refund_requests 记录的历史退款回调，仅同步订单状态
     if out_trade_no and refund_status:
         res = await db.execute(select(Order).where(Order.out_trade_no == out_trade_no))
         order = res.scalar_one_or_none()
         if order:
-            if refund_status == "SUCCESS" and order.status != OrderStatus.REFUNDED:
+            if refund_status == "SUCCESS" and order.status not in (
+                OrderStatus.REFUNDED, OrderStatus.PARTIALLY_REFUNDED,
+            ):
                 order.status = OrderStatus.REFUNDED
                 order.refunded_at = datetime.now(timezone.utc)
             elif refund_status == "CHANGE":
                 order.status = OrderStatus.REFUND_CHANGE
+        await db.commit()
 
     return Response(status_code=200)
 
@@ -502,26 +463,34 @@ async def refund_notify(request: Request, db: AsyncSession = Depends(get_db)):
 @router.post("/refund_order/{out_trade_no}")
 async def client_refund_order(
     out_trade_no: str,
+    req: UserRefundRequest = UserRefundRequest(),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """用户提交退款申请：持久化 refund_requests，进入后台审核流程。"""
     result = await db.execute(
         select(Order).where(Order.out_trade_no == out_trade_no, Order.user_id == user.id)
+        .with_for_update()
     )
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
-    if order.status not in (OrderStatus.PAID, OrderStatus.ASSIGNED):
-        raise HTTPException(status_code=400, detail="只能退款已支付或已入账的订单")
 
-    order.status_before_refund = order.status
-    order.status = OrderStatus.REFUNDING
-    order.refund_requested_at = datetime.now(timezone.utc)
+    try:
+        await refund_service.create_user_refund_request(db, order, user, req.reason)
+        await db.commit()
+    except refund_service.RefundError as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
 
-    redis = get_redis()
-    await redis.setex(f"refund:auto:{out_trade_no}", 900, "1")
-
-    return {"status": "refunding", "out_trade_no": out_trade_no, "message": "退款申请已提交，等待确认"}
+    return {
+        "status": order.status,
+        "out_trade_no": out_trade_no,
+        "message": "退款申请已提交，等待审核",
+        "refund_request": refund_service.refund_request_public_dict(
+            await refund_service.get_open_request(db, order.id)
+        ),
+    }
 
 
 @router.get("/refund_status/{out_trade_no}")
@@ -536,10 +505,31 @@ async def client_refund_status(
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
+
+    # 处理中的退款：轮询顺带驱动微信状态同步（回调丢失兜底）
+    open_req = await refund_service.get_open_request(db, order.id)
+    if open_req is not None and open_req.status == "processing":
+        try:
+            await refund_service.sync_refund_from_wechat(db, open_req)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.exception("refund status sync failed for order %s", order.out_trade_no)
+
+    latest = await db.execute(
+        select(RefundRequest)
+        .where(RefundRequest.order_id == order.id)
+        .order_by(RefundRequest.requested_at.desc())
+        .limit(1)
+    )
+    latest_req = latest.scalar_one_or_none()
+
     return {
         "status": order.status,
         "out_refund_no": order.out_refund_no,
         "amount_cny": float(order.amount_cny),
+        "refunded_cny": float(order.refunded_cny),
+        "refund_request": refund_service.refund_request_public_dict(latest_req),
     }
 
 
@@ -554,16 +544,28 @@ async def list_user_orders(
         .order_by(Order.created_at.desc())
     )
     orders = result.scalars().all()
+    order_ids = [o.id for o in orders]
+    latest_requests: dict[str, RefundRequest] = {}
+    if order_ids:
+        reqs = await db.execute(
+            select(RefundRequest)
+            .where(RefundRequest.order_id.in_(order_ids))
+            .order_by(RefundRequest.requested_at.asc())
+        )
+        for r in reqs.scalars().all():
+            latest_requests[r.order_id] = r  # asc 迭代 → 保留最新
     return [
         {
             "out_trade_no": o.out_trade_no,
             "amount_usd": float(o.amount_usd),
             "amount_cny": float(o.amount_cny),
             "exchange_rate": float(o.exchange_rate) if o.exchange_rate else None,
+            "refunded_cny": float(o.refunded_cny),
             "status": o.status,
             "pay_type": o.pay_type,
             "created_at": o.created_at.isoformat(),
             "paid_at": o.paid_at.isoformat() if o.paid_at else None,
+            "refund_request": refund_service.refund_request_public_dict(latest_requests.get(o.id)),
         }
         for o in orders
     ]

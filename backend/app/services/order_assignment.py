@@ -1,7 +1,8 @@
-"""已支付订单 → 统一余额入账。
+"""已支付订单 → 统一余额入账 + 自动绑定默认正式 Runtime Token。
 
-V4 起：支付成功只增加 users.balance_usd（现金余额），写入 RECHARGE 流水。
-不再分配 Token、不再按分组记账。状态 ASSIGNED 语义 = 充值已入账。
+V4.1 起：支付成功 = 现金余额入账（RECHARGE 流水）+ 检查用户正式 Token 绑定，
+无 active 正式绑定时自动绑定默认正式 Token（默认 Token 后续切换不影响已绑定用户）。
+状态 ASSIGNED 语义 = 充值已入账。
 """
 
 import logging
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.token import Order, OrderStatus
 from app.models.user import User
 from app.services import billing
+from app.services import runtime_token as rt
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +32,13 @@ async def assign_paid_order(
     *,
     auto: bool = False,
 ) -> Order:
-    """将已支付订单入账到用户现金余额（幂等，不 commit，由调用方提交）。
+    """将已支付订单入账到用户现金余额并自动绑定 Runtime Token（幂等，不 commit）。
 
     - ASSIGNED：幂等直接返回
     - 非 PAID：抛 InvalidOrderStatusError
     - 入账金额 = order.amount_usd（Decimal 快照）
-    - 同时写 RECHARGE 流水并将 account_type 置为 paid
+    - 写 RECHARGE 流水、account_type 置 paid
+    - 无 active 正式 Token 绑定 → 绑定默认正式 Token（无默认可用则记日志跳过）
     """
     if order.status == OrderStatus.ASSIGNED:
         logger.info("Order %s already credited, skipping (auto=%s)", order.out_trade_no, auto)
@@ -58,6 +61,9 @@ async def assign_paid_order(
     order.status = OrderStatus.ASSIGNED
     if user.account_type != "paid":
         user.account_type = "paid"
+
+    # 支付成功自动绑定正式 Token（用户无需再手动领取）
+    await rt.ensure_paid_assignment(db, order.user_id)
 
     logger.info(
         "Order %s credited $%s to user %s balance (txn %s, auto=%s)",

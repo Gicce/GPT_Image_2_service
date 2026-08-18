@@ -50,17 +50,23 @@ async def get_my_runtime_token(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """当前账户的 Image2 Runtime Token 状态（仅脱敏信息，绝不返回明文）。"""
+    """当前账户的 Image2 Runtime Token 状态（仅脱敏信息，绝不返回明文）。
+
+    V4.1：Token 由系统自动分配（注册试用 → 默认试用 Token；充值成功 → 默认正式 Token），
+    普通用户不再提供手动领取/更换入口；绑定调整由管理员操作。
+    """
     if not user.is_active:
         raise HTTPException(status_code=403, detail="账号已被禁用")
 
-    assigned = await rt.get_assigned_token(db, user.id)
-    if assigned is not None:
-        return {
-            "assigned": True,
-            "source": "assigned",
-            **rt.token_public_dict(assigned),
-        }
+    assignment = await rt.get_user_active_assignment(db, user.id)
+    if assignment is not None:
+        assigned = await db.get(rt.TokenInventory, assignment.token_id)
+        if assigned is not None:
+            return {
+                "assigned": True,
+                "source": "assigned",
+                **rt.token_public_dict(assigned, assigned_at=assignment.assigned_at),
+            }
 
     master = settings.PACKYAPI_IMAGE_MASTER_TOKEN or settings.PACKYAPI_MASTER_TOKEN
     if master:
@@ -68,47 +74,14 @@ async def get_my_runtime_token(
             "assigned": False,
             "source": "server_master",
             "token_id": None,
+            "name": None,
             "masked_token": rt.mask_token(master),
             "is_trial": False,
             "is_disabled": False,
             "assigned_at": None,
         }
-    return {"assigned": False, "source": "none", "token_id": None, "masked_token": None,
-            "is_trial": False, "is_disabled": False, "assigned_at": None}
-
-
-@router.post("/me/runtime-token/replace")
-async def replace_my_runtime_token(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """更换当前账户绑定的 Runtime Token。
-
-    服务端在单个事务内完成：锁定旧 Token 与一枚可用 Token → 旧解绑 → 新绑定 → 写分配历史。
-    库存无可用 Token 时旧绑定保持不变并返回 NO_AVAILABLE_RUNTIME_TOKEN。
-    """
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="账号已被禁用")
-
-    try:
-        token, released = await rt.assign_runtime_token(
-            db, user.id, token_id=None, source="user_replace",
-        )
-    except rt.NoAvailableTokenError:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "NO_AVAILABLE_RUNTIME_TOKEN",
-                "message": "当前没有可更换的 Image2 Runtime Token，请联系管理员",
-            },
-        )
-
-    return {
-        "assigned": True,
-        "source": "assigned",
-        "replaced": released is not None,
-        **rt.token_public_dict(token, user),
-    }
+    return {"assigned": False, "source": "none", "token_id": None, "name": None,
+            "masked_token": None, "is_trial": False, "is_disabled": False, "assigned_at": None}
 
 
 @router.get("/me/runtime-config")
@@ -118,7 +91,7 @@ async def get_runtime_config(
 ):
     """下发 Image2 运行时直连配置（仅 image，V4 起无 agent/postprocess）。
 
-    优先使用当前账户绑定的 Runtime Token；未绑定时回落到服务端 Master Token。
+    优先使用当前账户绑定的 Runtime Token（须仍有效）；未绑定/失效时回落服务端 Master Token。
     仅当账户有可用额度且存在可用上游 Token 时返回 enabled。
     """
     if not user.is_active:
@@ -126,8 +99,8 @@ async def get_runtime_config(
 
     cfg = await billing.get_image2_config(db)
 
-    assigned = await rt.get_assigned_token(db, user.id)
-    if assigned is not None and not assigned.is_disabled:
+    assigned = await rt.get_user_active_token(db, user.id)
+    if assigned is not None and await rt.is_token_assignable(db, assigned):
         image_token = assigned.token_value
     else:
         image_token = settings.PACKYAPI_IMAGE_MASTER_TOKEN or settings.PACKYAPI_MASTER_TOKEN
