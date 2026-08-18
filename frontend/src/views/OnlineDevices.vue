@@ -1,7 +1,10 @@
 <template>
   <div>
     <div class="page-header">
-      <h2 class="page-header-title">在线客户端</h2>
+      <div class="page-header-left">
+        <h2 class="page-header-title">在线客户端</h2>
+        <p v-if="lastUpdatedAt" class="page-header-subtitle">最后更新：{{ lastUpdatedAt }}</p>
+      </div>
       <n-button type="primary" size="small" @click="loadDevices" :loading="loading">
         <template #icon>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
@@ -120,15 +123,24 @@ const columns = [
     title: '状态',
     key: 'status',
     width: 80,
-    render: () => h(NTag, { type: 'success', size: 'small', bordered: false }, { default: () => '在线' })
+    render: row => h(NTag, {
+      type: row.status === 'online' ? 'success' : 'default',
+      size: 'small',
+      bordered: false,
+    }, { default: () => row.status === 'online' ? '在线' : '离线' })
   },
 ]
+
+const lastUpdatedAt = ref('')
 
 async function loadDevices() {
   loading.value = true
   try {
     const { data } = await http.get('/api/admin/online-devices')
     devices.value = data.devices || []
+    if (data.generated_at) {
+      lastUpdatedAt.value = new Date(data.generated_at).toLocaleTimeString('zh-CN', { hour12: false })
+    }
   } catch (e) {
     console.error('Failed to load online devices:', e)
     devices.value = []
@@ -139,8 +151,8 @@ async function loadDevices() {
 
 onMounted(() => {
   loadDevices()
-  // Auto refresh every 60 seconds
-  refreshTimer = setInterval(loadDevices, 60000)
+  // 页面自身按 30s 刷新列表（与客户端 60s 心跳上报是两件独立的事）
+  refreshTimer = setInterval(loadDevices, 30000)
 })
 
 onUnmounted(() => {

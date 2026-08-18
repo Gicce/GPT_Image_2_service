@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import uuid
@@ -28,6 +29,8 @@ from app.services import runtime_token as rt
 from app.services import refund as refund_service
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 IMAGE2_MODEL_ID = "gpt-image-2"
 
@@ -1231,6 +1234,24 @@ async def get_stats(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db
     # 复用 token stats
     token_stats = await get_token_stats(_=None, db=db)
 
+    pending_refunds = (await db.execute(
+        select(func.count()).select_from(RefundRequest)
+        .where(RefundRequest.status == RefundRequestStatus.REQUESTED)
+    )).scalar()
+
+    online_devices = 0
+    redis = get_redis()
+    if redis:
+        try:
+            cursor = 0
+            while True:
+                cursor, keys = await redis.scan(cursor, match="online_device:*", count=200)
+                online_devices += len(keys)
+                if cursor == 0:
+                    break
+        except Exception:
+            logger.exception("stats: online device scan failed")
+
     return {
         "users_total": users_total,
         "orders_paid": orders_paid,
@@ -1238,6 +1259,8 @@ async def get_stats(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db
         "image2_today": {"calls": image2_today[0], "images": image2_today[1]},
         "image2_total": {"calls": image2_total[0], "images": image2_total[1], "cost_usd": str(image2_total[2])},
         "token_stats": token_stats,
+        "pending_refunds": pending_refunds,
+        "online_devices": online_devices,
     }
 
 
@@ -1272,15 +1295,9 @@ async def list_audit_logs(
 
 
 # ── Admin password change ─────────────────────────────────────────
-
-class PasswordChange(BaseModel):
-    new_password: str
-
-
-@router.put("/password")
-async def change_admin_password(req: PasswordChange, _=Depends(get_admin_user)):
-    settings.ADMIN_PASSWORD = req.new_password
-    return {"ok": True, "note": "重启后失效，如需永久修改请更新 .env 文件中的 ADMIN_PASSWORD"}
+# 旧 env 密码修改端点（PUT /api/admin/password）已在 V4.0.2 移除：
+# 管理员密码改为数据库 bcrypt 存储，本人修改走 PUT /api/admin/admins/me/password，
+# 超级管理员重置他人密码走 PUT /api/admin/admins/{id}/password（见 admin_accounts.py）。
 
 
 # ── System Config (.env) ─────────────────────────────────────────
@@ -1471,18 +1488,24 @@ async def restart_backend(_=Depends(get_admin_user)):
         return {"ok": True}
     except ImportError:
         raise HTTPException(status_code=500, detail="docker SDK 未安装")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"重启失败: {exc}")
+    except Exception:
+        logger.exception("backend container restart failed")
+        raise HTTPException(status_code=500, detail="服务重启失败，请检查容器状态")
 
 
 # ── Online Devices ────────────────────────────────────────────────
 
 @router.get("/online-devices")
 async def list_online_devices(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    """List all currently online devices from Redis (TTL based)."""
+    """List all currently online devices from Redis (TTL based).
+
+    在线判定以 Redis key 剩余 TTL 为准（180s 无心跳自动过期即离线），
+    不依赖任何数据库 boolean 字段。generated_at 供后台页面显示"最后更新"。
+    """
     redis = get_redis()
     if not redis:
-        return {"devices": [], "message": "Redis unavailable"}
+        return {"devices": [], "total": 0, "generated_at": datetime.now(timezone.utc).isoformat(),
+                "message": "Redis unavailable"}
 
     devices = []
     cursor = 0
@@ -1497,6 +1520,7 @@ async def list_online_devices(_=Depends(get_admin_user), db: AsyncSession = Depe
                     data = json.loads(data_str)
                 except json.JSONDecodeError:
                     continue
+                ttl = await redis.ttl(key)
                 user_id = data.get("user_id", "")
                 user_email = ""
                 if user_id:
@@ -1514,13 +1538,16 @@ async def list_online_devices(_=Depends(get_admin_user), db: AsyncSession = Depe
                     "last_seen": data.get("last_seen", ""),
                     "ip": data.get("ip", ""),
                     "server_url": data.get("server_url", ""),
+                    "ttl_seconds": ttl if isinstance(ttl, int) and ttl > 0 else 0,
+                    "status": "online" if isinstance(ttl, int) and ttl > 0 else "offline",
                 })
             if cursor == 0:
                 break
     except Exception:
-        logger_exc = __import__("logging").getLogger(__name__)
-        logger_exc.exception("Redis scan failed")
-        return {"devices": [], "message": "Redis scan failed"}
+        logger.exception("Redis scan failed")
+        return {"devices": [], "total": 0, "generated_at": datetime.now(timezone.utc).isoformat(),
+                "message": "Redis scan failed"}
 
     devices.sort(key=lambda d: d.get("last_seen", ""), reverse=True)
-    return {"devices": devices, "total": len(devices)}
+    return {"devices": devices, "total": len(devices),
+            "generated_at": datetime.now(timezone.utc).isoformat()}

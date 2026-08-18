@@ -10,9 +10,11 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.user import User
+from app.models.admin_user import AdminUser
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-bearer_scheme = HTTPBearer()
+# auto_error=False：缺失 Authorization 头时由依赖统一返回 401，而非 FastAPI 默认 403
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def _validate_bcrypt_password(password: str) -> None:
@@ -39,6 +41,9 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
+    if credentials is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未提供认证凭据",
+                            headers={"WWW-Authenticate": "Bearer"})
     try:
         payload = jwt.decode(credentials.credentials, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         user_id: str = payload.get("sub")
@@ -51,24 +56,52 @@ async def get_current_user(
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在")
+    if not user.is_active:
+        # 被禁用用户的存量 token 立即失效（否则最长 7 天内仍可调用）
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="账号已被禁用")
     return user
 
 
 async def get_admin_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
 ) -> dict:
+    if credentials is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未提供认证凭据",
+                            headers={"WWW-Authenticate": "Bearer"})
     try:
         payload = jwt.decode(credentials.credentials, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        if payload.get("role") != "admin":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限")
-        return payload
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的认证信息")
 
+    if payload.get("role") not in ("admin", "super_admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限")
 
-def create_admin_token() -> str:
+    # 校验管理员仍存在且启用：被禁用/删除的账户其存量 token 立即失效
+    admin_id = payload.get("admin_id")
+    if not admin_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的认证信息")
+    result = await db.execute(select(AdminUser).where(AdminUser.id == admin_id))
+    admin = result.scalar_one_or_none()
+    if not admin or not admin.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的认证信息")
+
+    return {"id": admin.id, "sub": admin.username, "username": admin.username, "display_name": admin.display_name, "role": admin.role}
+
+
+async def get_super_admin_user(admin: dict = Depends(get_admin_user)) -> dict:
+    if admin.get("role") != "super_admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅超级管理员可执行此操作")
+    return admin
+
+
+def create_admin_token(admin_id: str, username: str, role: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(hours=12)
-    return jwt.encode({"sub": "admin", "role": "admin", "exp": expire}, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return jwt.encode(
+        {"sub": username, "admin_id": admin_id, "role": role, "exp": expire},
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
 
 
 async def get_optional_user(

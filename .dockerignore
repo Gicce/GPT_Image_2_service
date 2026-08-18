@@ -1,0 +1,19 @@
+# 敏感文件绝不进入镜像层（运行时 .env 由 compose 挂载）
+.env
+backend/.env
+*.env.local
+certs/
+
+# 本地数据与构建产物
+pgdata/
+redisdata/
+node_modules/
+frontend/dist/
+backend/__pycache__/
+**/__pycache__/
+*.pyc
+
+# 文档与本地脚本
+docs/
+*.md
+.git/

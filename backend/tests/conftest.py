@@ -48,11 +48,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import engine, Base, AsyncSessionLocal
 from app.main import (
     _ensure_columns, _ensure_indexes, _migrate_v4_single_model,
-    _migrate_v4_shared_token_refund, seed_defaults,
+    _migrate_v4_shared_token_refund, _migrate_admin_accounts, seed_defaults,
 )
 from app.models.user import User
 from app.models.content import AIModel
-from app.core.security import hash_password
+from app.core.security import hash_password, create_admin_token
+
+# 测试管理员：固定 id/用户名，token 由 make_admin_headers() 构造，
+# DB 行由 clean_tables 每个测试前重建（get_admin_user 会查库校验）
+TEST_ADMIN_ID = "00000000-0000-0000-0000-0000000000aa"
+TEST_ADMIN_USERNAME = "admin"
+TEST_ADMIN_LOGIN_PASSWORD = "admin-test-password"
+
+
+def make_admin_headers(role: str = "super_admin", admin_id: str = TEST_ADMIN_ID,
+                       username: str = TEST_ADMIN_USERNAME) -> dict:
+    return {"Authorization": f"Bearer {create_admin_token(admin_id, username, role)}"}
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -63,6 +74,7 @@ async def init_backend():
         await _ensure_indexes(conn)
         await _migrate_v4_single_model(conn)
         await _migrate_v4_shared_token_refund(conn)
+        await _migrate_admin_accounts(conn)
     await seed_defaults()
     yield
     await engine.dispose()
@@ -75,7 +87,7 @@ async def clean_tables(init_backend):
         for table in [
             "billing_transactions", "admin_audit_logs", "usage_logs", "refund_requests",
             "orders", "runtime_token_assignments", "token_assignment_logs",
-            "token_inventory", "users", "ai_models",
+            "token_inventory", "users", "ai_models", "admin_users",
         ]:
             await session.execute(text(f"DELETE FROM {table}"))
         await session.execute(text(
@@ -83,7 +95,20 @@ async def clean_tables(init_backend):
             "is_enabled, trial_allowed, price_per_call, currency) "
             "VALUES ('m-image2', 'gpt-image-2', 'Image2', 'OpenAI', 'per_call', true, true, 0.070000, 'USD')"
         ))
+        await session.execute(text(
+            "INSERT INTO admin_users (id, username, display_name, password_hash, role, "
+            "is_active, must_change_password, created_at, updated_at) "
+            "VALUES (:id, :username, 'Test Admin', :pw, 'super_admin', true, false, now(), now())"
+        ), {"id": TEST_ADMIN_ID, "username": TEST_ADMIN_USERNAME,
+            "pw": hash_password(TEST_ADMIN_LOGIN_PASSWORD)})
         await session.commit()
+
+    # 清理登录限流与在线设备相关 Redis key，避免测试间串扰
+    from app.core.redis import get_redis
+    redis = get_redis()
+    for pattern in ("adminlogin:*", "userlogin:*", "online_device:*"):
+        async for key in redis.scan_iter(match=pattern):
+            await redis.delete(key)
     yield
 
 

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from datetime import datetime, timedelta, timezone
@@ -6,6 +6,7 @@ from pydantic import BaseModel, EmailStr
 import uuid
 import secrets
 import logging
+import json
 
 from app.core.database import get_db
 from app.core.security import hash_password, verify_password, create_access_token, create_admin_token, get_current_user, _validate_bcrypt_password
@@ -13,6 +14,8 @@ from app.core.config import settings
 from app.core.redis import get_redis
 from app.core.email import send_verification_code
 from app.models.user import User
+from app.models.admin_user import AdminUser
+from app.models.audit import AdminAuditLog
 from app.services import billing
 from app.services import runtime_token as rt
 
@@ -84,15 +87,7 @@ async def _grant_trial(db: AsyncSession, user: User, days: int) -> bool:
 
 @router.post("/register/send-code")
 async def register_send_code(req: RegisterSendCodeRequest, db: AsyncSession = Depends(get_db)):
-    # [临时诊断] 接口入口日志
-    print(f'[auth.send-code] ===== RECEIVED REQUEST =====')
-    print(f'[auth.send-code] email: {req.email}')
-    print(f'[auth.send-code] username: {req.username}')
-    print(f'[auth.send-code] account_type: {req.account_type}')
-    print(f'[auth.send-code] password length: {len(req.password)}')
-
     if req.account_type not in ("trial", "normal"):
-        print(f'[auth.send-code] INVALID account_type: {req.account_type}')
         raise HTTPException(status_code=400, detail="account_type 必须为 trial 或 normal")
 
     _validate_bcrypt_password(req.password)
@@ -101,7 +96,6 @@ async def register_send_code(req: RegisterSendCodeRequest, db: AsyncSession = De
         select(User).where((User.username == req.username) | (User.email == req.email))
     )
     if existing.scalar_one_or_none():
-        print(f'[auth.send-code] USER ALREADY EXISTS: {req.username} / {req.email}')
         raise HTTPException(status_code=400, detail="用户名或邮箱已存在")
 
     email = req.email.strip().lower()
@@ -109,42 +103,30 @@ async def register_send_code(req: RegisterSendCodeRequest, db: AsyncSession = De
 
     rate_key = f"reg:rate:{email}"
     if await redis.exists(rate_key):
-        print(f'[auth.send-code] RATE LIMITED: {email}')
         raise HTTPException(status_code=429, detail="请求过于频繁，请60秒后重试")
 
     lockout_key = f"reg:lockout:{email}"
     if await redis.exists(lockout_key):
-        print(f'[auth.send-code] LOCKED OUT: {email}')
         raise HTTPException(status_code=429, detail="验证码尝试次数过多，请稍后再试")
 
     await redis.setex(rate_key, 60, "1")
 
     code = "".join(secrets.choice("0123456789") for _ in range(6))
-    print(f'[auth.send-code] GENERATED CODE for {email}: {code}')
 
     code_key = f"reg:code:{email}"
     attempts_key = f"reg:attempts:{email}"
 
     # Store code + registration data in Redis
     reg_data = {"username": req.username, "password": req.password, "account_type": req.account_type}
-    import json
     await redis.setex(code_key, 300, json.dumps({"code": code, "data": reg_data}))
     await redis.setex(attempts_key, 300, "0")
 
-    print(f'[auth.send-code] CODE STORED IN REDIS, key={code_key}')
-
     try:
-        print(f'[auth.send-code] BEFORE SEND EMAIL to {email}')
         await send_verification_code(email, code, purpose="register")
-        print(f'[auth.send-code] EMAIL SENT OK to {email}')
-    except Exception as e:
-        print(f'[auth.send-code] EMAIL SEND FAILED: {e}')
-        import traceback
-        traceback.print_exc()
+    except Exception:
         logger.exception("Failed to send registration code to %s", email)
         raise HTTPException(status_code=500, detail="邮件发送失败，请稍后重试")
 
-    print(f'[auth.send-code] ===== RETURN SUCCESS =====')
     return {"message": "验证码已发送"}
 
 
@@ -255,13 +237,41 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/login")
-async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    redis = get_redis()
+
+    # 暴力破解防护：用户名 + IP 双维度（阈值比管理员登录宽松，避免误伤正常用户）
+    fail_window_s = 900
+    username = req.username.strip().lower()
+    client_ip = request.headers.get("X-Forwarded-For", "")
+    if client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+    else:
+        client_ip = request.client.host if request.client else "unknown"
+
+    if redis:
+        if (await redis.exists(f"userlogin:lock:user:{username}")
+                or await redis.exists(f"userlogin:lock:ip:{client_ip}")):
+            raise HTTPException(status_code=429, detail="尝试次数过多，请稍后再试")
+
     result = await db.execute(select(User).where(User.username == req.username))
     user = result.scalar_one_or_none()
     if not user or not verify_password(req.password, user.password_hash):
+        if redis:
+            for dimension, threshold in (("user", 10), ("ip", 30)):
+                key = f"userlogin:fail:{dimension}:{username if dimension == 'user' else client_ip}"
+                count = await redis.incr(key)
+                if count == 1:
+                    await redis.expire(key, fail_window_s)
+                if count >= threshold:
+                    await redis.setex(f"userlogin:lock:{dimension}:{username if dimension == 'user' else client_ip}",
+                                      fail_window_s, "1")
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="账号已被禁用")
+
+    if redis:
+        await redis.delete(f"userlogin:fail:user:{username}", f"userlogin:fail:ip:{client_ip}")
 
     access_token = create_access_token(user.id)
     user_info = await _user_info(user, db)
@@ -273,10 +283,69 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/admin/login")
-async def admin_login(req: AdminLoginRequest):
-    if req.username != settings.ADMIN_USERNAME or req.password != settings.ADMIN_PASSWORD:
-        raise HTTPException(status_code=401, detail="管理员账号或密码错误")
-    return {"access_token": create_admin_token(), "token_type": "bearer"}
+async def admin_login(req: AdminLoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    username = req.username.strip().lower()
+    redis = get_redis()
+
+    # 客户端 IP：nginx 反代后取 X-Forwarded-For 首跳
+    client_ip = request.headers.get("X-Forwarded-For", "")
+    if client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+    else:
+        client_ip = request.client.host if request.client else "unknown"
+    user_agent = (request.headers.get("User-Agent") or "")[:200]
+
+    async def _audit(admin_username: str, action: str, detail: dict):
+        db.add(AdminAuditLog(admin=admin_username[:64], action=action,
+                             detail=json.dumps({**detail, "ip": client_ip, "ua": user_agent}, ensure_ascii=False)))
+
+    # 暴力破解防护：IP 与用户名两个维度独立计数（15 分钟窗口）
+    fail_window_s = 900
+    user_fail_threshold = 5
+    ip_fail_threshold = 20
+    if redis:
+        if (await redis.exists(f"adminlogin:lock:user:{username}")
+                or await redis.exists(f"adminlogin:lock:ip:{client_ip}")):
+            raise HTTPException(status_code=429, detail="尝试次数过多，请稍后再试")
+
+    result = await db.execute(select(AdminUser).where(AdminUser.username == username))
+    admin = result.scalar_one_or_none()
+
+    ok = admin is not None and admin.is_active and verify_password(req.password, admin.password_hash)
+    if not ok:
+        reason = "unknown_user" if admin is None else ("disabled" if not admin.is_active else "bad_password")
+        if redis:
+            for dimension, threshold in (("user", user_fail_threshold), ("ip", ip_fail_threshold)):
+                key = f"adminlogin:fail:{dimension}:{username if dimension == 'user' else client_ip}"
+                count = await redis.incr(key)
+                if count == 1:
+                    await redis.expire(key, fail_window_s)
+                if count >= threshold:
+                    await redis.setex(f"adminlogin:lock:{dimension}:{username if dimension == 'user' else client_ip}",
+                                      fail_window_s, "1")
+        # 对外统一文案，不区分用户名是否存在/是否禁用，避免枚举有效管理员
+        await _audit(username, "admin_login_failed", {"reason": reason})
+        await db.commit()
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    admin.last_login_at = datetime.now(timezone.utc)
+    await _audit(username, "admin_login_success", {"admin_id": admin.id})
+    await db.commit()
+
+    if redis:
+        await redis.delete(f"adminlogin:fail:user:{username}", f"adminlogin:fail:ip:{client_ip}")
+
+    return {
+        "access_token": create_admin_token(admin.id, admin.username, admin.role),
+        "token_type": "bearer",
+        "admin": {
+            "id": admin.id,
+            "username": admin.username,
+            "display_name": admin.display_name,
+            "role": admin.role,
+            "must_change_password": admin.must_change_password,
+        },
+    }
 
 
 @router.post("/forgot-password/send-code")

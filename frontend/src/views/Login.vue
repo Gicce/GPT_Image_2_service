@@ -31,12 +31,22 @@
         </div>
         <n-form @submit.prevent="login" label-placement="top">
           <n-form-item label="用户名">
-            <n-input v-model:value="form.username" placeholder="请输入用户名" size="large" />
+            <n-input v-model:value="form.username" placeholder="请输入用户名" size="large" :disabled="loading" @keydown.enter.prevent="login" />
           </n-form-item>
           <n-form-item label="密码">
-            <n-input v-model:value="form.password" type="password" placeholder="请输入密码" size="large" show-password-on="click" />
+            <n-input ref="passwordInputRef" v-model:value="form.password" type="password" placeholder="请输入密码" size="large" show-password-on="click" :disabled="loading" @keydown.enter.prevent="login" />
           </n-form-item>
-          <n-button type="primary" block attr-type="submit" :loading="loading" size="large" class="login-btn">登录</n-button>
+          <div v-if="loginError" class="login-error">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+              <circle cx="8" cy="8" r="7" stroke="currentColor" stroke-width="1.5"/>
+              <path d="M8 4.5v4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              <circle cx="8" cy="11.2" r="0.9" fill="currentColor"/>
+            </svg>
+            <span>{{ loginError }}</span>
+          </div>
+          <n-button type="primary" block attr-type="submit" :loading="loading" :disabled="loading || !form.username || !form.password" size="large" class="login-btn">
+            {{ loading ? '正在登录...' : '登录' }}
+          </n-button>
         </n-form>
       </n-card>
       <p class="login-footer">晨阳云枢 · CyCloudHub &middot; 企业级云端运营平台</p>
@@ -45,7 +55,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { nextTick, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useMessage } from 'naive-ui'
 import http from '../api/http'
@@ -53,16 +63,38 @@ import http from '../api/http'
 const router = useRouter()
 const msg = useMessage()
 const loading = ref(false)
+const loginError = ref('')
+const passwordInputRef = ref(null)
 const form = ref({ username: '', password: '' })
 
 async function login() {
+  if (loading.value) return
+  if (!form.value.username || !form.value.password) return
   loading.value = true
+  loginError.value = ''
   try {
     const { data } = await http.post('/api/auth/admin/login', form.value)
     localStorage.setItem('admin_token', data.access_token)
-    router.push('/dashboard')
-  } catch {
-    msg.error('账号或密码错误')
+    if (data.admin?.must_change_password) {
+      msg.warning('管理员已重置您的密码，请先修改密码')
+      router.push({ path: '/profile', query: { tab: 'password' } })
+    } else {
+      router.push('/dashboard')
+    }
+  } catch (err) {
+    const status = err.response?.status
+    if (status === 401) {
+      loginError.value = '用户名或密码错误'
+    } else if (status === 429) {
+      loginError.value = '尝试次数过多，请稍后再试'
+    } else if (!err.response) {
+      loginError.value = '无法连接服务器，请检查网络'
+    } else {
+      loginError.value = '服务暂时不可用，请稍后重试'
+    }
+    // 失败后清空密码、保留用户名并聚焦密码框，便于快速重试
+    form.value.password = ''
+    nextTick(() => passwordInputRef.value?.focus())
   } finally {
     loading.value = false
   }
@@ -180,6 +212,25 @@ async function login() {
 
 .login-btn:active {
   transform: translateY(0);
+}
+
+.login-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  color: #DC2626;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.login-error svg {
+  flex-shrink: 0;
+  margin-top: 1px;
 }
 
 .login-footer {

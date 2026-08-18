@@ -84,6 +84,8 @@ const statColors = [
   { bg: '#FEF3C7', color: '#F59E0B' },      // 累计充值 - 金黄色
   { bg: '#ECFDF5', color: '#10B981' },      // 可用 Token - 绿色
   { bg: '#FCE7F3', color: '#EC4899' },      // 试用 Token 可用 - 粉色
+  { bg: '#EEF2FF', color: '#6366F1' },      // 在线设备 - 靛蓝
+  { bg: '#FFF1F2', color: '#F43F5E' },      // 待审退款 - 玫红
 ]
 
 // 统一线性风格图标 (stroke-based，更企业感)
@@ -131,6 +133,21 @@ const statIcons = [
       h('path', { d: 'M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z' })
     ])
   }),
+  // 在线设备 - 显示器图标
+  defineComponent({
+    render: () => h('svg', { width: 20, height: 20, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.8, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, [
+      h('rect', { x: 2, y: 3, width: 20, height: 14, rx: 2, ry: 2 }),
+      h('line', { x1: 8, y1: 21, x2: 16, y2: 21 }),
+      h('line', { x1: 12, y1: 17, x2: 12, y2: 21 })
+    ])
+  }),
+  // 待审退款 - 退还/循环图标
+  defineComponent({
+    render: () => h('svg', { width: 20, height: 20, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.8, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, [
+      h('polyline', { points: '1 4 1 10 7 10' }),
+      h('path', { d: 'M3.51 15a9 9 0 1 0 2.13-9.36L1 10' })
+    ])
+  }),
 ]
 
 const stats = ref([
@@ -139,6 +156,8 @@ const stats = ref([
   { label: '累计充值 (USD)', value: '-' },
   { label: '可用 Token', value: '-' },
   { label: '试用 Token 可用', value: '-' },
+  { label: '在线设备', value: '-' },
+  { label: '待审退款', value: '-' },
 ])
 
 onMounted(async () => {
@@ -150,6 +169,8 @@ onMounted(async () => {
       { label: '累计充值 (USD)', value: data.total_revenue_usd != null ? `$${Number(data.total_revenue_usd).toFixed(2)}` : '-' },
       { label: '可用 Token', value: data.token_stats ? data.token_stats.available : '-' },
       { label: '试用 Token 可用', value: data.token_stats ? data.token_stats.trial_available : '-' },
+      { label: '在线设备', value: data.online_devices ?? '-' },
+      { label: '待审退款', value: data.pending_refunds ?? '-' },
     ]
   } catch {}
 })

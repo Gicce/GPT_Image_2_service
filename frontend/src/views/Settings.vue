@@ -42,6 +42,26 @@
         </div>
       </div>
 
+      <!-- 安全概览（只读）：管理员账户 / 最近登录 / 服务版本 / HTTPS -->
+      <div class="status-card">
+        <div class="status-card-icon" style="background: var(--danger-bg); color: var(--cy-danger);">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/>
+          </svg>
+        </div>
+        <div class="status-card-content">
+          <div class="status-card-label">管理员账户 / 安全</div>
+          <div class="security-summary">
+            <span>{{ securitySummary.admin_count }} 个账户</span>
+            <span v-if="securitySummary.last_login">最近登录 {{ securitySummary.last_login }}</span>
+            <span>v{{ securitySummary.version }}</span>
+            <n-tag :type="isHttps ? 'success' : 'warning'" size="small" :bordered="false" round>
+              {{ isHttps ? 'HTTPS' : 'HTTP' }}
+            </n-tag>
+          </div>
+        </div>
+      </div>
+
       <div class="status-card">
         <div class="status-card-icon" style="background: var(--cy-success-bg); color: var(--cy-success);">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
@@ -310,6 +330,38 @@ const envStatus = computed(() => {
   return { type: 'warning', label: '开发环境' }
 })
 
+// 安全概览（只读，不展示任何 secret）
+const securitySummary = ref({ admin_count: '-', last_login: '', version: '-' })
+const isHttps = computed(() => window.location.protocol === 'https:')
+
+async function loadSecuritySummary() {
+  try {
+    const [{ data: health }, ] = await Promise.all([
+      http.get('/api/health').catch(() => ({ data: {} })),
+    ])
+    let adminCount = '-'
+    let lastLogin = ''
+    // 仅 super_admin 可读管理员列表；普通 admin 忽略失败
+    try {
+      const { data } = await http.get('/api/admin/admins')
+      adminCount = data.total ?? '-'
+      const latest = (data.admins || [])
+        .map(a => a.last_login_at)
+        .filter(Boolean)
+        .sort()
+        .pop()
+      if (latest) {
+        lastLogin = new Date(latest).toLocaleString('zh-CN', { hour12: false })
+      }
+    } catch {}
+    securitySummary.value = {
+      admin_count: adminCount,
+      last_login: lastLogin,
+      version: health.version || '-',
+    }
+  } catch {}
+}
+
 // 微信支付状态（键名与后端 .env 一致）
 const wechatStatus = computed(() => {
   const hasMchId = formValues['WECHAT_MCHID'] && formValues['WECHAT_MCHID'].length > 0
@@ -331,7 +383,10 @@ const runtimeTokenStatus = computed(() => {
   return { type: 'warning', label: '未配置' }
 })
 
-onMounted(() => loadConfig())
+onMounted(() => {
+  loadConfig()
+  loadSecuritySummary()
+})
 
 async function loadConfig() {
   loading.value = true
@@ -494,6 +549,15 @@ async function doRestart() {
   font-size: 13px;
   color: var(--cy-text-muted);
   margin-bottom: 6px;
+}
+
+.security-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--cy-text);
 }
 
 /* 配置卡片网格 */

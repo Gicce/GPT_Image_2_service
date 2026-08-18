@@ -9,14 +9,13 @@ from sqlalchemy import select
 
 from app.main import app
 from app.core.database import AsyncSessionLocal
-from app.core.security import create_admin_token
 from app.models.token import Order, OrderStatus
 from app.models.billing import BillingTransaction
 from app.services import billing
 from app.services.order_assignment import assign_paid_order
-from tests.conftest import make_user, get_user
+from tests.conftest import make_admin_headers, make_user, get_user
 
-ADMIN_HEADERS = {"Authorization": f"Bearer {create_admin_token()}"}
+ADMIN_HEADERS = make_admin_headers()
 
 
 async def make_paid_order(user_id: str, amount_usd: str = "10.00") -> Order:

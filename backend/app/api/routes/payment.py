@@ -28,7 +28,9 @@ MIN_PAYMENT_CNY = 0.01
 
 
 def _wechatpay_error(exc: Exception) -> HTTPException:
-    return HTTPException(status_code=502, detail=f"WeChat Pay request failed: {exc}")
+    # 具体异常只进服务端日志；对外返回稳定文案，避免泄露上游/内部信息
+    logger.error("wechatpay request failed: %s: %s", type(exc).__name__, exc)
+    return HTTPException(status_code=502, detail="微信支付服务暂时不可用，请稍后重试")
 
 
 def is_wechat_pay_configured() -> bool:
@@ -169,7 +171,8 @@ async def create_order(
             raise _wechatpay_error(exc) from exc
 
         if code != 200:
-            raise HTTPException(status_code=502, detail=f"WeChat Pay create order failed: {result}")
+            logger.error("wechatpay create order failed: code=%s body=%s", code, result)
+            raise HTTPException(status_code=502, detail="微信下单失败，请稍后重试")
 
         import json
         result = json.loads(result)

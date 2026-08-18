@@ -13,20 +13,19 @@
         <n-tag :type="envTag.type" size="small" :bordered="false" round>
           {{ envTag.label }}
         </n-tag>
-        <div class="header-admin">
-          <div class="admin-avatar">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/>
+        <n-dropdown trigger="click" :options="adminMenuOptions" @select="onAdminMenuSelect">
+          <div class="header-admin header-admin-clickable">
+            <div class="admin-avatar">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/>
+              </svg>
+            </div>
+            <span class="admin-name">{{ adminProfile.username || '管理员' }}</span>
+            <svg class="admin-caret" width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
           </div>
-          <span class="admin-name">管理员</span>
-        </div>
-        <n-button text class="header-logout" @click="logout">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="margin-right:6px">
-            <path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/>
-          </svg>
-          退出登录
-        </n-button>
+        </n-dropdown>
       </div>
     </n-layout-header>
 
@@ -86,13 +85,47 @@
 </template>
 
 <script setup>
-import { computed, h, defineComponent } from 'vue'
+import { computed, h, defineComponent, onMounted, ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { NIcon } from 'naive-ui'
+import http from '../api/http'
 
 const router = useRouter()
 const route = useRoute()
 const activeKey = computed(() => route.path.replace('/', ''))
+
+// 当前登录管理员（/api/admin/admins/me），用于右上角菜单与角色可见性
+const adminProfile = ref({ username: '', display_name: '', role: '' })
+const isSuperAdmin = computed(() => adminProfile.value.role === 'super_admin')
+
+onMounted(async () => {
+  try {
+    const { data } = await http.get('/api/admin/admins/me')
+    adminProfile.value = data
+  } catch {
+    // profile 拉取失败不影响导航；401 由全局拦截器处理
+  }
+})
+
+const adminMenuOptions = computed(() => [
+  {
+    key: 'account',
+    label: `当前账户：${adminProfile.value.display_name || adminProfile.value.username || 'admin'}`,
+    disabled: true,
+  },
+  { key: 'profile', label: '个人设置' },
+  { key: 'change-password', label: '修改密码' },
+  { type: 'divider', key: 'divider', props: {} },
+  { key: 'logout', label: '退出登录' },
+])
+
+function onAdminMenuSelect(key) {
+  if (key === 'profile' || key === 'change-password') {
+    router.push({ path: '/profile', query: { tab: key === 'change-password' ? 'password' : 'info' } })
+  } else if (key === 'logout') {
+    logout()
+  }
+}
 
 // 页面标题映射
 const pageTitleMap = {
@@ -105,6 +138,8 @@ const pageTitleMap = {
   transactions: '账务流水',
   'online-devices': '在线客户端',
   settings: '系统配置',
+  admins: '管理员管理',
+  profile: '个人设置',
 }
 
 const currentPageTitle = computed(() => {
@@ -148,17 +183,24 @@ function makeIcon(key) {
   })
 }
 
-const menuOptions = [
-  { label: '概览', key: 'dashboard', icon: makeIcon('dashboard') },
-  { label: 'Image2 配置', key: 'models', icon: makeIcon('models') },
-  { label: 'Token 库存', key: 'tokens', icon: makeIcon('tokens') },
-  { label: '客户账户', key: 'users', icon: makeIcon('users') },
-  { label: '账务流水', key: 'transactions', icon: makeIcon('transactions') },
-  { label: '交易订单', key: 'orders', icon: makeIcon('orders') },
-  { label: '运营通知', key: 'notice', icon: makeIcon('notice') },
-  { label: '在线客户端', key: 'online-devices', icon: makeIcon('online-devices') },
-  { label: '系统配置', key: 'settings', icon: makeIcon('settings') },
-]
+const menuOptions = computed(() => {
+  const options = [
+    { label: '概览', key: 'dashboard', icon: makeIcon('dashboard') },
+    { label: 'Image2 配置', key: 'models', icon: makeIcon('models') },
+    { label: 'Token 库存', key: 'tokens', icon: makeIcon('tokens') },
+    { label: '客户账户', key: 'users', icon: makeIcon('users') },
+    { label: '账务流水', key: 'transactions', icon: makeIcon('transactions') },
+    { label: '交易订单', key: 'orders', icon: makeIcon('orders') },
+    { label: '运营通知', key: 'notice', icon: makeIcon('notice') },
+    { label: '在线客户端', key: 'online-devices', icon: makeIcon('online-devices') },
+    { label: '系统配置', key: 'settings', icon: makeIcon('settings') },
+  ]
+  if (isSuperAdmin.value) {
+    // 管理员管理仅 super_admin 可见（后端同时做 403 校验）
+    options.splice(options.length - 1, 0, { label: '管理员管理', key: 'admins', icon: makeIcon('users') })
+  }
+  return options
+})
 
 function navigate(key) { router.push('/' + key) }
 
@@ -221,6 +263,20 @@ function logout() {
   padding: 6px 12px;
   background: var(--cy-bg-muted);
   border-radius: var(--cy-radius);
+}
+
+.header-admin-clickable {
+  cursor: pointer;
+  transition: background 0.2s;
+  user-select: none;
+}
+
+.header-admin-clickable:hover {
+  background: var(--cy-primary-light);
+}
+
+.admin-caret {
+  color: var(--cy-text-dim);
 }
 
 .admin-avatar {

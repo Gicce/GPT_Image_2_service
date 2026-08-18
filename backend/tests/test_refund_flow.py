@@ -11,13 +11,13 @@ from sqlalchemy import select, text
 
 from app.main import app
 from app.core.database import AsyncSessionLocal
-from app.core.security import create_access_token, create_admin_token
+from app.core.security import create_access_token
 from app.core.config import settings
 from app.models.token import Order, OrderStatus, RefundRequest
 from app.services import refund as refund_service
-from tests.conftest import make_user
+from tests.conftest import make_admin_headers, make_user
 
-ADMIN_HEADERS = {"Authorization": f"Bearer {create_admin_token()}"}
+ADMIN_HEADERS = make_admin_headers()
 
 
 def wx_refund_response(status: str, refund_id: str = None) -> tuple[int, str]:

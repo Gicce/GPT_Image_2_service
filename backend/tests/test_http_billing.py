@@ -6,8 +6,8 @@ import httpx
 from decimal import Decimal
 
 from app.main import app
-from app.core.security import create_access_token, create_admin_token
-from tests.conftest import make_user, get_user
+from app.core.security import create_access_token
+from tests.conftest import make_admin_headers, make_user, get_user
 
 
 @pytest.fixture
@@ -21,7 +21,7 @@ async def auth_headers(user_id: str) -> dict:
     return {"Authorization": f"Bearer {create_access_token(user_id)}"}
 
 
-ADMIN_HEADERS = {"Authorization": f"Bearer {create_admin_token()}"}
+ADMIN_HEADERS = make_admin_headers()
 
 
 async def test_authorize_settle_http_flow(client):

@@ -9,10 +9,9 @@ from sqlalchemy import text
 
 from app.main import app
 from app.core.database import AsyncSessionLocal
-from app.core.security import create_admin_token
-from tests.conftest import make_user
+from tests.conftest import make_admin_headers, make_user
 
-ADMIN_HEADERS = {"Authorization": f"Bearer {create_admin_token()}"}
+ADMIN_HEADERS = make_admin_headers()
 
 
 async def insert_token(trial=False, assigned=False, disabled=False) -> str:

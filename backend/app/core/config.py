@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "admin123"
 
+    # CORS 白名单（逗号分隔，留空则放开以兼容 Tauri 客户端多变 origin）
+    CORS_ORIGINS: str = ""
+
     # 微信支付
     WECHAT_MCHID: str = ""
     WECHAT_APPID: str = ""

@@ -1,4 +1,5 @@
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from decimal import Decimal
 
@@ -12,16 +13,18 @@ import asyncio
 
 from app.core.database import engine, Base, AsyncSessionLocal, AsyncSession
 from app.core.redis import init_redis, recover_processing_refunds
-from app.api.routes import auth, users, tokens, payment, notice, models, admin, usage, client
+from app.api.routes import auth, users, tokens, payment, notice, models, admin, usage, client, admin_accounts
 from app.models.content import AIModel
 from app.services import billing
+from app.core.security import hash_password
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
 IMAGE2_MODEL_ID = "gpt-image-2"
 
 # 服务版本唯一来源：/health、/api/health 与 FastAPI 元数据均引用此常量
-APP_VERSION = "4.0.1"
+APP_VERSION = "4.0.2"
 
 # V4：系统仅提供 Image2 一个收费模型，seed 只保证它存在，不再创建任何其他默认模型。
 IMAGE2_SEED = {
@@ -37,6 +40,7 @@ IMAGE2_SEED = {
 
 MIGRATION_VERSION = "v4_single_model"
 MIGRATION_VERSION_SHARED_TOKEN_REFUND = "v4_shared_token_refund"
+MIGRATION_VERSION_ADMIN_ACCOUNTS = "v402_admin_accounts"
 
 
 async def seed_defaults():
@@ -73,6 +77,8 @@ async def _ensure_columns(conn):
         # V4.1 退款累计（部分退款多次累计，快照语义）
         ("orders", "refunded_cny", "NUMERIC(10,2) NOT NULL DEFAULT 0"),
         ("orders", "refunded_usd", "NUMERIC(18,6) NOT NULL DEFAULT 0"),
+        # V4.0.2 管理员体系
+        ("admin_users", "must_change_password", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ]
     for table, column, col_type in new_columns:
         if not await _column_exists(conn, table, column):
@@ -298,6 +304,43 @@ async def _migrate_v4_shared_token_refund(conn):
     logger.info("migration %s done", MIGRATION_VERSION_SHARED_TOKEN_REFUND)
 
 
+async def _migrate_admin_accounts(conn):
+    """V4.0.2 一次性迁移：管理员账户数据库化。
+
+    admin_users 表由 create_all 建立；首次迁移若表为空，用现有 env 管理员
+    （ADMIN_USERNAME / ADMIN_PASSWORD）初始化为 super_admin（bcrypt 哈希），
+    保证生产环境现有管理员迁移后无需任何操作即可继续登录。
+    迁移后 env 管理员凭据仅作为首次引导来源，登录一律以数据库为准。
+    """
+    applied = await conn.execute(text(
+        "SELECT 1 FROM schema_migrations WHERE version = :v"
+    ), {"v": MIGRATION_VERSION_ADMIN_ACCOUNTS})
+    if applied.scalar():
+        return
+
+    logger.info("running migration %s ...", MIGRATION_VERSION_ADMIN_ACCOUNTS)
+
+    count = await conn.execute(text("SELECT COUNT(*) FROM admin_users"))
+    if not count.scalar():
+        username = settings.ADMIN_USERNAME.strip().lower() or "admin"
+        await conn.execute(text(
+            "INSERT INTO admin_users (id, username, display_name, password_hash, role, "
+            "is_active, must_change_password, created_at, updated_at, password_changed_at) "
+            "VALUES (:id, :username, :display_name, :password_hash, 'super_admin', true, false, now(), now(), now())"
+        ), {
+            "id": str(uuid.uuid4()),
+            "username": username,
+            "display_name": "超级管理员",
+            "password_hash": hash_password(settings.ADMIN_PASSWORD),
+        })
+        logger.info("bootstrap super_admin '%s' created from env credentials", username)
+
+    await conn.execute(text(
+        "INSERT INTO schema_migrations (version) VALUES (:v) ON CONFLICT DO NOTHING"
+    ), {"v": MIGRATION_VERSION_ADMIN_ACCOUNTS})
+    logger.info("migration %s done", MIGRATION_VERSION_ADMIN_ACCOUNTS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_redis()
@@ -307,6 +350,7 @@ async def lifespan(app: FastAPI):
         await _ensure_indexes(conn)
         await _migrate_v4_single_model(conn)
         await _migrate_v4_shared_token_refund(conn)
+        await _migrate_admin_accounts(conn)
     await seed_defaults()
 
     # 启动即清理一次超时预占，再进入周期任务
@@ -318,7 +362,15 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="CyImagePro Service", version=APP_VERSION, lifespan=lifespan)
+# 生产环境关闭交互式 API 文档，避免暴露完整接口结构
+_is_production = settings.APP_ENV == "production"
+
+app = FastAPI(
+    title="CyImagePro Service", version=APP_VERSION, lifespan=lifespan,
+    docs_url=None if _is_production else "/docs",
+    redoc_url=None if _is_production else "/redoc",
+    openapi_url=None if _is_production else "/openapi.json",
+)
 
 
 @app.exception_handler(Exception)
@@ -330,10 +382,15 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"detail": "服务器内部错误，请稍后重试"},
     )
 
+# CORS：认证全部走 Authorization Bearer（无 Cookie），因此不启用 credentials。
+# 生产可通过 CORS_ORIGINS 配置显式白名单（逗号分隔）；未配置时放开以兼容
+# Tauri 客户端的多变 origin（tauri://localhost、http://tauri.localhost 等）。
+_cors_origins = [o.strip() for o in (settings.CORS_ORIGINS or "").split(",") if o.strip()] or ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -346,6 +403,7 @@ app.include_router(notice.router, prefix="/api/notice", tags=["notice"])
 app.include_router(models.router, prefix="/api/models", tags=["models"])
 app.include_router(usage.router, prefix="/api/usage", tags=["usage"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
+app.include_router(admin_accounts.router, prefix="/api/admin", tags=["admin-accounts"])
 app.include_router(client.router, prefix="/api/client", tags=["client"])
 
 
