@@ -2,8 +2,8 @@
   <div>
     <div class="page-header">
       <div class="page-header-left">
-        <h2 class="page-header-title">在线客户端</h2>
-        <p v-if="lastUpdatedAt" class="page-header-subtitle">最后更新：{{ lastUpdatedAt }}</p>
+        <h2 class="page-header-title">客户端设备</h2>
+        <p v-if="lastUpdatedAt" class="page-header-subtitle">最后更新：{{ lastUpdatedAt }}（相对时间由服务器时钟计算）</p>
       </div>
       <n-button type="primary" size="small" @click="loadDevices" :loading="loading">
         <template #icon>
@@ -18,14 +18,27 @@
     <div class="stats-row">
       <div class="stat-card">
         <div class="stat-card-accent" style="background:linear-gradient(90deg,#00d4aa,#00d4aa00)"></div>
-        <div class="stat-card-label">在线设备</div>
-        <div class="stat-card-value">{{ devices.length }}</div>
+        <div class="stat-card-label">当前在线</div>
+        <div class="stat-card-value">{{ onlineCount }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-accent" style="background:linear-gradient(90deg,#0f766e,#0f766e00)"></div>
+        <div class="stat-card-label">历史设备</div>
+        <div class="stat-card-value">{{ historyCount }}</div>
       </div>
     </div>
 
-    <n-empty v-if="!loading && devices.length === 0" description="暂无在线客户端" size="large" style="margin-top:60px">
+    <div class="filter-bar">
+      <n-radio-group v-model:value="statusFilter" size="small" @update:value="loadDevices">
+        <n-radio-button value="all">全部</n-radio-button>
+        <n-radio-button value="online">在线</n-radio-button>
+        <n-radio-button value="offline">离线</n-radio-button>
+      </n-radio-group>
+    </div>
+
+    <n-empty v-if="!loading && devices.length === 0" description="暂无设备记录" size="large" style="margin-top:60px">
       <template #extra>
-        <span style="color:var(--cy-text-dim);font-size:13px">客户端登录后会自动上报在线状态</span>
+        <span style="color:var(--cy-text-dim);font-size:13px">客户端登录后会自动上报心跳，设备历史永久保留</span>
       </template>
     </n-empty>
 
@@ -48,25 +61,43 @@ import http from '../api/http'
 
 const devices = ref([])
 const loading = ref(false)
+const statusFilter = ref('all')
+const onlineCount = ref(0)
+const historyCount = ref(0)
 let refreshTimer = null
+
+// 相对时间一律用服务器下发的 seconds_since_seen（恒 >= 0），
+// 禁止用浏览器本地 new Date() 求差——服务器与管理员浏览器时钟偏移会透出负数
+function formatSecondsAgo(seconds) {
+  if (seconds == null) return '-'
+  if (seconds < 60) return `${seconds} 秒前`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`
+  return `${Math.floor(seconds / 86400)} 天前`
+}
+
+function formatDateTime(iso) {
+  if (!iso) return '-'
+  return new Date(iso).toLocaleString('zh-CN', { hour12: false })
+}
 
 const columns = [
   {
     title: '用户',
     key: 'user_email',
     width: 180,
-    render: row => row.user_email || row.user_id || '-'
+    render: row => row.user_email || row.username || row.user_id || '-'
   },
   {
     title: '设备名',
     key: 'device_name',
-    width: 140,
+    width: 130,
     render: row => row.device_name || '-'
   },
   {
     title: '设备 ID',
     key: 'device_id',
-    width: 160,
+    width: 150,
     render: row => {
       const id = row.device_id || ''
       if (id.length <= 12) return id
@@ -79,9 +110,9 @@ const columns = [
   },
   {
     title: '版本',
-    key: 'app_version',
+    key: 'client_version',
     width: 80,
-    render: row => row.app_version || '-'
+    render: row => row.client_version || '-'
   },
   {
     title: '平台',
@@ -89,45 +120,44 @@ const columns = [
     width: 80,
     render: row => {
       const platform = row.platform || '-'
-      const platformIcons = {
-        windows: '🪟',
-        macos: '🍎',
-        linux: '🐧',
-        darwin: '🍎',
-      }
+      const platformIcons = { windows: '🪟', macos: '🍎', linux: '🐧', darwin: '🍎' }
       const icon = platformIcons[platform.toLowerCase()] || ''
       return `${icon} ${platform}`.trim()
     }
   },
   {
     title: 'IP',
-    key: 'ip',
+    key: 'last_ip',
     width: 120,
-    render: row => row.ip || '-'
+    render: row => row.last_ip || '-'
+  },
+  {
+    title: '首次出现',
+    key: 'first_seen_at',
+    width: 160,
+    render: row => formatDateTime(row.first_seen_at)
   },
   {
     title: '最后心跳',
-    key: 'last_seen',
-    width: 160,
-    render: row => {
-      if (!row.last_seen) return '-'
-      const date = new Date(row.last_seen)
-      const now = new Date()
-      const diff = Math.floor((now - date) / 1000)
-      if (diff < 60) return `${diff} 秒前`
-      if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
-      return date.toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-    }
+    key: 'seconds_since_seen',
+    width: 110,
+    render: row => formatSecondsAgo(row.seconds_since_seen)
+  },
+  {
+    title: '心跳次数',
+    key: 'heartbeat_count',
+    width: 90,
+    render: row => row.heartbeat_count ?? '-'
   },
   {
     title: '状态',
     key: 'status',
     width: 80,
     render: row => h(NTag, {
-      type: row.status === 'online' ? 'success' : 'default',
+      type: row.online ? 'success' : 'default',
       size: 'small',
       bordered: false,
-    }, { default: () => row.status === 'online' ? '在线' : '离线' })
+    }, { default: () => row.online ? '在线' : '离线' })
   },
 ]
 
@@ -136,13 +166,17 @@ const lastUpdatedAt = ref('')
 async function loadDevices() {
   loading.value = true
   try {
-    const { data } = await http.get('/api/admin/online-devices')
+    const params = {}
+    if (statusFilter.value !== 'all') params.status = statusFilter.value
+    const { data } = await http.get('/api/admin/devices', { params })
     devices.value = data.devices || []
+    onlineCount.value = data.online_count ?? 0
+    historyCount.value = data.history_count ?? devices.value.length
     if (data.generated_at) {
       lastUpdatedAt.value = new Date(data.generated_at).toLocaleTimeString('zh-CN', { hour12: false })
     }
   } catch (e) {
-    console.error('Failed to load online devices:', e)
+    console.error('Failed to load devices:', e)
     devices.value = []
   } finally {
     loading.value = false
@@ -168,6 +202,12 @@ onUnmounted(() => {
   display: flex;
   gap: 16px;
   margin-bottom: 24px;
+}
+
+.filter-bar {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
 }
 
 .stat-card {

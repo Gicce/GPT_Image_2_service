@@ -298,10 +298,11 @@ async def test_partial_refund_over_remaining_rejected(client, monkeypatch):
 
 async def test_insufficient_balance_never_negative(client, monkeypatch):
     user, order = await make_paid_order("rf_neg", credited=True)
-    # 用户已消费 $0.80，余额只剩 $0.20
+    # 用户已消费大部分点数，paid_credits 只剩 140（= $0.20 镜像）；
+    # 直接改点数真相列并同步镜像（绕过业务层模拟历史消费）
     async with AsyncSessionLocal() as db:
         await db.execute(text(
-            "UPDATE users SET balance_usd = 0.20 WHERE id = :uid"
+            "UPDATE users SET paid_credits = 140, balance_usd = 0.200000 WHERE id = :uid"
         ), {"uid": user.id})
         await db.commit()
 
@@ -321,14 +322,16 @@ async def test_insufficient_balance_never_negative(client, monkeypatch):
         from app.models.user import User
         from app.models.billing import BillingTransaction
         u = (await db.execute(select(User).where(User.id == user.id))).scalar_one()
-        assert Decimal(str(u.balance_usd)) == Decimal("0.00")  # 扣到 0 为止，不为负
-        # 流水如实记录实际扣除 0.20（差额在审核界面提示人工处理）
+        assert u.paid_credits == 0  # 扣到 0 为止，不为负
+        assert Decimal(str(u.balance_usd)) == Decimal("0.00")  # 镜像同步为 0
+        # 流水如实记录实际扣除 140 点（$0.20 镜像；差额在审核界面提示人工处理）
         txn = (await db.execute(
             select(BillingTransaction).where(
                 BillingTransaction.related_order_id == order['id'],
                 BillingTransaction.type == "RECHARGE_REFUND",
             )
         )).scalar_one()
+        assert txn.amount_credits == 140
         assert Decimal(str(txn.amount_usd)) == Decimal("0.20")
 
 

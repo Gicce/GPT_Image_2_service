@@ -13,9 +13,12 @@ import asyncio
 
 from app.core.database import engine, Base, AsyncSessionLocal, AsyncSession
 from app.core.redis import init_redis, recover_processing_refunds
-from app.api.routes import auth, users, tokens, payment, notice, models, admin, usage, client, admin_accounts
+from app.api.routes import auth, users, tokens, payment, notice, models, admin, usage, client, admin_accounts, billing as billing_route, trial as trial_route
 from app.models.content import AIModel
+from app.models.billing import PricingRule
 from app.services import billing
+from app.services import config_service
+from app.services import credits_migration
 from app.core.security import hash_password
 from app.core.config import settings
 
@@ -24,7 +27,7 @@ logger = logging.getLogger(__name__)
 IMAGE2_MODEL_ID = "gpt-image-2"
 
 # 服务版本唯一来源：/health、/api/health 与 FastAPI 元数据均引用此常量
-APP_VERSION = "4.0.2"
+APP_VERSION = "4.2.0"
 
 # V4：系统仅提供 Image2 一个收费模型，seed 只保证它存在，不再创建任何其他默认模型。
 IMAGE2_SEED = {
@@ -48,6 +51,31 @@ async def seed_defaults():
         result = await session.execute(select(AIModel).where(AIModel.name == IMAGE2_MODEL_ID))
         if not result.scalar_one_or_none():
             session.add(AIModel(**IMAGE2_SEED))
+
+        # V4.2 业务配置默认值（幂等，仅补缺失键）
+        await config_service.seed_config_defaults(session)
+
+        # V4.2 定价规则种子：仅当无任何生效规则时创建。
+        # 单价 80 点 = ¥0.80（示例成本 ¥0.20 + 10% 安全垫，70% 目标毛利 → 最低 80 点）。
+        # 管理员可在后台按真实采购成本调整；所有改动经 Price Guard。
+        rule = await session.execute(
+            select(PricingRule).where(PricingRule.enabled.is_(True)).limit(1)
+        )
+        if rule.scalar_one_or_none() is None:
+            existing_any = await session.execute(select(PricingRule).limit(1))
+            if existing_any.scalar_one_or_none() is None:
+                session.add(PricingRule(
+                    feature="image",
+                    model=IMAGE2_MODEL_ID,
+                    unit_credits=80,
+                    nominal_unit_cost_rmb=Decimal("0.20"),
+                    target_margin=Decimal("0.70"),
+                    safety_buffer=Decimal("0.10"),
+                    rounding_step=10,
+                    created_by="system-seed",
+                ))
+                logger.info("seeded default pricing rule: 80 credits/image")
+
         await session.commit()
 
 
@@ -79,6 +107,21 @@ async def _ensure_columns(conn):
         ("orders", "refunded_usd", "NUMERIC(18,6) NOT NULL DEFAULT 0"),
         # V4.0.2 管理员体系
         ("admin_users", "must_change_password", "BOOLEAN NOT NULL DEFAULT FALSE"),
+        # V4.2 CY Credits
+        ("users", "paid_credits", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "trial_credits", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "gift_credits", "INTEGER NOT NULL DEFAULT 0"),
+        ("billing_transactions", "unit_credits", "INTEGER"),
+        ("billing_transactions", "amount_credits", "INTEGER NOT NULL DEFAULT 0"),
+        ("billing_transactions", "trial_credits_part", "INTEGER NOT NULL DEFAULT 0"),
+        ("billing_transactions", "gift_credits_part", "INTEGER NOT NULL DEFAULT 0"),
+        ("billing_transactions", "paid_credits_part", "INTEGER NOT NULL DEFAULT 0"),
+        ("billing_transactions", "quote_id", "VARCHAR(36)"),
+        ("billing_transactions", "pricing_rule_id", "VARCHAR(36)"),
+        ("billing_transactions", "pricing_rule_version", "INTEGER"),
+        ("orders", "credits_granted", "INTEGER"),
+        ("usage_logs", "unit_credits", "INTEGER"),
+        ("usage_logs", "cost_credits", "INTEGER NOT NULL DEFAULT 0"),
     ]
     for table, column, col_type in new_columns:
         if not await _column_exists(conn, table, column):
@@ -353,6 +396,29 @@ async def lifespan(app: FastAPI):
         await _migrate_admin_accounts(conn)
     await seed_defaults()
 
+    # V4.2 旧美元余额 → CY 点数迁移：
+    # - 非生产（测试/开发）：启动即自动执行（幂等）
+    # - 生产：只输出 preview 报告，必须由 super_admin 经
+    #   POST /api/admin/billing/credits-migration 确认后执行
+    async with AsyncSessionLocal() as session:
+        if not await credits_migration.credits_migration_applied(session):
+            report = await credits_migration.preview_credits_migration(session)
+            if settings.APP_ENV == "production":
+                logger.warning(
+                    "credits migration PENDING (production): users=%d balance_usd=%s -> credits=%d "
+                    "(run POST /api/admin/billing/credits-migration {\"action\":\"apply\"} to apply)",
+                    report["user_count"], report["total_balance_usd"],
+                    report["total_paid_credits"] + report["total_trial_credits"],
+                )
+            else:
+                await credits_migration.apply_credits_migration(session)
+                await session.commit()
+                logger.info(
+                    "credits migration auto-applied (non-production): users=%d credits=%d",
+                    report["user_count"],
+                    report["total_paid_credits"] + report["total_trial_credits"],
+                )
+
     # 启动即清理一次超时预占，再进入周期任务
     asyncio.create_task(start_reservation_gc_loop())
 
@@ -405,6 +471,8 @@ app.include_router(usage.router, prefix="/api/usage", tags=["usage"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(admin_accounts.router, prefix="/api/admin", tags=["admin-accounts"])
 app.include_router(client.router, prefix="/api/client", tags=["client"])
+app.include_router(billing_route.router, prefix="/api/billing", tags=["billing"])
+app.include_router(trial_route.router, prefix="/api/trial", tags=["trial"])
 
 
 @app.get("/api")

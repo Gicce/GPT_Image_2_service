@@ -85,9 +85,13 @@ async def clean_tables(init_backend):
     """每个测试前清空业务表并重置 Image2 配置。"""
     async with AsyncSessionLocal() as session:
         for table in [
+            # client_devices 有指向 users 的 FK，必须先于 users 删除
+            "client_devices",
             "billing_transactions", "admin_audit_logs", "usage_logs", "refund_requests",
             "orders", "runtime_token_assignments", "token_assignment_logs",
             "token_inventory", "users", "ai_models", "admin_users",
+            # V4.2 新表（user_id 为普通字符串列，无 FK，顺序不敏感）
+            "trial_claims", "cost_margin_ledger", "pricing_rules", "system_config",
         ]:
             await session.execute(text(f"DELETE FROM {table}"))
         await session.execute(text(
@@ -106,20 +110,29 @@ async def clean_tables(init_backend):
     # 清理登录限流与在线设备相关 Redis key，避免测试间串扰
     from app.core.redis import get_redis
     redis = get_redis()
-    for pattern in ("adminlogin:*", "userlogin:*", "online_device:*"):
+    for pattern in ("adminlogin:*", "userlogin:*", "online_device:*", "billing_quote:*"):
         async for key in redis.scan_iter(match=pattern):
             await redis.delete(key)
     yield
 
 
+# 测试环境 legacy 兑换率（system_config 缺省同值）
+TEST_LEGACY_RATE = 700
+
+
 async def make_user(username: str = "u1", balance: str = "0", trial: str = "0") -> User:
+    """构造用户：USD 参数按 legacy 率折算为点数（业务真相），镜像同步回写。"""
     async with AsyncSessionLocal() as session:
+        paid = int((Decimal(balance) * Decimal(TEST_LEGACY_RATE)).to_integral_value())
+        trial_cr = int((Decimal(trial) * Decimal(TEST_LEGACY_RATE)).to_integral_value())
         user = User(
             username=username,
             email=f"{username}@test.local",
             password_hash=hash_password("x"),
-            balance_usd=Decimal(balance),
-            trial_credit_usd=Decimal(trial),
+            paid_credits=paid,
+            trial_credits=trial_cr,
+            balance_usd=Decimal(paid) / Decimal(TEST_LEGACY_RATE),
+            trial_credit_usd=Decimal(trial_cr) / Decimal(TEST_LEGACY_RATE),
         )
         session.add(user)
         await session.commit()

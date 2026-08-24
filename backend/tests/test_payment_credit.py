@@ -69,7 +69,7 @@ async def test_recharge_credit_idempotent():
 
 
 async def test_recharge_refund_debit():
-    """充值退款冲正：扣回充值金额；余额不足时扣到 0 并如实记录实际扣除。"""
+    """充值退款冲正：扣回充值点数；余额不足时扣到 0 并如实记录实际扣除。"""
     user = await make_user("p2", "3.00", "0")
     order = await make_paid_order(user.id, "10.00")
 
@@ -78,28 +78,28 @@ async def test_recharge_refund_debit():
         await assign_paid_order(db, o)
         await db.commit()
     row = await get_user(user.id)
-    assert row.balance_usd == Decimal("13.000000")
+    assert row.balance_usd == Decimal("13.000000")  # 镜像 = 9100cr / 700
 
-    # 全额退款冲正
+    # 全额退款冲正（$10 订单 = 7000 点）
     async with AsyncSessionLocal() as db:
-        _, _, actual = await billing.debit_balance_for_refund(
-            db, user.id, Decimal("10.00"), related_order_id=order.id,
+        _, _, actual = await billing.debit_paid_credits_for_refund(
+            db, user.id, 7000, related_order_id=order.id,
         )
         await db.commit()
-    assert actual == Decimal("10.000000")
+    assert actual == 7000
     row = await get_user(user.id)
     assert row.balance_usd == Decimal("3.000000")
 
     # 余额不足时（已消费）：扣到 0 为止
     async with AsyncSessionLocal() as db:
-        _, _, actual = await billing.debit_balance_for_refund(
-            db, user.id, Decimal("10.00"),
+        _, _, actual = await billing.debit_paid_credits_for_refund(
+            db, user.id, 7000,
         )
         await db.commit()
-    assert actual == Decimal("3.000000")
+    assert actual == 2100
     row = await get_user(user.id)
     assert row.balance_usd == Decimal("0.000000")
-    assert row.trial_credit_usd == Decimal("0.000000")  # 退款不动试用额度
+    assert row.trial_credit_usd == Decimal("0.000000")  # 退款不动试用点数
 
 
 async def test_dev_mark_paid_http_idempotent():

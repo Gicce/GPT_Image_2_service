@@ -66,23 +66,33 @@ class RegisterVerifyRequest(BaseModel):
     account_type: str = "normal"
 
 
-async def _grant_trial(db: AsyncSession, user: User, days: int) -> bool:
-    """发放试用：绑定默认试用 Token（共享池，不消耗库存）+ 发放试用额度（写流水）。不 commit。
+async def _grant_trial(db: AsyncSession, user: User, days: int) -> tuple[bool, str]:
+    """发放试用：绑定默认试用 Token + 写 claim 记录 + 发放试用点数。不 commit。
 
-    返回 False 表示试用通道未开放（无有效默认试用 Token）。
+    返回 (granted, reason)：
+      reason="ok"                 发放成功
+      reason="already_claimed"    该邮箱已领取过（注册流静默降级为普通账号）
+      reason="unavailable"        试用通道未开放（无有效默认试用 Token）
     """
+    from app.services import config_service
+    from app.services import trial as trial_service
+
     trial_token = await rt.resolve_default_token(db, is_trial=True)
     if trial_token is None:
-        return False
+        return False, "unavailable"
+
+    grant = await config_service.get_config_int(db, "trial_grant_credits")
+    try:
+        await trial_service.record_trial_claim(db, user, grant, source="register_trial")
+    except trial_service.TrialClaimError:
+        return False, "already_claimed"
 
     now = datetime.now(timezone.utc)
     await rt.bind_token_to_user(db, user.id, trial_token, source="register_trial")
     user.account_type = "trial"
     user.trial_expires_at = now + timedelta(days=days)
-    await billing.grant_trial_credit(
-        db, user, billing.Decimal(str(settings.TRIAL_CREDIT_USD))
-    )
-    return True
+    await billing.grant_trial_credits(db, user, grant)
+    return True, "ok"
 
 
 @router.post("/register/send-code")
@@ -181,9 +191,10 @@ async def register_verify(req: RegisterVerifyRequest, db: AsyncSession = Depends
     await db.flush()
 
     if req.account_type == "trial":
-        granted = await _grant_trial(db, user, days=2)
-        if not granted:
+        granted, reason = await _grant_trial(db, user, days=2)
+        if not granted and reason == "unavailable":
             raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
+        # already_claimed：该邮箱已领过试用，静默注册为普通账号（claim 一次性规则优先）
 
     await db.flush()
     access_token = create_access_token(user.id)
@@ -221,9 +232,10 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     await db.flush()
 
     if req.account_type == "trial":
-        granted = await _grant_trial(db, user, days=2)
-        if not granted:
+        granted, reason = await _grant_trial(db, user, days=2)
+        if not granted and reason == "unavailable":
             raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
+        # already_claimed：该邮箱已领过试用，静默注册为普通账号（claim 一次性规则优先）
 
     await db.flush()
     access_token = create_access_token(user.id)
@@ -429,15 +441,17 @@ async def upgrade_trial(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """旧客户端试用申请入口：对齐 Trial Entitlement V1（claim 一次性 + 通道判定）。"""
+    from app.services import trial as trial_service
+
     if user.account_type != "normal":
         raise HTTPException(status_code=400, detail="仅普通账户可申请试用")
 
-    if billing.d(user.trial_credit_usd) > 0:
-        raise HTTPException(status_code=400, detail="已领取过试用额度")
-
-    granted = await _grant_trial(db, user, days=3)
-    if not granted:
-        raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
+    try:
+        await trial_service.claim_trial_for_user(db, user)
+    except trial_service.TrialClaimError as exc:
+        message = "已领取过试用额度" if exc.code == trial_service.REASON_ALREADY_CLAIMED else exc.message
+        raise HTTPException(status_code=400, detail=message) from exc
 
     await db.commit()
 
@@ -451,12 +465,18 @@ async def get_me(user: User = Depends(get_current_user), db: AsyncSession = Depe
 
 
 async def _user_info(user: User, db: AsyncSession):
+    from app.services import config_service
+    from app.services import trial as trial_service
+
     now = datetime.now(timezone.utc)
     trial_expired = (
         user.account_type == "trial"
         and user.trial_expires_at
         and user.trial_expires_at.replace(tzinfo=timezone.utc) < now
     )
+
+    trial_status = await trial_service.trial_status_for_user(db, user)
+    credits_per_cny = await config_service.get_credits_per_cny(db)
 
     return {
         "id": user.id,
@@ -465,6 +485,14 @@ async def _user_info(user: User, db: AsyncSession):
         "account_type": user.account_type,
         "trial_expires_at": user.trial_expires_at.isoformat() if user.trial_expires_at else None,
         "trial_expired": trial_expired,
+        # CY Credits（V4.2 起业务真相）
+        "paid_credits": user.paid_credits,
+        "trial_credits": user.trial_credits,
+        "gift_credits": user.gift_credits,
+        "total_credits": user.paid_credits + user.trial_credits + user.gift_credits,
+        "credits_per_cny": credits_per_cny,
+        "trial_available": trial_status["trial_available"],
+        # USD 兼容镜像（旧客户端展示）
         "balance_usd": str(billing.q6(billing.d(user.balance_usd))),
         "trial_credit_usd": str(billing.q6(billing.d(user.trial_credit_usd))),
     }

@@ -22,11 +22,16 @@ from app.models.token import (
     RefundRequest, RefundRequestStatus,
 )
 from app.models.content import Notice, AIModel
-from app.models.billing import BillingTransaction
+from app.models.billing import BillingTransaction, PricingRule, CostMarginLedger
 from app.models.audit import AdminAuditLog
+from app.models.device import ClientDevice
 from app.services import billing
 from app.services import runtime_token as rt
 from app.services import refund as refund_service
+from app.services import config_service
+from app.services import pricing as pricing_service
+from app.services import credits_migration
+from app.core.security import get_super_admin_user
 
 router = APIRouter()
 
@@ -532,6 +537,10 @@ async def list_users(_=Depends(get_admin_user), db: AsyncSession = Depends(get_d
             "id": u.id, "username": u.username, "email": u.email,
             "account_type": u.account_type,
             "is_active": u.is_active,
+            "paid_credits": u.paid_credits,
+            "trial_credits": u.trial_credits,
+            "gift_credits": u.gift_credits,
+            "total_credits": u.paid_credits + u.trial_credits + u.gift_credits,
             "balance_usd": str(billing.q6(billing.d(u.balance_usd))),
             "trial_credit_usd": str(billing.q6(billing.d(u.trial_credit_usd))),
             "trial_expires_at": u.trial_expires_at.isoformat() if u.trial_expires_at else None,
@@ -558,10 +567,24 @@ async def get_user(user_id: str, _=Depends(get_admin_user), db: AsyncSession = D
     )
     total_recharged = recharge_row.scalar()
 
+    recharge_cr_row = await db.execute(
+        select(func.coalesce(func.sum(BillingTransaction.amount_credits), 0)).where(
+            BillingTransaction.user_id == user_id,
+            BillingTransaction.type == billing.RECHARGE,
+            BillingTransaction.status == "SUCCESS",
+        )
+    )
+    total_recharged_credits = recharge_cr_row.scalar()
+
     spent_row = await db.execute(
         select(func.coalesce(func.sum(UsageLog.cost_usd), 0)).where(UsageLog.user_id == user_id)
     )
     total_spent = spent_row.scalar()
+
+    spent_cr_row = await db.execute(
+        select(func.coalesce(func.sum(UsageLog.cost_credits), 0)).where(UsageLog.user_id == user_id)
+    )
+    total_spent_credits = spent_cr_row.scalar()
 
     usage_row = await db.execute(
         select(func.count(UsageLog.id), func.coalesce(func.sum(UsageLog.image_count), 0)).where(
@@ -582,10 +605,16 @@ async def get_user(user_id: str, _=Depends(get_admin_user), db: AsyncSession = D
         "id": u.id, "username": u.username, "email": u.email,
         "account_type": u.account_type,
         "is_active": u.is_active,
+        "paid_credits": u.paid_credits,
+        "trial_credits": u.trial_credits,
+        "gift_credits": u.gift_credits,
+        "total_credits": u.paid_credits + u.trial_credits + u.gift_credits,
         "balance_usd": str(billing.q6(billing.d(u.balance_usd))),
         "trial_credit_usd": str(billing.q6(billing.d(u.trial_credit_usd))),
         "total_recharged_usd": str(total_recharged),
+        "total_recharged_credits": total_recharged_credits,
         "total_spent_usd": str(total_spent),
+        "total_spent_credits": total_spent_credits,
         "image2_call_count": call_count,
         "image2_image_count": image_count,
         "runtime_token": (
@@ -600,6 +629,8 @@ async def get_user(user_id: str, _=Depends(get_admin_user), db: AsyncSession = D
                 "image_count": log.image_count,
                 "unit_price": str(log.unit_price) if log.unit_price is not None else None,
                 "cost_usd": str(log.cost_usd),
+                "unit_credits": log.unit_credits,
+                "cost_credits": log.cost_credits,
                 "created_at": log.created_at.isoformat(),
             }
             for log in usage_logs
@@ -693,6 +724,11 @@ async def delete_user(user_id: str, _=Depends(get_admin_user), db: AsyncSession 
 
 
 class BalanceAdjustRequest(BaseModel):
+    """管理员直接设置点数余额（绝对值），写 ADMIN_ADJUSTMENT 流水 + 审计。"""
+    paid_credits: Optional[int] = Field(default=None, ge=0)
+    trial_credits: Optional[int] = Field(default=None, ge=0)
+    gift_credits: Optional[int] = Field(default=None, ge=0)
+    # 兼容旧字段（管理后台旧表单）：按 legacy 兑换率折算为点数后设置
     balance_usd: Optional[Decimal] = Field(default=None, ge=0, max_digits=18, decimal_places=6)
     trial_credit_usd: Optional[Decimal] = Field(default=None, ge=0, max_digits=18, decimal_places=6)
     remark: str = Field(default="", max_length=255)
@@ -705,52 +741,68 @@ async def adjust_user_balance(
     admin: dict = Depends(get_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """管理员直接设置现金余额 / 试用额度（写 ADMIN_ADJUSTMENT 流水 + 审计）。"""
+    """管理员直接设置 paid/trial/gift 点数（写 ADMIN_ADJUSTMENT 流水 + 审计）。"""
+    from app.services import config_service
+
     result = await db.execute(select(User).where(User.id == user_id).with_for_update())
     u = result.scalar_one_or_none()
     if not u:
         raise HTTPException(status_code=404, detail="用户不存在")
 
+    legacy_rate = await config_service.get_legacy_usd_to_credits(db)
+    rate = Decimal(legacy_rate)
+
+    def _usd_to_credits(v: Decimal) -> int:
+        from decimal import ROUND_HALF_UP
+        return int((billing.d(v) * rate).to_integral_value(rounding=ROUND_HALF_UP))
+
+    paid_target = (
+        _usd_to_credits(req.balance_usd) if req.balance_usd is not None
+        else req.paid_credits
+    )
+    trial_target = (
+        _usd_to_credits(req.trial_credit_usd) if req.trial_credit_usd is not None
+        else req.trial_credits
+    )
+    gift_target = req.gift_credits
+
     detail = {}
-    if req.balance_usd is not None:
-        before = billing.d(u.balance_usd)
-        u.balance_usd = billing.q6(req.balance_usd)
+    for name, target, part in (
+        ("paid_credits", paid_target, "paid"),
+        ("trial_credits", trial_target, "trial"),
+        ("gift_credits", gift_target, "gift"),
+    ):
+        if target is None:
+            continue
+        before = getattr(u, name)
+        if before == target:
+            continue
+        setattr(u, name, int(target))
+        delta = int(target) - before
         db.add(BillingTransaction(
             user_id=user_id,
             type=billing.ADMIN_ADJUSTMENT,
             status="SUCCESS",
-            amount_usd=billing.q6(billing.d(u.balance_usd) - before),
-            trial_amount=Decimal("0"),
-            balance_amount=billing.q6(billing.d(u.balance_usd) - before),
-            billing_source="CASH",
-            balance_before=before,
-            balance_after=u.balance_usd,
-            remark=req.remark or "admin balance adjustment",
+            amount_credits=abs(delta),
+            paid_credits_part=max(delta, 0) if part == "paid" else 0,
+            trial_credits_part=max(delta, 0) if part == "trial" else 0,
+            gift_credits_part=max(delta, 0) if part == "gift" else 0,
+            billing_source=part.upper() if delta > 0 else "NONE",
+            remark=req.remark or f"admin {name} adjustment ({'+' if delta > 0 else ''}{delta})",
         ))
-        detail["balance_usd"] = {"from": str(before), "to": str(u.balance_usd)}
-    if req.trial_credit_usd is not None:
-        before = billing.d(u.trial_credit_usd)
-        u.trial_credit_usd = billing.q6(req.trial_credit_usd)
-        db.add(BillingTransaction(
-            user_id=user_id,
-            type=billing.ADMIN_ADJUSTMENT,
-            status="SUCCESS",
-            amount_usd=billing.q6(billing.d(u.trial_credit_usd) - before),
-            trial_amount=billing.q6(billing.d(u.trial_credit_usd) - before),
-            balance_amount=Decimal("0"),
-            billing_source="TRIAL",
-            trial_before=before,
-            trial_after=u.trial_credit_usd,
-            remark=req.remark or "admin trial adjustment",
-        ))
-        detail["trial_credit_usd"] = {"from": str(before), "to": str(u.trial_credit_usd)}
+        detail[name] = {"from": before, "to": target}
 
     if not detail:
-        raise HTTPException(status_code=400, detail="未指定任何调整项")
+        raise HTTPException(status_code=400, detail="未指定任何调整项（或与当前值相同）")
+
+    billing.sync_legacy_mirrors(u, legacy_rate)
     await _record_audit(db, admin, "balance_adjust", {"user_id": user_id, **detail, "remark": req.remark})
 
     return {
         "ok": True,
+        "paid_credits": u.paid_credits,
+        "trial_credits": u.trial_credits,
+        "gift_credits": u.gift_credits,
         "balance_usd": str(billing.q6(billing.d(u.balance_usd))),
         "trial_credit_usd": str(billing.q6(billing.d(u.trial_credit_usd))),
     }
@@ -1493,61 +1545,507 @@ async def restart_backend(_=Depends(get_admin_user)):
         raise HTTPException(status_code=500, detail="服务重启失败，请检查容器状态")
 
 
-# ── Online Devices ────────────────────────────────────────────────
+# ── Devices（客户端设备历史） ─────────────────────────────────────
 
 @router.get("/online-devices")
 async def list_online_devices(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    """List all currently online devices from Redis (TTL based).
+    """兼容入口：仅返回当前在线设备（= /devices?status=online）。"""
+    data = await list_devices(status="online", db=db)
+    return {"devices": data["devices"], "total": data["online_count"],
+            "generated_at": data["generated_at"]}
 
-    在线判定以 Redis key 剩余 TTL 为准（180s 无心跳自动过期即离线），
-    不依赖任何数据库 boolean 字段。generated_at 供后台页面显示"最后更新"。
+
+@router.get("/devices")
+async def list_devices(
+    status: Optional[str] = None,
+    user_id: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    _=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """客户端设备历史（永久保留，离线不删除）。
+
+    - 真相来源 client_devices 表；online 状态 = Redis 心跳 key 存在（TTL 180s）
+    - seconds_since_seen 由服务器时钟计算且恒 >= 0（前端禁止自行用本地时钟求差，
+      杜绝「-28 秒前」：任何时钟偏移都不会透出负数）
     """
-    redis = get_redis()
-    if not redis:
-        return {"devices": [], "total": 0, "generated_at": datetime.now(timezone.utc).isoformat(),
-                "message": "Redis unavailable"}
+    if status not in (None, "", "all", "online", "offline"):
+        raise HTTPException(status_code=400, detail="status 仅支持 all/online/offline")
 
-    devices = []
-    cursor = 0
+    redis = get_redis()
+    online_keys: set[str] = set()
     try:
+        cursor = 0
         while True:
             cursor, keys = await redis.scan(cursor, match="online_device:*", count=100)
             for key in keys:
-                data_str = await redis.get(key)
-                if not data_str:
-                    continue
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-                ttl = await redis.ttl(key)
-                user_id = data.get("user_id", "")
-                user_email = ""
-                if user_id:
-                    u_result = await db.execute(select(User).where(User.id == user_id))
-                    u = u_result.scalar_one_or_none()
-                    if u:
-                        user_email = u.email
-                devices.append({
-                    "device_id": data.get("device_id", ""),
-                    "device_name": data.get("device_name", ""),
-                    "user_id": user_id,
-                    "user_email": user_email,
-                    "app_version": data.get("app_version", ""),
-                    "platform": data.get("platform", ""),
-                    "last_seen": data.get("last_seen", ""),
-                    "ip": data.get("ip", ""),
-                    "server_url": data.get("server_url", ""),
-                    "ttl_seconds": ttl if isinstance(ttl, int) and ttl > 0 else 0,
-                    "status": "online" if isinstance(ttl, int) and ttl > 0 else "offline",
-                })
+                # key = online_device:{user_id}:{device_id}
+                parts = key.split(":", 2)
+                if len(parts) == 3:
+                    online_keys.add((parts[1], parts[2]))
             if cursor == 0:
                 break
     except Exception:
-        logger.exception("Redis scan failed")
-        return {"devices": [], "total": 0, "generated_at": datetime.now(timezone.utc).isoformat(),
-                "message": "Redis scan failed"}
+        logger.exception("redis scan for devices failed (treat all as offline)")
 
-    devices.sort(key=lambda d: d.get("last_seen", ""), reverse=True)
-    return {"devices": devices, "total": len(devices),
-            "generated_at": datetime.now(timezone.utc).isoformat()}
+    query = select(ClientDevice)
+    if user_id:
+        query = query.where(ClientDevice.user_id == user_id)
+
+    count_result = await db.execute(select(func.count()).select_from(query.subquery()))
+    total = count_result.scalar()
+
+    page = max(1, page)
+    page_size = max(1, min(200, page_size))
+    result = await db.execute(
+        query.order_by(ClientDevice.last_seen_at.desc())
+        .offset((page - 1) * page_size).limit(page_size)
+    )
+    devices = result.scalars().all()
+
+    user_ids = list({d.user_id for d in devices})
+    uname_map: dict[str, str] = {}
+    if user_ids:
+        ures = await db.execute(select(User.id, User.username, User.email).where(User.id.in_(user_ids)))
+        uname_map = {row.id: (row.username, row.email) for row in ures}
+
+    now = datetime.now(timezone.utc)
+    rows = []
+    online_count_total = 0
+    # 全表 online 数（分页前）：Redis key 数即在线设备数
+    for uid, did in online_keys:
+        online_count_total += 1
+
+    for d in devices:
+        online = (d.user_id, d.device_id) in online_keys
+        last_seen = d.last_seen_at if d.last_seen_at.tzinfo else d.last_seen_at.replace(tzinfo=timezone.utc)
+        seconds = int((now - last_seen).total_seconds())
+        username, email = uname_map.get(d.user_id, ("", ""))
+        rows.append({
+            "user_id": d.user_id,
+            "username": username,
+            "user_email": email,
+            "device_id": d.device_id,
+            "device_name": d.device_name or "",
+            "platform": d.platform or "",
+            "client_version": d.client_version or "",
+            "first_seen_at": d.first_seen_at.isoformat() if d.first_seen_at else None,
+            "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None,
+            "last_ip": d.last_ip or "",
+            "heartbeat_count": d.heartbeat_count,
+            "online": online,
+            "status": "online" if online else "offline",
+            "seconds_since_seen": max(0, seconds),
+            # 兼容别名（旧后台页面/旧测试）
+            "last_seen": d.last_seen_at.isoformat() if d.last_seen_at else None,
+            "app_version": d.client_version or "",
+            "ttl_seconds": max(0, 180 - max(0, seconds)) if online else 0,
+        })
+
+    if status == "online":
+        rows = [r for r in rows if r["online"]]
+    elif status == "offline":
+        rows = [r for r in rows if not r["online"]]
+
+    return {
+        "devices": rows,
+        "total": total,
+        "online_count": online_count_total,
+        "history_count": total,
+        "page": page,
+        "page_size": page_size,
+        "generated_at": now.isoformat(),
+    }
+
+
+# ── Pricing Rules（定价规则 + Price Guard） ───────────────────────
+
+class PricingRuleUpdate(BaseModel):
+    unit_credits: int = Field(gt=0, le=100000)
+    nominal_unit_cost_rmb: Decimal = Field(ge=0, max_digits=10, decimal_places=6)
+    target_margin: Decimal = Field(gt=0, lt=1, max_digits=5, decimal_places=4)
+    safety_buffer: Decimal = Field(ge=0, lt=1, max_digits=5, decimal_places=4)
+    rounding_step: int = Field(default=10, ge=1, le=1000)
+    provider_route: str = Field(default="packyapi", max_length=64)
+    enabled: bool = True
+    # 低于目标毛利强制保存（仅 super_admin）
+    force: bool = False
+    override_reason: Optional[str] = Field(default=None, max_length=255)
+
+
+def _rule_dict(rule: PricingRule, preview: dict | None = None) -> dict:
+    out = {
+        "id": rule.id,
+        "feature": rule.feature,
+        "model": rule.model,
+        "unit_credits": rule.unit_credits,
+        "enabled": rule.enabled,
+        "version": rule.version,
+        "provider_route": rule.provider_route,
+        "nominal_unit_cost_rmb": str(rule.nominal_unit_cost_rmb),
+        "target_margin": str(rule.target_margin),
+        "safety_buffer": str(rule.safety_buffer),
+        "rounding_step": rule.rounding_step,
+        "effective_from": rule.effective_from.isoformat() if rule.effective_from else None,
+        "override_by": rule.override_by,
+        "override_at": rule.override_at.isoformat() if rule.override_at else None,
+        "override_reason": rule.override_reason,
+        "updated_at": rule.updated_at.isoformat() if rule.updated_at else None,
+    }
+    if preview is not None:
+        out["margin_preview"] = preview
+    return out
+
+
+@router.get("/pricing/rules")
+async def list_pricing_rules(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    rules = (await db.execute(select(PricingRule).order_by(PricingRule.feature, PricingRule.model))).scalars().all()
+    credits_per_cny = await config_service.get_credits_per_cny(db)
+    return {
+        "credits_per_cny": credits_per_cny,
+        "rules": [
+            _rule_dict(r, pricing_service.margin_math(
+                r.unit_credits, r.nominal_unit_cost_rmb, r.target_margin,
+                r.safety_buffer, credits_per_cny, r.rounding_step,
+            ))
+            for r in rules
+        ],
+    }
+
+
+@router.post("/pricing/rules/preview")
+async def preview_pricing(
+    req: PricingRuleUpdate,
+    _=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """编辑表单实时测算（Price Guard 同一套公式，保存前即可见毛利/最低售价）。"""
+    credits_per_cny = await config_service.get_credits_per_cny(db)
+    return pricing_service.margin_math(
+        req.unit_credits, req.nominal_unit_cost_rmb, req.target_margin,
+        req.safety_buffer, credits_per_cny, req.rounding_step,
+    )
+
+
+@router.put("/pricing/rules/{rule_id}")
+async def update_pricing_rule(
+    rule_id: str,
+    req: PricingRuleUpdate,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """修改定价：原地升版本（历史任务经流水快照锁定原价）。
+
+    Price Guard：预计毛利率低于目标 → 普通管理员 403 拒绝；
+    super_admin 携 force=true + override_reason 可强制保存（留痕）。
+    """
+    rule = await db.get(PricingRule, rule_id)
+    if rule is None:
+        raise HTTPException(status_code=404, detail="定价规则不存在")
+
+    credits_per_cny = await config_service.get_credits_per_cny(db)
+    preview = pricing_service.margin_math(
+        req.unit_credits, req.nominal_unit_cost_rmb, req.target_margin,
+        req.safety_buffer, credits_per_cny, req.rounding_step,
+    )
+
+    if preview["below_target"]:
+        if not req.force:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "BELOW_TARGET_MARGIN",
+                    "message": (
+                        f"低于目标毛利：预计毛利率 {preview['gross_margin']}，"
+                        f"目标 {preview['target_margin']}；建议最低售价 {preview['min_unit_credits']} 点"
+                    ),
+                    "margin_preview": preview,
+                },
+            )
+        if admin.get("role") != "super_admin":
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "OVERRIDE_REQUIRES_SUPER_ADMIN",
+                        "message": "低于目标毛利的强制保存仅限超级管理员"},
+            )
+        if not (req.override_reason or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "OVERRIDE_REASON_REQUIRED", "message": "强制保存必须填写原因"},
+            )
+
+    old = {
+        "unit_credits": rule.unit_credits,
+        "nominal_unit_cost_rmb": str(rule.nominal_unit_cost_rmb),
+        "target_margin": str(rule.target_margin),
+        "safety_buffer": str(rule.safety_buffer),
+    }
+    rule.unit_credits = req.unit_credits
+    rule.nominal_unit_cost_rmb = req.nominal_unit_cost_rmb
+    rule.target_margin = req.target_margin
+    rule.safety_buffer = req.safety_buffer
+    rule.rounding_step = req.rounding_step
+    rule.provider_route = req.provider_route
+    rule.enabled = req.enabled
+    rule.version = (rule.version or 1) + 1
+    rule.effective_from = datetime.now(timezone.utc)
+    if req.force:
+        rule.override_by = admin.get("sub", "admin")
+        rule.override_at = datetime.now(timezone.utc)
+        rule.override_reason = req.override_reason
+
+    await _record_audit(db, admin, "pricing_rule_update", {
+        "rule_id": rule.id, "from": old,
+        "to": {"unit_credits": rule.unit_credits,
+               "nominal_unit_cost_rmb": str(rule.nominal_unit_cost_rmb),
+               "target_margin": str(rule.target_margin),
+               "safety_buffer": str(rule.safety_buffer)},
+        "force_override": req.force,
+        "override_reason": req.override_reason,
+        "margin_preview": preview,
+    })
+
+    return {"ok": True, "rule": _rule_dict(rule, preview)}
+
+
+# ── Cost & Margin Ledger（经营账查询） ────────────────────────────
+
+def _ledger_row_dict(row: CostMarginLedger, username: str = "") -> dict:
+    return {
+        "id": row.id,
+        "billing_transaction_id": row.billing_transaction_id,
+        "request_id": row.request_id,
+        "user_id": row.user_id,
+        "username": username,
+        "pricing_rule_id": row.pricing_rule_id,
+        "pricing_rule_version": row.pricing_rule_version,
+        "unit_credits": row.unit_credits,
+        "reserved_credits": row.reserved_credits,
+        "charged_credits": row.charged_credits,
+        "released_credits": row.released_credits,
+        "category": row.category,
+        "credit_value_rmb": str(row.credit_value_rmb),
+        "revenue_rmb": str(row.revenue_rmb),
+        "promotional_value_rmb": str(row.promotional_value_rmb),
+        "provider": row.provider,
+        "provider_route": row.provider_route,
+        "token_inventory_id": row.token_inventory_id,
+        "nominal_unit_cost_rmb": str(row.nominal_unit_cost_rmb),
+        "safety_buffer": str(row.safety_buffer),
+        "effective_unit_cost_rmb": str(row.effective_unit_cost_rmb),
+        "actual_cost_rmb": str(row.actual_cost_rmb),
+        "effective_cost_rmb": str(row.effective_cost_rmb),
+        "gross_profit_rmb": str(row.gross_profit_rmb),
+        "gross_margin": str(row.gross_margin) if row.gross_margin is not None else None,
+        "successful_units": row.successful_units,
+        "failed_units": row.failed_units,
+        "settled_at": row.settled_at.isoformat() if row.settled_at else None,
+    }
+
+
+def _ledger_filters(
+    query,
+    user_id: Optional[str], request_id: Optional[str], provider_route: Optional[str],
+    category: Optional[str], min_margin: Optional[float], max_margin: Optional[float],
+    start: Optional[datetime], end: Optional[datetime],
+):
+    if user_id:
+        query = query.where(CostMarginLedger.user_id == user_id)
+    if request_id:
+        query = query.where(CostMarginLedger.request_id == request_id)
+    if provider_route:
+        query = query.where(CostMarginLedger.provider_route == provider_route)
+    if category:
+        query = query.where(CostMarginLedger.category == category)
+    if min_margin is not None:
+        query = query.where(CostMarginLedger.gross_margin >= Decimal(str(min_margin)))
+    if max_margin is not None:
+        query = query.where(CostMarginLedger.gross_margin <= Decimal(str(max_margin)))
+    if start:
+        query = query.where(CostMarginLedger.settled_at >= start)
+    if end:
+        query = query.where(CostMarginLedger.settled_at < end)
+    return query
+
+
+@router.get("/margin/ledger")
+async def list_margin_ledger(
+    user_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+    provider_route: Optional[str] = None,
+    category: Optional[str] = None,
+    min_margin: Optional[float] = None,
+    max_margin: Optional[float] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    _=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    def _parse_date(value: str) -> datetime:
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD")
+
+    start = _parse_date(start_date) if start_date else None
+    end = (_parse_date(end_date) + timedelta(days=1)) if end_date else None
+
+    base = select(CostMarginLedger)
+    base = _ledger_filters(base, user_id, request_id, provider_route, category,
+                           min_margin, max_margin, start, end)
+
+    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar()
+    page = max(1, page)
+    page_size = max(1, min(200, page_size))
+    rows = (await db.execute(
+        base.order_by(CostMarginLedger.settled_at.desc())
+        .offset((page - 1) * page_size).limit(page_size)
+    )).scalars().all()
+
+    user_ids = list({r.user_id for r in rows})
+    uname_map: dict[str, str] = {}
+    if user_ids:
+        ures = await db.execute(select(User.id, User.username).where(User.id.in_(user_ids)))
+        uname_map = {row.id: row.username for row in ures}
+
+    agg = _ledger_filters(
+        select(
+            func.coalesce(func.sum(CostMarginLedger.revenue_rmb), 0),
+            func.coalesce(func.sum(CostMarginLedger.promotional_value_rmb), 0),
+            func.coalesce(func.sum(CostMarginLedger.actual_cost_rmb), 0),
+            func.coalesce(func.sum(CostMarginLedger.gross_profit_rmb), 0),
+            func.coalesce(func.sum(CostMarginLedger.charged_credits), 0),
+            func.coalesce(func.sum(CostMarginLedger.successful_units), 0),
+        ), user_id, request_id, provider_route, category,
+        min_margin, max_margin, start, end,
+    )
+    revenue, promo, cost, profit, credits, units = (await db.execute(agg)).one()
+
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "records": [_ledger_row_dict(r, uname_map.get(r.user_id, "")) for r in rows],
+        "summary": {
+            "revenue_rmb": str(revenue),
+            "promotional_value_rmb": str(promo),
+            "actual_cost_rmb": str(cost),
+            "gross_profit_rmb": str(profit),
+            "gross_margin": str(
+                (profit / revenue).quantize(Decimal("0.0001"))
+            ) if revenue and revenue > 0 else None,
+            "charged_credits": credits,
+            "successful_units": units,
+        },
+    }
+
+
+# ── System Config（业务配置 K-V） ─────────────────────────────────
+
+@router.get("/system-config")
+async def get_system_config(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
+    configs = await config_service.all_configs(db)
+    stored = {c.key: {"value": c.value,
+                      "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+                      "updated_by": c.updated_by} for c in configs}
+    return {
+        "configs": [
+            {
+                "key": key,
+                "value": stored.get(key, {}).get("value", default),
+                "default": default,
+                "description": config_service.CONFIG_DESCRIPTIONS.get(key, ""),
+                "updated_at": stored.get(key, {}).get("updated_at"),
+                "updated_by": stored.get(key, {}).get("updated_by"),
+            }
+            for key, default in config_service.DEFAULTS.items()
+        ]
+    }
+
+
+class ConfigUpdateRequest(BaseModel):
+    key: str = Field(max_length=64)
+    value: str = Field(max_length=255)
+    reason: Optional[str] = Field(default=None, max_length=255)
+
+
+@router.put("/system-config")
+async def update_system_config(
+    req: ConfigUpdateRequest,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """修改业务配置（兑换率/试用/毛利参数）。值合法性校验 + 审计。"""
+    key = req.key.strip()
+    value = req.value.strip()
+    if key not in config_service.DEFAULTS:
+        raise HTTPException(status_code=400, detail=f"未知配置键: {key}")
+
+    # 严格校验（非法值 400，绝不静默吞掉）
+    from decimal import InvalidOperation
+    try:
+        if key in config_service.INT_KEYS:
+            if int(value) <= 0 and key in ("credits_per_cny", "legacy_usd_to_credits",
+                                            "trial_grant_credits", "trial_campaign_version"):
+                raise ValueError("必须为正整数")
+        elif key in config_service.DECIMAL_KEYS:
+            parsed = Decimal(value)
+            if not (Decimal("0") < parsed < Decimal("1")):
+                raise ValueError("必须为 0~1 之间的小数")
+        elif key in config_service.BOOL_KEYS:
+            if value.lower() not in ("true", "false"):
+                raise ValueError("必须为 true/false")
+    except (ValueError, InvalidOperation):
+        raise HTTPException(status_code=400, detail=f"配置值非法: {key}={value}")
+
+    await config_service.set_config(db, key, value, updated_by=admin.get("sub", "admin"))
+    await _record_audit(db, admin, "system_config_update", {
+        "key": key, "value": value, "reason": req.reason,
+    })
+    return {"ok": True, "key": key, "value": value}
+
+
+# ── Credits Migration（旧余额迁移，生产须 super_admin 确认） ──────
+
+class CreditsMigrationRequest(BaseModel):
+    action: str = Field(pattern="^(preview|apply)$")
+
+
+@router.post("/billing/credits-migration")
+async def run_credits_migration(
+    req: CreditsMigrationRequest,
+    admin: dict = Depends(get_super_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """旧美元余额 → CY 点数迁移（preview 只读 / apply 正式执行）。
+
+    生产环境部署后必须先 preview 核对报告（用户数/旧总余额/总点数/异常数），
+    无异常再 apply。幂等：已执行过则跳过。
+    """
+    if req.action == "preview":
+        return await credits_migration.preview_credits_migration(db)
+
+    if settings.APP_ENV == "production":
+        report = await credits_migration.preview_credits_migration(db)
+        if not report["applied"] and (
+            report["anomaly_count"] > 0
+            or report["converted_count"] != report["user_count"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "MIGRATION_ANOMALY", "message": "存在异常用户，禁止迁移",
+                        "report": report},
+            )
+
+    report = await credits_migration.apply_credits_migration(db)
+    await _record_audit(db, admin, "credits_migration_apply", {
+        "executed": report.get("executed"),
+        "migrated_count": report.get("migrated_count"),
+        "total_paid_credits": report.get("total_paid_credits"),
+        "total_trial_credits": report.get("total_trial_credits"),
+        "total_balance_usd": report.get("total_balance_usd"),
+    })
+    return report

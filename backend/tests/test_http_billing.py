@@ -46,7 +46,7 @@ async def test_authorize_settle_http_flow(client):
 
 
 async def test_quota_exhausted_error_shape(client):
-    """402 + QUOTA_EXHAUSTED + 固定文案「余额不足，请充值后继续使用」。"""
+    """402 + QUOTA_EXHAUSTED + 固定文案「点数不足，请充值后继续使用」。"""
     user = await make_user("h2", "0", "0")
     r = await client.post("/api/usage/authorize", json={
         "request_id": "http-req-0002", "image_count": 1,
@@ -54,7 +54,7 @@ async def test_quota_exhausted_error_shape(client):
     assert r.status_code == 402
     body = r.json()
     assert body["detail"]["code"] == "QUOTA_EXHAUSTED"
-    assert body["detail"]["message"] == "余额不足，请充值后继续使用"
+    assert body["detail"]["message"] == "点数不足，请充值后继续使用"
 
 
 async def test_settle_unknown_request_404(client):

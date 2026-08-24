@@ -75,23 +75,28 @@
         <div class="detail-stats">
           <div class="stat-card">
             <div class="stat-card-accent" style="background:linear-gradient(90deg,#00d4aa,#00d4aa00)"></div>
-            <div class="stat-card-label">现金余额</div>
-            <div class="stat-card-value">${{ fmt(detailUser.balance_usd, 4) }}</div>
+            <div class="stat-card-label">正式点数</div>
+            <div class="stat-card-value">{{ detailUser.paid_credits ?? 0 }}</div>
           </div>
           <div class="stat-card">
             <div class="stat-card-accent" style="background:linear-gradient(90deg,#f59e0b,#f59e0b00)"></div>
-            <div class="stat-card-label">试用额度</div>
-            <div class="stat-card-value">${{ fmt(detailUser.trial_credit_usd, 4) }}</div>
+            <div class="stat-card-label">试用点数</div>
+            <div class="stat-card-value">{{ detailUser.trial_credits ?? 0 }}</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-card-accent" style="background:linear-gradient(90deg,#6366f1,#6366f100)"></div>
+            <div class="stat-card-label">赠送点数</div>
+            <div class="stat-card-value">{{ detailUser.gift_credits ?? 0 }}</div>
           </div>
           <div class="stat-card">
             <div class="stat-card-accent" style="background:linear-gradient(90deg,#3b82f6,#3b82f600)"></div>
-            <div class="stat-card-label">累计充值</div>
-            <div class="stat-card-value">${{ fmt(detailUser.total_recharged_usd, 2) }}</div>
+            <div class="stat-card-label">累计充值（点）</div>
+            <div class="stat-card-value">{{ detailUser.total_recharged_credits ?? 0 }}</div>
           </div>
           <div class="stat-card">
             <div class="stat-card-accent" style="background:linear-gradient(90deg,#ec4899,#ec489900)"></div>
-            <div class="stat-card-label">累计消费</div>
-            <div class="stat-card-value">${{ fmt(detailUser.total_spent_usd, 4) }}</div>
+            <div class="stat-card-label">累计消费（点）</div>
+            <div class="stat-card-value">{{ detailUser.total_spent_credits ?? 0 }}</div>
           </div>
           <div class="stat-card">
             <div class="stat-card-accent" style="background:linear-gradient(90deg,#10b981,#10b98100)"></div>
@@ -150,26 +155,35 @@
     </n-modal>
 
     <!-- 调整余额 -->
-    <n-modal v-model:show="showBalance" preset="card" title="调整余额" style="width:520px">
+    <n-modal v-model:show="showBalance" preset="card" title="调整点数余额" style="width:520px">
       <template v-if="balanceForm">
         <n-alert type="info" :bordered="false" style="margin-bottom:16px">
-          直接设置目标值（非增减）。当前：现金余额 ${{ fmt(balanceForm.current_balance, 4) }}，
-          试用额度 ${{ fmt(balanceForm.current_trial, 4) }}。至少填写一项。
+          直接设置目标值（非增减）。当前：正式 {{ balanceForm.current_paid }} 点 /
+          试用 {{ balanceForm.current_trial }} 点 / 赠送 {{ balanceForm.current_gift }} 点。至少填写一项。
         </n-alert>
         <n-form label-placement="left" label-width="100">
-          <n-form-item label="现金余额 ($)">
+          <n-form-item label="正式点数">
             <n-input
-              v-model:value="balanceForm.balance_usd"
-              placeholder="留空则不修改，如 10.5"
+              v-model:value="balanceForm.paid_credits"
+              placeholder="留空则不修改，如 1000"
               :status="balanceError ? 'error' : undefined"
               style="font-family:var(--cy-font-mono)"
               clearable
             />
           </n-form-item>
-          <n-form-item label="试用额度 ($)">
+          <n-form-item label="试用点数">
             <n-input
-              v-model:value="balanceForm.trial_credit_usd"
-              placeholder="留空则不修改，如 0.14"
+              v-model:value="balanceForm.trial_credits"
+              placeholder="留空则不修改，如 500"
+              :status="balanceError ? 'error' : undefined"
+              style="font-family:var(--cy-font-mono)"
+              clearable
+            />
+          </n-form-item>
+          <n-form-item label="赠送点数">
+            <n-input
+              v-model:value="balanceForm.gift_credits"
+              placeholder="留空则不修改，如 200"
               :status="balanceError ? 'error' : undefined"
               style="font-family:var(--cy-font-mono)"
               clearable
@@ -283,14 +297,21 @@ const columns = [
   { title: '用户名', key: 'username', width: 130 },
   { title: '邮箱', key: 'email', width: 200, ellipsis: true },
   {
-    title: '余额', key: 'balance_usd', width: 110,
-    render: row => h('span', { style: 'font-family:var(--cy-font-mono);color:var(--cy-text)' },
-      `$${fmt(row.balance_usd, 2)}`),
+    title: '点数余额', key: 'total_credits', width: 110,
+    render: row => h('span', { style: 'font-family:var(--cy-font-mono);color:var(--cy-text);font-weight:600' },
+      `${row.total_credits ?? 0}`),
   },
   {
-    title: '试用额度', key: 'trial_credit_usd', width: 100,
-    render: row => h('span', { style: 'font-family:var(--cy-font-mono);color:var(--cy-warning)' },
-      `$${fmt(row.trial_credit_usd, 2)}`),
+    title: '正式', key: 'paid_credits', width: 80,
+    render: row => h('span', { style: 'font-family:var(--cy-font-mono)' }, `${row.paid_credits ?? 0}`),
+  },
+  {
+    title: '试用', key: 'trial_credits', width: 80,
+    render: row => h('span', { style: 'font-family:var(--cy-font-mono);color:var(--cy-warning)' }, `${row.trial_credits ?? 0}`),
+  },
+  {
+    title: '赠送', key: 'gift_credits', width: 80,
+    render: row => h('span', { style: 'font-family:var(--cy-font-mono);color:#6366f1' }, `${row.gift_credits ?? 0}`),
   },
   {
     title: '类型', key: 'account_type', width: 80,
@@ -324,12 +345,12 @@ const usageColumns = [
   { title: '类型', key: 'usage_type', width: 90 },
   { title: '图片数', key: 'image_count', width: 70 },
   {
-    title: '单价 ($)', key: 'unit_price', width: 90,
-    render: row => row.unit_price != null ? `$${fmt(row.unit_price, 4)}` : '-',
+    title: '单价（点）', key: 'unit_credits', width: 90,
+    render: row => row.unit_credits != null ? `${row.unit_credits}` : '-',
   },
   {
-    title: '费用 ($)', key: 'cost_usd', width: 100,
-    render: row => `$${fmt(row.cost_usd, 4)}`,
+    title: '费用（点）', key: 'cost_credits', width: 100,
+    render: row => `${row.cost_credits ?? 0}`,
   },
   { title: '时间', key: 'created_at', width: 160, render: row => formatTime(row.created_at) },
 ]
@@ -392,13 +413,14 @@ const balanceError = computed(() => {
   const check = (v, label) => {
     const raw = (v ?? '').trim()
     if (!raw) return null
-    if (!/^\d+(\.\d{1,6})?$/.test(raw)) return `${label}必须为非负数字，最多 6 位小数`
+    if (!/^\d+$/.test(raw)) return `${label}必须为非负整数（CY 点）`
     return null
   }
-  const cash = (f.balance_usd ?? '').trim()
-  const trial = (f.trial_credit_usd ?? '').trim()
-  if (!cash && !trial) return '请至少填写一项（现金余额或试用额度）'
-  return check(f.balance_usd, '现金余额') || check(f.trial_credit_usd, '试用额度')
+  const paid = (f.paid_credits ?? '').trim()
+  const trial = (f.trial_credits ?? '').trim()
+  const gift = (f.gift_credits ?? '').trim()
+  if (!paid && !trial && !gift) return '请至少填写一项（正式/试用/赠送点数）'
+  return check(f.paid_credits, '正式点数') || check(f.trial_credits, '试用点数') || check(f.gift_credits, '赠送点数')
 })
 
 function openBalance(row) {
@@ -406,10 +428,12 @@ function openBalance(row) {
   balanceForm.value = {
     userId: row.id,
     username: row.username,
-    current_balance: row.balance_usd,
-    current_trial: row.trial_credit_usd,
-    balance_usd: '',
-    trial_credit_usd: '',
+    current_paid: row.paid_credits ?? 0,
+    current_trial: row.trial_credits ?? 0,
+    current_gift: row.gift_credits ?? 0,
+    paid_credits: '',
+    trial_credits: '',
+    gift_credits: '',
     remark: '',
   }
   showBalance.value = true
@@ -419,13 +443,14 @@ async function submitBalance() {
   const f = balanceForm.value
   if (balanceError.value) { message.warning(balanceError.value); return }
   const body = { remark: f.remark || '' }
-  if ((f.balance_usd ?? '').trim()) body.balance_usd = f.balance_usd.trim()
-  if ((f.trial_credit_usd ?? '').trim()) body.trial_credit_usd = f.trial_credit_usd.trim()
+  if ((f.paid_credits ?? '').trim()) body.paid_credits = Number(f.paid_credits.trim())
+  if ((f.trial_credits ?? '').trim()) body.trial_credits = Number(f.trial_credits.trim())
+  if ((f.gift_credits ?? '').trim()) body.gift_credits = Number(f.gift_credits.trim())
 
   adjusting.value = true
   try {
     const { data } = await http.put(`/api/admin/users/${f.userId}/balance`, body)
-    message.success(`调整成功：现金余额 $${fmt(data.balance_usd, 2)}，试用额度 $${fmt(data.trial_credit_usd, 2)}`)
+    message.success(`调整成功：正式 ${data.paid_credits} 点，试用 ${data.trial_credits} 点，赠送 ${data.gift_credits} 点`)
     showBalance.value = false
     if (showDetail.value && detailUser.value && detailUser.value.id === f.userId) {
       await viewUser({ id: f.userId })

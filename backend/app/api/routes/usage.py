@@ -23,6 +23,9 @@ router = APIRouter()
 class AuthorizeRequest(BaseModel):
     request_id: str = Field(min_length=8, max_length=64)
     image_count: int = Field(gt=0, le=100)
+    # 报价冻结：携带 /api/billing/quote 返回的 quote_id 时按报价单价计费（参数不符则按当前价）
+    quote_id: Optional[str] = Field(default=None, max_length=36)
+    feature: str = Field(default="image", max_length=32)
 
 
 class SettleRequest(BaseModel):
@@ -35,7 +38,7 @@ class SettleRequest(BaseModel):
 def _quota_http_error(exc: billing.QuotaExhaustedError) -> HTTPException:
     return HTTPException(
         status_code=402,
-        detail={"code": "QUOTA_EXHAUSTED", "message": "余额不足，请充值后继续使用"},
+        detail={"code": "QUOTA_EXHAUSTED", "message": "点数不足，请充值后继续使用"},
     )
 
 
@@ -49,7 +52,10 @@ async def authorize_usage(
         raise HTTPException(status_code=403, detail="账号已被禁用")
 
     try:
-        txn, u = await billing.authorize_image2(db, user.id, req.request_id, req.image_count)
+        txn, u = await billing.authorize_image2(
+            db, user.id, req.request_id, req.image_count,
+            quote_id=req.quote_id, feature=req.feature,
+        )
     except billing.QuotaExhaustedError as exc:
         raise _quota_http_error(exc) from exc
     except billing.ModelDisabledError as exc:
@@ -274,6 +280,8 @@ async def get_usage_records(
                 "image_count": log.image_count,
                 "unit_price": str(log.unit_price) if log.unit_price is not None else None,
                 "cost_usd": log.cost_usd,
+                "unit_credits": log.unit_credits,
+                "cost_credits": log.cost_credits,
                 "request_id": log.request_id,
                 "created_at": log.created_at.isoformat() if log.created_at else None,
             }

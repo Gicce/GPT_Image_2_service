@@ -279,9 +279,10 @@ const columns = [
       : `$${Number(row.quota_usd).toFixed(2)} / 用 $${Number(row.used_usd || 0).toFixed(2)}`,
   },
   {
-    title: '默认', key: 'is_default', width: 70,
+    title: '默认路由', key: 'is_default', width: 100,
     render: row => row.is_default
-      ? h(NTag, { type: 'success', size: 'small', bordered: false }, { default: () => '默认' })
+      ? h(NTag, { type: 'success', size: 'small', bordered: false },
+          { default: () => row.is_trial ? '试用默认' : '正式默认' })
       : '-',
   },
   {

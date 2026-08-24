@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
-from sqlalchemy import String, DateTime, Boolean, Numeric, ForeignKey
+from sqlalchemy import String, DateTime, Boolean, Numeric, Integer, Text, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
@@ -23,6 +23,13 @@ class User(Base):
     # 统一余额：现金余额（充值/退款入账）与试用额度（注册赠送），均为 Decimal 精确金额
     balance_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, default=Decimal("0"))
     trial_credit_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, default=Decimal("0"))
+    # CY Credits（V4.2 起）：三类点数余额，1 点为原子单位，¥1 = credits_per_cny 点（system_config）
+    # 消费顺序 trial → gift → paid（集中在 billing.consume_credits）。
+    # balance_usd / trial_credit_usd 降级为兼容镜像：每次点数变动后按 legacy 兑换率回写，
+    # 供 V4.0.9 及更旧客户端展示，不再作为业务真相。
+    paid_credits: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    trial_credits: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    gift_credits: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     orders: Mapped[list["Order"]] = relationship("Order", back_populates="user")

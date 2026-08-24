@@ -21,19 +21,39 @@ async def get_account_entitlements(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """账户权益：统一现金余额 + 试用额度 + Image2 配置。"""
+    """账户权益：CY 点数余额（三类）+ Image2 配置 + 试用可用性。"""
+    from app.services import config_service
+    from app.services import pricing as pricing_service
+    from app.services import trial as trial_service
+
     if not user.is_active:
         raise HTTPException(status_code=403, detail="账号已被禁用")
 
     cfg = await billing.get_image2_config(db)
     price = billing.q6(billing.d(cfg.price_per_call)) if cfg and cfg.price_per_call is not None else None
-    balance = billing.q6(billing.d(user.balance_usd))
-    trial = billing.q6(billing.d(user.trial_credit_usd))
+
+    unit_credits = None
+    try:
+        unit_credits, _rule = await pricing_service.resolve_unit_credits(db)
+    except pricing_service.NoPriceError:
+        pass
+
+    trial_status = await trial_service.trial_status_for_user(db, user)
+    credits_per_cny = await config_service.get_credits_per_cny(db)
 
     return {
-        "balance_usd": str(balance),
-        "trial_credit_usd": str(trial),
-        "total_credit_usd": str(balance + trial),
+        # CY Credits（V4.2 起业务真相）
+        "paid_credits": user.paid_credits,
+        "trial_credits": user.trial_credits,
+        "gift_credits": user.gift_credits,
+        "total_credits": user.paid_credits + user.trial_credits + user.gift_credits,
+        "credits_per_cny": credits_per_cny,
+        "unit_credits": unit_credits,
+        "trial_available": trial_status["trial_available"],
+        # USD 兼容镜像（旧客户端）
+        "balance_usd": str(billing.q6(billing.d(user.balance_usd))),
+        "trial_credit_usd": str(billing.q6(billing.d(user.trial_credit_usd))),
+        "total_credit_usd": str(billing.q6(billing.d(user.balance_usd) + billing.d(user.trial_credit_usd))),
         "enabled_features": {"image": bool(cfg and cfg.is_enabled)},
         "enabled_models": ["gpt-image-2"] if cfg and cfg.is_enabled else [],
         "image2": {
@@ -105,9 +125,9 @@ async def get_runtime_config(
     else:
         image_token = settings.PACKYAPI_IMAGE_MASTER_TOKEN or settings.PACKYAPI_MASTER_TOKEN
 
-    balance = billing.d(user.balance_usd) + billing.d(user.trial_credit_usd)
+    total_credits = user.paid_credits + user.trial_credits + user.gift_credits
     enabled = bool(
-        cfg and cfg.is_enabled and image_token and user.is_active and balance > 0
+        cfg and cfg.is_enabled and image_token and user.is_active and total_credits > 0
     )
 
     image_config = {
@@ -156,6 +176,8 @@ async def get_usage(
             "usage_type": log.usage_type,
             "image_count": log.image_count,
             "cost_usd": str(log.cost_usd),
+            "cost_credits": log.cost_credits,
+            "unit_credits": log.unit_credits,
             "request_id": log.request_id,
             "created_at": log.created_at.isoformat(),
         }

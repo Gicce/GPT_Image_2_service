@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import wechatpay
@@ -78,6 +78,42 @@ def compute_usd_reversal(order: Order, refund_fen: int) -> Decimal:
     if total_fen <= 0:
         return Decimal("0")
     return q6(amount_usd * Decimal(refund_fen) / Decimal(total_fen))
+
+
+async def _order_total_credits(db: AsyncSession, order: Order) -> int:
+    """订单到账总点数（credits_granted 快照；旧订单按 USD × legacy 率折算）。"""
+    from app.services import config_service
+
+    if order.credits_granted is not None and order.credits_granted > 0:
+        return int(order.credits_granted)
+    legacy_rate = await config_service.get_legacy_usd_to_credits(db)
+    return int((d(order.amount_usd) * Decimal(legacy_rate)).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+async def compute_credits_reversal(db: AsyncSession, order: Order, refund_fen: int) -> int:
+    """退款分 → 点数冲正额（比例换算；全退用差额收口，累计不超总点数）。"""
+    from app.models.billing import BillingTransaction
+
+    total_fen = order_total_fen(order)
+    total_credits = await _order_total_credits(db, order)
+    result = await db.execute(
+        select(func.coalesce(func.sum(BillingTransaction.amount_credits), 0)).where(
+            BillingTransaction.related_order_id == order.id,
+            BillingTransaction.type == billing.RECHARGE_REFUND,
+        )
+    )
+    refunded_credits = int(result.scalar() or 0)
+    remaining_credits = max(0, total_credits - refunded_credits)
+
+    if refund_fen >= total_fen - order_refunded_fen(order):
+        return remaining_credits
+    if total_fen <= 0:
+        return 0
+    proportional = int(
+        (Decimal(total_credits) * Decimal(refund_fen) / Decimal(total_fen))
+        .to_integral_value(rounding=ROUND_HALF_UP)
+    )
+    return min(proportional, remaining_credits)
 
 
 async def get_open_request(db: AsyncSession, order_id: str) -> RefundRequest | None:
@@ -298,11 +334,12 @@ async def settle_refund_success(
         return req
 
     reversal_usd = compute_usd_reversal(order, refund_fen)
+    reversal_credits = await compute_credits_reversal(db, order, refund_fen)
 
-    user, txn, actual_usd = await billing.debit_balance_for_refund(
-        db, req.user_id, reversal_usd,
+    user, txn, actual_credits = await billing.debit_paid_credits_for_refund(
+        db, req.user_id, reversal_credits,
         related_order_id=order.id,
-        remark=f"wechat refund {order.out_trade_no} ({fen_to_cny(refund_fen)} CNY)",
+        remark=f"wechat refund {order.out_trade_no} ({fen_to_cny(refund_fen)} CNY, -{reversal_credits} credits)",
     )
 
     order.refunded_cny = fen_to_cny(order_refunded_fen(order) + refund_fen)
@@ -323,8 +360,8 @@ async def settle_refund_success(
 
     await db.flush()
     logger.info(
-        "refund settled: order=%s refund_fen=%d reversal_usd=%s status=%s",
-        order.out_trade_no, refund_fen, reversal_usd, order.status,
+        "refund settled: order=%s refund_fen=%d reversal_credits=%d reversal_usd=%s status=%s",
+        order.out_trade_no, refund_fen, reversal_credits, reversal_usd, order.status,
     )
     return req
 

@@ -220,7 +220,7 @@ async def test_10_trial_frozen_when_disabled():
         ))
         await db.commit()
         txn, _ = await billing.authorize_image2(db, user.id, "req-t10-0001", 1)
-        assert txn.billing_source == "CASH"
+        assert txn.billing_source == "PAID"
         await billing.settle_image2(db, user.id, "req-t10-0001", True)
         await db.commit()
 

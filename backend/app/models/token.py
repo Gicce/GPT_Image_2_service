@@ -158,7 +158,9 @@ class Order(Base):
     refunded_cny: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=Decimal("0"), server_default=text("0"))
     refunded_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, default=Decimal("0"), server_default=text("0"))
     items_json: Mapped[str] = mapped_column(Text, nullable=True)
-    pay_type: Mapped[str] = mapped_column(String(16), nullable=True)
+    # V4.2 起：本单到账 CY 点数快照（退款冲正按本快照比例换算）；旧订单为 NULL
+    credits_granted: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pay_type: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="pending")
     out_refund_no: Mapped[str] = mapped_column(String(64), nullable=True)
     token_id: Mapped[str] = mapped_column(String(36), nullable=True)
@@ -240,6 +242,10 @@ class UsageLog(Base):
     # 结算时点的单价快照（per_call 模型）
     unit_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 6), nullable=True)
     cost_usd: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False)
+    # CY Credits（V4.2 起）：cost_usd 降级为兼容镜像（= cost_credits / legacy 兑换率），
+    # 供旧统计与 Token 配额聚合继续工作；业务真相通篇以点数为准
+    unit_credits: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cost_credits: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

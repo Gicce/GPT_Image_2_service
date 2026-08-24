@@ -44,20 +44,31 @@ def should_use_dev_payment() -> bool:
 
 
 async def _get_exchange_rate() -> float:
+    rate, _source, _at = await _get_exchange_rate_meta()
+    return rate
+
+
+async def _get_exchange_rate_meta() -> tuple[float, str, str]:
+    """汇率 + 来源语义（供 UI 按 §26 规则标注：实时 API + 1h 缓存 = 参考汇率·每小时更新）。"""
+    from datetime import datetime, timezone as _tz
+
     redis = get_redis()
     cached = await redis.get("exchange_rate_usd_cny")
+    cached_at = await redis.get("exchange_rate_usd_cny_at")
     if cached:
-        return float(cached)
+        return float(cached), "realtime_cached", cached_at or ""
     try:
         import httpx
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(settings.EXCHANGE_RATE_API)
             data = resp.json()
             rate = float(data["rates"]["CNY"])
+            now_iso = datetime.now(_tz.utc).isoformat()
             await redis.setex("exchange_rate_usd_cny", 3600, str(rate))
-            return rate
+            await redis.setex("exchange_rate_usd_cny_at", 3600, now_iso)
+            return rate, "realtime_fresh", now_iso
     except Exception:
-        return 7.25
+        return 7.25, "fallback_fixed", ""
 
 
 async def _validate_amount(total_usd: float) -> tuple[float, float]:
@@ -102,21 +113,83 @@ async def create_order(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """创建余额充值订单（单一计费主体，无分组概念）。
+    """创建余额充值订单（USD 兼容入口，V4.2 起到账 CY 点数）。
 
-    币种语义：amount_usd = 到账 USD 余额；amount_cny = 微信实付人民币（分）。
-    兑换按下单时汇率快照，订单保存汇率，到账金额以下单快照为准。
+    币种语义：amount_usd = 旧客户端提交的到账 USD 金额（兼容窗口保留）；
+    实际到账点数 = round(amount_usd × legacy_usd_to_credits)，微信按实时汇率付人民币。
+    V4.2+ 客户端应使用 /create_order_cny（人民币直购）。
     """
     amount_usd = _resolve_amount_usd(req)
     amount_cny, rate = await _validate_amount(amount_usd)
 
+    from app.services import config_service
+    legacy_rate = await config_service.get_legacy_usd_to_credits(db)
+    credits = int(Decimal(str(amount_usd)) * Decimal(legacy_rate))
+
+    return await _create_recharge_order(
+        db, user,
+        amount_cny=amount_cny,
+        amount_usd=Decimal(str(amount_usd)),
+        exchange_rate=rate,
+        credits=credits,
+    )
+
+
+class CreateOrderCnyRequest(BaseModel):
+    """人民币直购（V4.2 标准入口）：¥N → N × credits_per_cny 点。"""
+    amount_cny: float = Field(gt=0)
+
+
+@router.post("/create_order_cny")
+async def create_order_cny(
+    req: CreateOrderCnyRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services import config_service
+    credits_per_cny = await config_service.get_credits_per_cny(db)
+    min_cny = await config_service.get_config_int(db, "recharge_min_cny")
+    max_cny = await config_service.get_config_int(db, "recharge_max_cny")
+
+    amount_cny = round(float(req.amount_cny), 2)
+    if amount_cny < min_cny or amount_cny > max_cny:
+        raise HTTPException(
+            status_code=400,
+            detail=f"充值金额需在 ¥{min_cny} ~ ¥{max_cny} 之间",
+        )
+
+    credits = int(Decimal(str(amount_cny)) * Decimal(max(1, credits_per_cny)))
+    rate, _src, _at = await _get_exchange_rate_meta()
+    legacy_rate = await config_service.get_legacy_usd_to_credits(db)
+    # USD 镜像 = 点数按固定 peg 反推（订单展示/旧客户端兼容；不参与计费）
+    amount_usd = (Decimal(credits) / Decimal(legacy_rate)).quantize(Decimal("0.01"))
+
+    return await _create_recharge_order(
+        db, user,
+        amount_cny=amount_cny,
+        amount_usd=amount_usd,
+        exchange_rate=rate,
+        credits=credits,
+    )
+
+
+async def _create_recharge_order(
+    db: AsyncSession,
+    user: User,
+    *,
+    amount_cny: float,
+    amount_usd: Decimal,
+    exchange_rate: float,
+    credits: int,
+):
+    """下单公共实现：订单快照 + 微信 Native code_url。"""
     # 服务端防连击：10 秒内同用户已创建同金额待支付订单则拒绝（前端 loading 防抖的兜底；
     # 不同金额视为用户主动改单，放行）
     recent = await db.execute(
         select(Order.id).where(
             Order.user_id == user.id,
             Order.status == OrderStatus.PENDING,
-            Order.amount_usd == Decimal(str(amount_usd)),
+            Order.amount_cny == Decimal(str(amount_cny)),
             Order.created_at > datetime.now(timezone.utc) - timedelta(seconds=10),
         ).limit(1)
     )
@@ -128,9 +201,10 @@ async def create_order(
     order = Order(
         user_id=user.id,
         out_trade_no=out_trade_no,
-        amount_usd=Decimal(str(amount_usd)),
+        amount_usd=amount_usd,
         amount_cny=Decimal(str(amount_cny)),
-        exchange_rate=Decimal(str(rate)),
+        exchange_rate=Decimal(str(exchange_rate)),
+        credits_granted=credits,
         pay_type="wxpay",
         status="pending",
     )
@@ -160,7 +234,7 @@ async def create_order(
                 data={
                     "appid": settings.WECHAT_APPID,
                     "mchid": settings.WECHAT_MCHID,
-                    "description": "CyImagePro 余额充值",
+                    "description": "CyImagePro 点数充值",
                     "out_trade_no": out_trade_no,
                     "notify_url": settings.WECHAT_NOTIFY_URL,
                     "amount": {"total": int(round(amount_cny * 100)), "currency": "CNY"},
@@ -181,9 +255,10 @@ async def create_order(
     response = {
         "out_trade_no": out_trade_no,
         "code_url": code_url,
-        "amount_usd": amount_usd,
+        "amount_usd": float(amount_usd),
         "amount_cny": amount_cny,
-        "exchange_rate": rate,
+        "credits_granted": credits,
+        "exchange_rate": exchange_rate,
         "status": "pending",
     }
 
@@ -562,6 +637,7 @@ async def list_user_orders(
             "out_trade_no": o.out_trade_no,
             "amount_usd": float(o.amount_usd),
             "amount_cny": float(o.amount_cny),
+            "credits_granted": o.credits_granted,
             "exchange_rate": float(o.exchange_rate) if o.exchange_rate else None,
             "refunded_cny": float(o.refunded_cny),
             "status": o.status,
@@ -576,21 +652,43 @@ async def list_user_orders(
 
 @router.get("/packages")
 async def get_packages(db: AsyncSession = Depends(get_db)):
-    """充值信息：单一余额充值 + 汇率 + 限额。"""
-    rate = await _get_exchange_rate()
+    """充值信息：点数兑换 + 汇率（含来源语义）+ 限额。"""
+    from app.services import config_service
+    from app.services import pricing as pricing_service
+
+    rate, rate_source, rate_updated_at = await _get_exchange_rate_meta()
     cfg = await billing.get_image2_config(db)
     price = billing.q6(billing.d(cfg.price_per_call)) if cfg and cfg.price_per_call is not None else None
+
+    credits_per_cny = await config_service.get_credits_per_cny(db)
+    min_cny = await config_service.get_config_int(db, "recharge_min_cny")
+    max_cny = await config_service.get_config_int(db, "recharge_max_cny")
+
+    unit_credits = None
+    try:
+        unit_credits, _rule = await pricing_service.resolve_unit_credits(db)
+    except pricing_service.NoPriceError:
+        pass
+
+    # 汇率来源语义（UI 文案规则）：realtime_* → 参考汇率·每小时更新；fallback_fixed → 结算汇率
     return {
         "exchange_rate": rate,
-        "currency": "USD",
+        "exchange_rate_source": rate_source,
+        "exchange_rate_updated_at": rate_updated_at or None,
+        "currency": "CNY",
+        "credits_per_cny": credits_per_cny,
+        "unit_credits": unit_credits,
         "model": {
             "name": "gpt-image-2",
             "display_name": "Image2",
             "price_per_call_usd": str(price) if price else None,
         },
+        "presets_cny": [10, 20, 50, 100],
         "limits": {
             "min_total_usd": settings.PAYMENT_MIN_TOTAL_USD,
             "max_total_usd": settings.PAYMENT_MAX_TOTAL_USD,
+            "min_cny": min_cny,
+            "max_cny": max_cny,
         },
     }
 
@@ -655,9 +753,12 @@ async def dev_mark_paid(
         "user_id": order.user_id,
         "amount_usd": float(order.amount_usd),
         "amount_cny": float(order.amount_cny),
+        "credits_granted": order.credits_granted,
         "paid_at": order.paid_at.isoformat() if order.paid_at else None,
         "balance_usd": str(billing.q6(billing.d(u.balance_usd))) if u else None,
         "trial_credit_usd": str(billing.q6(billing.d(u.trial_credit_usd))) if u else None,
+        "paid_credits": u.paid_credits if u else None,
+        "total_credits": (u.paid_credits + u.trial_credits + u.gift_credits) if u else None,
     }
     if assignment_result:
         response["assignment"] = assignment_result

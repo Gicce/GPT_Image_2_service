@@ -33,7 +33,8 @@
             {{ statusLabel[detailOrder.status] || detailOrder.status }}
           </n-tag>
         </n-descriptions-item>
-        <n-descriptions-item label="到账金额(USD)">${{ Number(detailOrder.amount_usd).toFixed(2) }}</n-descriptions-item>
+        <n-descriptions-item label="到账点数">{{ detailOrder.credits_granted ?? '（历史订单）' }}</n-descriptions-item>
+        <n-descriptions-item label="到账金额(USD·旧口径)">${{ Number(detailOrder.amount_usd).toFixed(2) }}</n-descriptions-item>
         <n-descriptions-item label="付款金额(CNY)">¥{{ Number(detailOrder.amount_cny).toFixed(2) }}</n-descriptions-item>
         <n-descriptions-item label="汇率">{{ detailOrder.exchange_rate ?? '-' }}</n-descriptions-item>
         <n-descriptions-item label="已退款">¥{{ Number(detailOrder.refunded_cny || 0).toFixed(2) }}</n-descriptions-item>
@@ -297,7 +298,8 @@ const columns = [
   { title: '付款 / 到账', key: 'amount', width: 150,
     render: row => h('div', { style: 'line-height:1.4' }, [
       h('div', { style: 'font-weight:600' }, `¥${Number(row.amount_cny).toFixed(2)}`),
-      h('div', { style: 'color:var(--cy-text-muted);font-size:12px' }, `$${Number(row.amount_usd).toFixed(2)}`),
+      h('div', { style: 'color:var(--cy-text-muted);font-size:12px' },
+        row.credits_granted != null ? `${row.credits_granted} 点` : `$${Number(row.amount_usd).toFixed(2)}`),
     ]) },
   { title: '已退款', key: 'refunded_cny', width: 90,
     render: row => Number(row.refunded_cny) > 0

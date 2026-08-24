@@ -187,12 +187,14 @@ const menuOptions = computed(() => {
   const options = [
     { label: '概览', key: 'dashboard', icon: makeIcon('dashboard') },
     { label: 'Image2 配置', key: 'models', icon: makeIcon('models') },
+    { label: '定价规则', key: 'pricing', icon: makeIcon('models') },
     { label: 'Token 库存', key: 'tokens', icon: makeIcon('tokens') },
     { label: '客户账户', key: 'users', icon: makeIcon('users') },
     { label: '账务流水', key: 'transactions', icon: makeIcon('transactions') },
+    { label: '成本与毛利', key: 'margin', icon: makeIcon('transactions') },
     { label: '交易订单', key: 'orders', icon: makeIcon('orders') },
     { label: '运营通知', key: 'notice', icon: makeIcon('notice') },
-    { label: '在线客户端', key: 'online-devices', icon: makeIcon('online-devices') },
+    { label: '客户端设备', key: 'online-devices', icon: makeIcon('online-devices') },
     { label: '系统配置', key: 'settings', icon: makeIcon('settings') },
   ]
   if (isSuperAdmin.value) {

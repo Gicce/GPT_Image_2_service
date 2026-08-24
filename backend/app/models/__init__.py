@@ -5,11 +5,15 @@ from app.models.token import (
     Order, UsageLog, OrderStatus, RefundRequest, RefundRequestStatus,
 )
 from app.models.content import Notice, AIModel
-from app.models.billing import BillingTransaction
+from app.models.billing import BillingTransaction, PricingRule, CostMarginLedger
 from app.models.audit import AdminAuditLog
+from app.models.config import SystemConfig
+from app.models.trial import TrialClaim
+from app.models.device import ClientDevice
 
 __all__ = [
     "User", "AdminUser", "TokenInventory", "TokenAssignmentLog", "RuntimeTokenAssignment",
     "Order", "UsageLog", "OrderStatus", "RefundRequest", "RefundRequestStatus",
     "Notice", "AIModel", "BillingTransaction", "AdminAuditLog",
+    "PricingRule", "CostMarginLedger", "SystemConfig", "TrialClaim", "ClientDevice",
 ]
