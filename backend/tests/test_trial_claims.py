@@ -257,3 +257,22 @@ async def test_register_trial_writes_claim_and_legacy_upgrade(client):
     # 旧客户端入口：该账号已领 → 明确拒绝
     r3 = await client.post("/api/auth/upgrade-trial", headers={"Authorization": f"Bearer {token}"})
     assert r3.status_code == 400
+
+
+async def test_register_email_case_cannot_create_duplicate_account(client):
+    """plain /register 邮箱规范化：大小写变体不可重复注册（与 claim ledger 同口径）。"""
+    r1 = await client.post("/api/auth/register", json={
+        "username": "tc9a", "email": "Norm.Case@example.com", "password": "Passw0rd!123",
+    })
+    assert r1.status_code == 200
+
+    r2 = await client.post("/api/auth/register", json={
+        "username": "tc9b", "email": "  norm.case@EXAMPLE.com ", "password": "Passw0rd!123",
+    })
+    assert r2.status_code == 400  # 规范化后同邮箱 → 拒绝
+
+    from sqlalchemy import text as sql_text
+    async with AsyncSessionLocal() as db:
+        stored = (await db.execute(sql_text(
+            "SELECT email FROM users WHERE username = 'tc9a'"))).scalar_one()
+        assert stored == "norm.case@example.com"  # 落库即小写规范形

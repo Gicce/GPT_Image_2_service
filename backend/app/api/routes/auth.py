@@ -214,8 +214,12 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if req.account_type not in ("trial", "normal"):
         raise HTTPException(status_code=400, detail="account_type 必须为 trial 或 normal")
 
+    # 邮箱规范化（trim + lowercase，与 register/verify 一致）：
+    # 保证唯一性与 trial claim 的 normalized_email 同口径，大小写变体不可绕过
+    email = req.email.strip().lower()
+
     existing = await db.execute(
-        select(User).where((User.username == req.username) | (User.email == req.email))
+        select(User).where((User.username == req.username) | (User.email == email))
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="用户名或邮箱已存在")
@@ -224,7 +228,7 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     user = User(
         id=str(uuid.uuid4()),
         username=req.username,
-        email=req.email,
+        email=email,
         password_hash=hash_password(req.password),
         account_type="normal",
     )
