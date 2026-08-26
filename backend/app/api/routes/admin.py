@@ -649,6 +649,11 @@ async def update_user(user_id: str, req: UserUpdate, admin: dict = Depends(get_a
     if not u:
         raise HTTPException(status_code=404, detail="用户不存在")
     changed = {k: v for k, v in req.model_dump(exclude_none=True).items()}
+    if u.archived_at is not None and changed.get("is_active") is True:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "USER_ARCHIVED", "message": "已归档账户不能重新启用"},
+        )
     for k, v in changed.items():
         setattr(u, k, v)
     if changed:
@@ -669,9 +674,14 @@ async def admin_assign_runtime_token(
     db: AsyncSession = Depends(get_db),
 ):
     """管理员为用户分配或更换 Image2 Runtime Token（事务内完成，写分配历史 + 审计）。"""
-    exists = await db.execute(select(User.id).where(User.id == user_id))
-    if not exists.scalar_one_or_none():
+    user = await db.get(User, user_id)
+    if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
+    if user.archived_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "USER_ARCHIVED", "message": "已归档账户不能绑定 Runtime Token"},
+        )
 
     try:
         token, released = await rt.assign_runtime_token(

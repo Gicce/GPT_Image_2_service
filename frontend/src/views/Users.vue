@@ -64,7 +64,7 @@
             </div>
           </template>
           <p v-else class="runtime-token-empty">尚未分配 Image2 Runtime Token（生成时回落使用服务端 Master Token）</p>
-          <n-space size="small">
+          <n-space v-if="!detailUser.archived_at" size="small">
             <n-button size="small" type="primary" secondary :loading="assignSubmitting" @click="openAssignToken">
               {{ detailUser.runtime_token ? '更换 Token' : '分配 Token' }}
             </n-button>

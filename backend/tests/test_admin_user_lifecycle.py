@@ -121,6 +121,18 @@ async def test_account_with_business_history_is_blocked_then_archived(client):
     login = await client.post("/api/auth/login", json={"username": user.username, "password": "x"})
     assert login.status_code == 403
 
+    reactivate = await client.put(
+        f"/api/admin/users/{user.id}", json={"is_active": True}, headers=ADMIN,
+    )
+    assert reactivate.status_code == 409
+    assert reactivate.json()["detail"]["code"] == "USER_ARCHIVED"
+
+    reassign = await client.post(
+        f"/api/admin/users/{user.id}/runtime-token/assign", json={}, headers=ADMIN,
+    )
+    assert reassign.status_code == 409
+    assert reassign.json()["detail"]["code"] == "USER_ARCHIVED"
+
 
 async def test_dashboard_uses_successful_recharge_credits(client):
     user = await make_user("dashboard-credits")
