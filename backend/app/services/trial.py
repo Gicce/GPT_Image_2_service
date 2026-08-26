@@ -25,8 +25,6 @@ from app.services import runtime_token as rt
 
 logger = logging.getLogger(__name__)
 
-TRIAL_VALID_DAYS = 2
-
 REASON_OK = "ok"
 REASON_DISABLED = "trial_disabled"                    # 试用通道总开关关闭
 REASON_NO_TOKEN = "trial_token_unavailable"           # 无有效试用默认 Token
@@ -67,6 +65,7 @@ async def trial_status_for_user(db: AsyncSession, user: User) -> dict:
     availability = await trial_availability(db)
     claim = await get_claim_by_email(db, user.email)
     grant = await config_service.get_config_int(db, "trial_grant_credits")
+    valid_days = await config_service.get_config_int(db, "trial_valid_days")
     campaign = await config_service.get_config_int(db, "trial_campaign_version")
 
     trial_available = availability["available"] and claim is None
@@ -80,6 +79,7 @@ async def trial_status_for_user(db: AsyncSession, user: User) -> dict:
         "already_claimed": claim is not None,
         "claimed_at": claim.claimed_at.isoformat() if claim is not None else None,
         "grant_credits": grant,
+        "valid_days": valid_days,
         "campaign_version": campaign,
     }
 
@@ -136,18 +136,20 @@ async def claim_trial_for_user(db: AsyncSession, user: User) -> dict:
         raise TrialClaimError(REASON_ALREADY_CLAIMED, "该邮箱已领取过新用户试用")
 
     grant = await config_service.get_config_int(db, "trial_grant_credits")
+    valid_days = await config_service.get_config_int(db, "trial_valid_days")
     token = await rt.resolve_default_token(db, is_trial=True)
 
     claim = await record_trial_claim(db, user, grant, source="account_claim")
     await rt.bind_token_to_user(db, user.id, token, source="register_trial")
     user.account_type = "trial"
-    user.trial_expires_at = datetime.now(timezone.utc) + timedelta(days=TRIAL_VALID_DAYS)
+    user.trial_expires_at = datetime.now(timezone.utc) + timedelta(days=valid_days)
     await billing.grant_trial_credits(db, user, grant)
 
     logger.info("trial claimed user=%s email=%s grant=%dcr", user.id, claim.normalized_email, grant)
     return {
         "granted": True,
         "grant_credits": grant,
+        "valid_days": valid_days,
         "claim_id": claim.id,
         "campaign_version": claim.campaign_version,
     }

@@ -394,7 +394,7 @@ GET /api/tokens/stock
 
 > 按 token_type 和 package_usd 分组，值为可用数量。
 
-### 5.2 查询试用库存
+### 5.2 查询试用策略与可用性
 
 ```
 GET /api/tokens/trial-stock
@@ -403,12 +403,16 @@ GET /api/tokens/trial-stock
 **响应：**
 ```json
 {
-  "remaining": 10,
-  "available": true
+  "remaining": 1,
+  "available": true,
+  "reason": "ok",
+  "grant_credits": 500,
+  "valid_days": 2,
+  "campaign_version": 1
 }
 ```
 
-> 试用 Token 只有 image 类型。`available=false` 时注册试用账号会失败。
+> `remaining` 仅为旧客户端兼容字段：共享 Token 模式下可用时为 1，否则为 0，并不代表真实剩余名额。新客户端使用 `available`、`grant_credits` 与 `valid_days` 展示试用政策。试用开关关闭或默认试用 Token 不可用时，`available=false`。
 
 ---
 

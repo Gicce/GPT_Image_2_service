@@ -125,7 +125,7 @@ const categoryDescriptions = {
 }
 const businessGroupMeta = [
   { key: 'credits', title: '点数与兑换', description: 'CY 点数兑换及历史余额迁移口径', keys: ['credits_per_cny', 'legacy_usd_to_credits'] },
-  { key: 'trial', title: '试用策略', description: '新用户试用开关、额度与活动版本', keys: ['trial_feature_enabled', 'trial_grant_credits', 'trial_campaign_version'] },
+  { key: 'trial', title: '试用策略', description: '新用户试用开关、赠送点数、有效天数与活动版本', keys: ['trial_feature_enabled', 'trial_grant_credits', 'trial_valid_days', 'trial_campaign_version'] },
   { key: 'margin', title: '成本与毛利', description: '定价保护线和采购成本安全垫', keys: ['target_margin', 'cost_safety_buffer'] },
   { key: 'recharge', title: '充值范围', description: '单笔人民币充值上下限', keys: ['recharge_min_cny', 'recharge_max_cny'] },
 ]

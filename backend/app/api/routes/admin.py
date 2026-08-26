@@ -5,7 +5,7 @@ import re
 import uuid
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -529,8 +529,17 @@ class UserUpdate(BaseModel):
 
 
 @router.get("/users")
-async def list_users(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).order_by(User.created_at.desc()).limit(200))
+async def list_users(
+    archive_scope: Literal["current", "archived", "all"] = "current",
+    _=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(User)
+    if archive_scope == "current":
+        query = query.where(User.archived_at.is_(None))
+    elif archive_scope == "archived":
+        query = query.where(User.archived_at.is_not(None))
+    result = await db.execute(query.order_by(User.created_at.desc()).limit(200))
     users = result.scalars().all()
     return [
         {
@@ -1375,7 +1384,9 @@ async def get_stats(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db
     now = datetime.now(timezone.utc)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    users_total = (await db.execute(select(func.count()).select_from(User))).scalar()
+    users_total = (await db.execute(
+        select(func.count()).select_from(User).where(User.archived_at.is_(None))
+    )).scalar()
     orders_paid = (await db.execute(
         select(func.count()).select_from(Order).where(Order.paid_at != None)
     )).scalar()
@@ -2104,7 +2115,8 @@ async def update_system_config(
     try:
         if key in config_service.INT_KEYS:
             if int(value) <= 0 and key in ("credits_per_cny", "legacy_usd_to_credits",
-                                            "trial_grant_credits", "trial_campaign_version"):
+                                            "trial_grant_credits", "trial_valid_days",
+                                            "trial_campaign_version"):
                 raise ValueError("必须为正整数")
         elif key in config_service.DECIMAL_KEYS:
             parsed = Decimal(value)

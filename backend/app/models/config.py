@@ -18,6 +18,7 @@ class SystemConfig(Base):
       legacy_usd_to_credits    旧美元余额→点数迁移兑换率（默认 700）+ 兼容镜像回写率
       trial_feature_enabled    试用通道总开关
       trial_grant_credits      试用赠送点数（默认 500）
+      trial_valid_days         试用账号有效天数（默认 2）
       trial_campaign_version   试用活动版本号
       target_margin            目标毛利率（默认 0.70）
       cost_safety_buffer       成本安全垫（默认 0.10）

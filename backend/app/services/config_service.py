@@ -19,6 +19,7 @@ DEFAULTS = {
     "legacy_usd_to_credits": "700",    # 旧美元余额→点数迁移率；同时是 USD 兼容镜像回写率
     "trial_feature_enabled": "true",
     "trial_grant_credits": "500",
+    "trial_valid_days": "2",
     "trial_campaign_version": "1",
     "target_margin": "0.70",
     "cost_safety_buffer": "0.10",
@@ -28,7 +29,7 @@ DEFAULTS = {
 
 INT_KEYS = {
     "credits_per_cny", "legacy_usd_to_credits", "trial_grant_credits",
-    "trial_campaign_version", "recharge_min_cny", "recharge_max_cny",
+    "trial_valid_days", "trial_campaign_version", "recharge_min_cny", "recharge_max_cny",
 }
 DECIMAL_KEYS = {"target_margin", "cost_safety_buffer"}
 BOOL_KEYS = {"trial_feature_enabled"}
@@ -38,6 +39,7 @@ CONFIG_DESCRIPTIONS = {
     "legacy_usd_to_credits": "旧美元余额→点数迁移兑换率（$1 = N 点）",
     "trial_feature_enabled": "新用户试用通道总开关",
     "trial_grant_credits": "试用赠送 CY 点数",
+    "trial_valid_days": "试用账号有效天数",
     "trial_campaign_version": "试用活动版本号",
     "target_margin": "目标毛利率（Price Guard 底线）",
     "cost_safety_buffer": "采购成本安全垫（成本 × (1+N) 参与毛利底线）",

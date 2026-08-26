@@ -152,6 +152,37 @@ async def test_dashboard_uses_successful_recharge_credits(client):
     assert "token_stats" in response.json()  # 旧调用方兼容字段仍保留
 
 
+async def test_user_archive_scopes_and_dashboard_customer_count(client):
+    current = await make_user("scope-current")
+    disabled = await make_user("scope-disabled")
+    archived = await make_user("scope-archived")
+    async with AsyncSessionLocal() as db:
+        await db.execute(text(
+            "UPDATE users SET is_active=false WHERE id=:id"
+        ), {"id": disabled.id})
+        await db.execute(text(
+            "UPDATE users SET is_active=false, archived_at=now(), archived_by='admin' WHERE id=:id"
+        ), {"id": archived.id})
+        await db.commit()
+
+    default_rows = (await client.get("/api/admin/users", headers=ADMIN)).json()
+    assert {row["id"] for row in default_rows} == {current.id, disabled.id}
+
+    archived_rows = (await client.get(
+        "/api/admin/users?archive_scope=archived", headers=ADMIN,
+    )).json()
+    assert [row["id"] for row in archived_rows] == [archived.id]
+
+    all_rows = (await client.get(
+        "/api/admin/users?archive_scope=all", headers=ADMIN,
+    )).json()
+    assert {row["id"] for row in all_rows} == {current.id, disabled.id, archived.id}
+
+    stats = await client.get("/api/admin/stats", headers=ADMIN)
+    assert stats.status_code == 200
+    assert stats.json()["users_total"] == 2
+
+
 async def test_login_logs_are_filterable_and_super_admin_only(client):
     normal_id = str(uuid.uuid4())
     async with AsyncSessionLocal() as db:

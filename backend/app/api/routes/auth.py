@@ -66,22 +66,26 @@ class RegisterVerifyRequest(BaseModel):
     account_type: str = "normal"
 
 
-async def _grant_trial(db: AsyncSession, user: User, days: int) -> tuple[bool, str]:
+async def _grant_trial(db: AsyncSession, user: User) -> tuple[bool, str]:
     """发放试用：绑定默认试用 Token + 写 claim 记录 + 发放试用点数。不 commit。
 
     返回 (granted, reason)：
       reason="ok"                 发放成功
       reason="already_claimed"    该邮箱已领取过（注册流静默降级为普通账号）
-      reason="unavailable"        试用通道未开放（无有效默认试用 Token）
+      reason="trial_disabled"     试用活动已关闭
+      reason="trial_token_unavailable" 无有效默认试用 Token
     """
     from app.services import config_service
     from app.services import trial as trial_service
 
+    availability = await trial_service.trial_availability(db)
+    if not availability["available"]:
+        return False, availability["reason"]
+
     trial_token = await rt.resolve_default_token(db, is_trial=True)
-    if trial_token is None:
-        return False, "unavailable"
 
     grant = await config_service.get_config_int(db, "trial_grant_credits")
+    valid_days = await config_service.get_config_int(db, "trial_valid_days")
     try:
         await trial_service.record_trial_claim(db, user, grant, source="register_trial")
     except trial_service.TrialClaimError:
@@ -90,7 +94,7 @@ async def _grant_trial(db: AsyncSession, user: User, days: int) -> tuple[bool, s
     now = datetime.now(timezone.utc)
     await rt.bind_token_to_user(db, user.id, trial_token, source="register_trial")
     user.account_type = "trial"
-    user.trial_expires_at = now + timedelta(days=days)
+    user.trial_expires_at = now + timedelta(days=valid_days)
     await billing.grant_trial_credits(db, user, grant)
     return True, "ok"
 
@@ -191,9 +195,10 @@ async def register_verify(req: RegisterVerifyRequest, db: AsyncSession = Depends
     await db.flush()
 
     if req.account_type == "trial":
-        granted, reason = await _grant_trial(db, user, days=2)
-        if not granted and reason == "unavailable":
-            raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
+        granted, reason = await _grant_trial(db, user)
+        if not granted and reason != "already_claimed":
+            message = "试用活动未开启" if reason == "trial_disabled" else "试用通道暂不可用，请直接购买套餐"
+            raise HTTPException(status_code=400, detail=message)
         # already_claimed：该邮箱已领过试用，静默注册为普通账号（claim 一次性规则优先）
 
     await db.flush()
@@ -236,9 +241,10 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     await db.flush()
 
     if req.account_type == "trial":
-        granted, reason = await _grant_trial(db, user, days=2)
-        if not granted and reason == "unavailable":
-            raise HTTPException(status_code=400, detail="试用名额已满，请直接购买套餐")
+        granted, reason = await _grant_trial(db, user)
+        if not granted and reason != "already_claimed":
+            message = "试用活动未开启" if reason == "trial_disabled" else "试用通道暂不可用，请直接购买套餐"
+            raise HTTPException(status_code=400, detail=message)
         # already_claimed：该邮箱已领过试用，静默注册为普通账号（claim 一次性规则优先）
 
     await db.flush()

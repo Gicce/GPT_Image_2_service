@@ -7,9 +7,14 @@
       </div>
     </div>
 
+    <n-tabs v-model:value="accountTab" type="line" animated @update:value="onAccountTabChange">
+      <n-tab-pane name="current" :tab="`当前客户（${currentUsers.length}）`" />
+      <n-tab-pane name="archived" :tab="archivedLoaded ? `归档记录（${archivedUsers.length}）` : '归档记录'" />
+    </n-tabs>
+
     <div class="filter-bar">
       <n-select v-model:value="filterType" :options="typeOptions" clearable placeholder="筛选类型" style="width:160px" />
-      <n-select v-model:value="filterStatus" :options="statusOptions" clearable placeholder="筛选状态" style="width:160px" />
+      <n-select v-if="accountTab === 'current'" v-model:value="filterStatus" :options="statusOptions" clearable placeholder="筛选状态" style="width:160px" />
       <n-input v-model:value="search" placeholder="搜索用户名 / 邮箱" style="width:260px" clearable />
     </div>
 
@@ -128,7 +133,7 @@
       <template #footer>
         <n-space justify="end">
           <n-button @click="showDetail = false">关闭</n-button>
-          <n-button type="primary" @click="openBalance(detailUser)">调整余额</n-button>
+          <n-button v-if="!detailUser.archived_at" type="primary" @click="openBalance(detailUser)">调整余额</n-button>
         </n-space>
       </template>
     </n-modal>
@@ -252,7 +257,10 @@ import { formatTime } from '../utils/time'
 
 const message = useMessage()
 const dialog = useDialog()
-const users = ref([])
+const currentUsers = ref([])
+const archivedUsers = ref([])
+const archivedLoaded = ref(false)
+const accountTab = ref('current')
 const filterType = ref(null)
 const filterStatus = ref(null)
 const search = ref('')
@@ -280,7 +288,6 @@ const typeOptions = [
 const statusOptions = [
   { label: '正常', value: 'active' },
   { label: '禁用', value: 'disabled' },
-  { label: '已归档', value: 'archived' },
 ]
 
 const typeTag = { trial: 'warning', paid: 'success', normal: 'default' }
@@ -294,11 +301,10 @@ function fmt(v, digits) {
 }
 
 const filtered = computed(() => {
-  let list = users.value
+  let list = accountTab.value === 'archived' ? archivedUsers.value : currentUsers.value
   if (filterType.value) list = list.filter(u => u.account_type === filterType.value)
   if (filterStatus.value === 'active') list = list.filter(u => u.is_active && !u.archived_at)
   if (filterStatus.value === 'disabled') list = list.filter(u => !u.is_active && !u.archived_at)
-  if (filterStatus.value === 'archived') list = list.filter(u => !!u.archived_at)
   if (search.value) {
     const q = search.value.toLowerCase()
     list = list.filter(u =>
@@ -349,11 +355,13 @@ const allColumns = [
   {
     title: '操作', key: 'actions', width: 250, fixed: 'right',
     render: row => h(NSpace, { size: 'small' }, {
-      default: () => [
+      default: () => row.archived_at ? [
         h(NButton, { size: 'small', quaternary: true, type: 'info', onClick: () => viewUser(row) }, { default: () => '查看' }),
-        h(NButton, { size: 'small', quaternary: true, type: 'warning', disabled: !!row.archived_at, onClick: () => openEdit(row) }, { default: () => '编辑' }),
-        h(NButton, { size: 'small', quaternary: true, type: 'primary', disabled: !!row.archived_at, onClick: () => openBalance(row) }, { default: () => '调余额' }),
-        h(NButton, { size: 'small', quaternary: true, type: 'error', disabled: !!row.archived_at, onClick: () => confirmDelete(row) }, { default: () => row.archived_at ? '已归档' : '删除' }),
+      ] : [
+        h(NButton, { size: 'small', quaternary: true, type: 'info', onClick: () => viewUser(row) }, { default: () => '查看' }),
+        h(NButton, { size: 'small', quaternary: true, type: 'warning', onClick: () => openEdit(row) }, { default: () => '编辑' }),
+        h(NButton, { size: 'small', quaternary: true, type: 'primary', onClick: () => openBalance(row) }, { default: () => '调余额' }),
+        h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDelete(row) }, { default: () => '删除' }),
       ]
     }),
   },
@@ -380,13 +388,25 @@ const usageColumns = [
   { title: '时间', key: 'created_at', width: 160, render: row => formatTime(row.created_at) },
 ]
 
-async function loadUsers() {
+async function loadUsers(scope = accountTab.value) {
   try {
-    const { data } = await http.get('/api/admin/users')
-    users.value = data
+    const { data } = await http.get('/api/admin/users', { params: { archive_scope: scope } })
+    if (scope === 'archived') {
+      archivedUsers.value = data
+      archivedLoaded.value = true
+    } else {
+      currentUsers.value = data
+    }
   } catch (e) {
     message.error(e.response?.data?.detail || '加载用户失败')
   }
+}
+
+async function onAccountTabChange(scope) {
+  filterStatus.value = null
+  filterType.value = null
+  search.value = ''
+  if (scope === 'archived' && !archivedLoaded.value) await loadUsers('archived')
 }
 
 // 5xx 时后端 detail 是通用文案，仍避免把任何内部信息弹给管理员
@@ -584,7 +604,8 @@ async function confirmDelete(row) {
           await http.delete(`/api/admin/users/${row.id}`)
           message.success('空账户已彻底删除')
         }
-        await loadUsers()
+        await loadUsers('current')
+        if (isArchive) await loadUsers('archived')
       } catch (e) {
         const detail = e.response?.data?.detail
         message.error(typeof detail === 'object' ? (detail.message || '操作失败') : (detail || '操作失败'))

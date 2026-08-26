@@ -7,6 +7,7 @@
 
 import asyncio
 import uuid
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
@@ -276,3 +277,63 @@ async def test_register_email_case_cannot_create_duplicate_account(client):
         stored = (await db.execute(sql_text(
             "SELECT email FROM users WHERE username = 'tc9a'"))).scalar_one()
         assert stored == "norm.case@example.com"  # 落库即小写规范形
+
+
+async def test_public_trial_policy_and_registration_use_system_config(client):
+    """注册卡片与实际发放读取同一套赠送点数/有效天数策略。"""
+    await _seed_tokens()
+    async with AsyncSessionLocal() as db:
+        from app.services import config_service
+        await config_service.set_config(db, "trial_grant_credits", "750")
+        await config_service.set_config(db, "trial_valid_days", "5")
+        await config_service.set_config(db, "trial_campaign_version", "3")
+        await db.commit()
+
+    policy = await client.get("/api/tokens/trial-stock")
+    assert policy.status_code == 200
+    assert policy.json() == {
+        "remaining": 1,
+        "available": True,
+        "reason": "ok",
+        "grant_credits": 750,
+        "valid_days": 5,
+        "campaign_version": 3,
+    }
+
+    response = await client.post("/api/auth/register", json={
+        "username": "configured-trial",
+        "email": "configured-trial@example.com",
+        "password": "Passw0rd!123",
+        "account_type": "trial",
+    })
+    assert response.status_code == 200
+    assert response.json()["user"]["trial_credits"] == 750
+
+    async with AsyncSessionLocal() as db:
+        user = (await db.execute(select(User).where(
+            User.username == "configured-trial"
+        ))).scalar_one()
+        assert user.trial_expires_at >= datetime.now(timezone.utc) + timedelta(days=4, hours=23)
+
+
+async def test_public_trial_policy_honors_feature_switch(client):
+    await _seed_tokens()
+    async with AsyncSessionLocal() as db:
+        from app.services import config_service
+        await config_service.set_config(db, "trial_feature_enabled", "false")
+        await db.commit()
+
+    policy = await client.get("/api/tokens/trial-stock")
+    assert policy.status_code == 200
+    assert policy.json()["available"] is False
+    assert policy.json()["remaining"] == 0
+    assert policy.json()["reason"] == "trial_disabled"
+
+    response = await client.post("/api/auth/register", json={
+        "username": "disabled-trial",
+        "email": "disabled-trial@example.com",
+        "password": "Passw0rd!123",
+        "account_type": "trial",
+    })
+    assert response.status_code == 400
+    assert response.json()["detail"] == "试用活动未开启"
