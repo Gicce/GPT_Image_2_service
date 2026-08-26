@@ -2,22 +2,44 @@
   <div>
     <div class="page-header">
       <div class="page-header-left">
-        <h2 class="page-header-title">管理员管理</h2>
-        <p class="page-header-subtitle">可以登录 CyCloudHub 后台的管理员账户（与客户账户严格隔离）</p>
+        <h2 class="page-header-title">管理员与登录</h2>
+        <p class="page-header-subtitle">后台管理员账户、角色权限与登录安全审计</p>
       </div>
-      <n-button type="primary" @click="showCreate = true">+ 新建管理员</n-button>
+      <n-button v-if="activeTab === 'accounts'" type="primary" @click="showCreate = true">+ 新建管理员</n-button>
     </div>
 
-    <n-data-table
-      :columns="columns"
-      :data="admins"
-      :loading="loading"
-      :row-key="row => row.id"
-      :bordered="false"
-    />
+    <n-tabs v-model:value="activeTab" type="line" animated @update:value="onTabChange">
+      <n-tab-pane name="accounts" tab="管理员账户">
+        <n-data-table
+          :columns="columns"
+          :data="admins"
+          :loading="loading"
+          :row-key="row => row.id"
+          :bordered="false"
+          :scroll-x="1050"
+        />
+      </n-tab-pane>
+      <n-tab-pane name="login-logs" tab="登录记录">
+        <div class="filter-bar login-filters">
+          <n-select v-model:value="loginResult" :options="loginResultOptions" placeholder="登录结果" style="width:150px" @update:value="resetLoginPage" />
+          <n-input v-model:value="loginUsername" placeholder="搜索管理员" clearable style="width:220px" @keyup.enter="resetLoginPage" />
+          <n-date-picker v-model:value="loginDateRange" type="daterange" clearable @update:value="resetLoginPage" />
+          <n-button :loading="loginLoading" @click="resetLoginPage">查询</n-button>
+        </div>
+        <n-data-table
+          :columns="loginColumns"
+          :data="loginLogs"
+          :loading="loginLoading"
+          :pagination="loginPagination"
+          :row-key="row => row.id"
+          :bordered="false"
+          :scroll-x="980"
+        />
+      </n-tab-pane>
+    </n-tabs>
 
     <!-- 新建管理员 -->
-    <n-modal v-model:show="showCreate" preset="card" title="新建管理员" style="width:480px">
+    <n-modal v-model:show="showCreate" preset="card" title="新建管理员" style="width:min(480px,calc(100vw - 48px));max-height:calc(100vh - 48px)" content-style="overflow:auto">
       <n-form label-placement="top">
         <n-form-item label="用户名" required>
           <n-input v-model:value="createForm.username" placeholder="3-64 位，不区分大小写" />
@@ -47,7 +69,7 @@
     </n-modal>
 
     <!-- 编辑管理员 -->
-    <n-modal v-model:show="showEdit" preset="card" title="编辑管理员" style="width:480px">
+    <n-modal v-model:show="showEdit" preset="card" title="编辑管理员" style="width:min(480px,calc(100vw - 48px));max-height:calc(100vh - 48px)" content-style="overflow:auto">
       <n-form label-placement="top">
         <n-form-item label="用户名" required>
           <n-input v-model:value="editForm.username" />
@@ -77,7 +99,7 @@
     </n-modal>
 
     <!-- 重置密码 -->
-    <n-modal v-model:show="showReset" preset="card" title="重置管理员密码" style="width:480px">
+    <n-modal v-model:show="showReset" preset="card" title="重置管理员密码" style="width:min(480px,calc(100vw - 48px));max-height:calc(100vh - 48px)" content-style="overflow:auto">
       <n-alert type="warning" :bordered="false" style="margin-bottom:16px">
         将为管理员 <strong>{{ resetTarget ? (resetTarget.display_name || resetTarget.username) : '' }}</strong> 设置新密码：其旧密码立即失效，且下次登录后需先修改密码。
       </n-alert>
@@ -100,13 +122,26 @@
 </template>
 
 <script setup>
-import { h, onMounted, ref } from 'vue'
+import { computed, h, onMounted, ref } from 'vue'
 import { useMessage, NButton, NSpace, NTag, NPopconfirm } from 'naive-ui'
 import http from '../api/http'
 
 const msg = useMessage()
 const admins = ref([])
 const loading = ref(false)
+const activeTab = ref('accounts')
+const loginLogs = ref([])
+const loginLoading = ref(false)
+const loginTotal = ref(0)
+const loginPage = ref(1)
+const loginResult = ref('all')
+const loginUsername = ref('')
+const loginDateRange = ref(null)
+const loginResultOptions = [
+  { label: '全部结果', value: 'all' },
+  { label: '登录成功', value: 'success' },
+  { label: '登录失败', value: 'failed' },
+]
 
 const showCreate = ref(false)
 const creating = ref(false)
@@ -163,6 +198,71 @@ const columns = [
     },
   },
 ]
+
+const reasonLabel = {
+  unknown_user: '管理员不存在',
+  disabled: '账户已禁用',
+  bad_password: '密码错误',
+}
+
+const loginColumns = [
+  { title: '时间', key: 'created_at', width: 180, render: row => formatTime(row.created_at) },
+  { title: '管理员', key: 'username', width: 150 },
+  {
+    title: '结果', key: 'result', width: 100,
+    render: row => h(NTag, { type: row.result === 'success' ? 'success' : 'error', size: 'small', bordered: false },
+      { default: () => row.result === 'success' ? '成功' : '失败' }),
+  },
+  { title: '失败原因', key: 'reason', width: 140, render: row => reasonLabel[row.reason] || (row.reason || '-') },
+  { title: '来源 IP', key: 'ip', width: 150, render: row => row.ip || '-' },
+  { title: '客户端', key: 'user_agent', minWidth: 300, ellipsis: { tooltip: true }, render: row => row.user_agent || '-' },
+]
+
+const loginPagination = computed(() => ({
+  page: loginPage.value,
+  pageSize: 30,
+  itemCount: loginTotal.value,
+  onChange: page => { loginPage.value = page; loadLoginLogs() },
+}))
+
+function dateParam(timestamp) {
+  if (!timestamp) return undefined
+  const date = new Date(timestamp)
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000)
+  return local.toISOString().slice(0, 10)
+}
+
+async function loadLoginLogs() {
+  loginLoading.value = true
+  try {
+    const range = loginDateRange.value || []
+    const { data } = await http.get('/api/admin/admin-login-logs', {
+      params: {
+        result: loginResult.value,
+        username: loginUsername.value || undefined,
+        start_date: dateParam(range[0]),
+        end_date: dateParam(range[1]),
+        page: loginPage.value,
+        page_size: 30,
+      },
+    })
+    loginLogs.value = data.logs || []
+    loginTotal.value = data.total || 0
+  } catch (e) {
+    msg.error(e.response?.data?.detail || '加载登录记录失败')
+  } finally {
+    loginLoading.value = false
+  }
+}
+
+function resetLoginPage() {
+  loginPage.value = 1
+  loadLoginLogs()
+}
+
+function onTabChange(tab) {
+  if (tab === 'login-logs' && !loginLogs.value.length) loadLoginLogs()
+}
 
 async function loadAdmins() {
   loading.value = true
@@ -247,3 +347,7 @@ async function doReset() {
 
 onMounted(loadAdmins)
 </script>
+
+<style scoped>
+.login-filters { margin-top: 8px; }
+</style>

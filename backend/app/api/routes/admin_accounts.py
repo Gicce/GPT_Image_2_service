@@ -8,7 +8,7 @@
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -149,6 +149,67 @@ async def list_admins(
     result = await db.execute(select(AdminUser).order_by(AdminUser.created_at.asc()))
     admins = result.scalars().all()
     return {"total": len(admins), "admins": [_admin_info(a) for a in admins]}
+
+
+@router.get("/admin-login-logs")
+async def list_admin_login_logs(
+    result: str | None = None,
+    username: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    _admin: dict = Depends(get_super_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """管理员登录成功/失败审计；IP 与 UA 仅超级管理员可见。"""
+    actions = ["admin_login_success", "admin_login_failed"]
+    if result == "success":
+        actions = ["admin_login_success"]
+    elif result == "failed":
+        actions = ["admin_login_failed"]
+    elif result not in (None, "", "all"):
+        raise HTTPException(status_code=400, detail="result 必须为 success、failed 或 all")
+
+    query = select(AdminAuditLog).where(AdminAuditLog.action.in_(actions))
+    if username:
+        query = query.where(AdminAuditLog.admin.ilike(f"%{username.strip()}%"))
+
+    def _date(value: str) -> datetime:
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD") from exc
+
+    if start_date:
+        query = query.where(AdminAuditLog.created_at >= _date(start_date))
+    if end_date:
+        query = query.where(AdminAuditLog.created_at < _date(end_date) + timedelta(days=1))
+
+    total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar() or 0
+    page = max(1, page)
+    page_size = max(1, min(200, page_size))
+    rows = (await db.execute(
+        query.order_by(AdminAuditLog.created_at.desc())
+        .offset((page - 1) * page_size).limit(page_size)
+    )).scalars().all()
+
+    def _row(log: AdminAuditLog) -> dict:
+        try:
+            detail = json.loads(log.detail or "{}")
+        except (TypeError, json.JSONDecodeError):
+            detail = {}
+        return {
+            "id": log.id,
+            "username": log.admin,
+            "result": "success" if log.action == "admin_login_success" else "failed",
+            "reason": detail.get("reason"),
+            "ip": detail.get("ip", ""),
+            "user_agent": detail.get("ua", ""),
+            "created_at": log.created_at.isoformat(),
+        }
+
+    return {"total": total, "page": page, "page_size": page_size, "logs": [_row(row) for row in rows]}
 
 
 @router.post("/admins")

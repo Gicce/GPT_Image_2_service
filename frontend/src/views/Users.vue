@@ -3,12 +3,13 @@
     <div class="page-header">
       <div class="page-header-left">
         <h2 class="page-header-title">客户账户</h2>
-        <p class="page-header-subtitle">统一余额体系：现金余额 + 试用额度（USD）</p>
+        <p class="page-header-subtitle">CY 点数统一账户：正式、试用与赠送点数</p>
       </div>
     </div>
 
     <div class="filter-bar">
       <n-select v-model:value="filterType" :options="typeOptions" clearable placeholder="筛选类型" style="width:160px" />
+      <n-select v-model:value="filterStatus" :options="statusOptions" clearable placeholder="筛选状态" style="width:160px" />
       <n-input v-model:value="search" placeholder="搜索用户名 / 邮箱" style="width:260px" clearable />
     </div>
 
@@ -18,12 +19,14 @@
       :pagination="{ pageSize: 20 }"
       :row-key="row => row.id"
       :bordered="false"
+      :scroll-x="tableScrollX"
     />
 
     <!-- 查看用户详情 -->
-    <n-modal v-model:show="showDetail" preset="card" title="用户详情" style="width:720px">
+    <n-modal v-model:show="showDetail" preset="card" title="用户详情"
+      style="width:min(920px,calc(100vw - 48px));max-height:calc(100vh - 48px)" content-style="overflow:auto">
       <template v-if="detailUser">
-        <n-descriptions :column="2" bordered label-placement="left" size="small">
+        <n-descriptions :column="viewportWidth < 1200 ? 1 : 2" bordered label-placement="left" size="small">
           <n-descriptions-item label="用户名">{{ detailUser.username }}</n-descriptions-item>
           <n-descriptions-item label="邮箱">{{ detailUser.email }}</n-descriptions-item>
           <n-descriptions-item label="类型">
@@ -32,8 +35,8 @@
             </n-tag>
           </n-descriptions-item>
           <n-descriptions-item label="状态">
-            <n-tag :type="detailUser.is_active ? 'success' : 'error'" size="small" :bordered="false">
-              {{ detailUser.is_active ? '正常' : '禁用' }}
+            <n-tag :type="detailUser.archived_at ? 'default' : (detailUser.is_active ? 'success' : 'error')" size="small" :bordered="false">
+              {{ detailUser.archived_at ? '已归档' : (detailUser.is_active ? '正常' : '禁用') }}
             </n-tag>
           </n-descriptions-item>
           <n-descriptions-item label="注册时间">{{ formatTime(detailUser.created_at) }}</n-descriptions-item>
@@ -131,7 +134,8 @@
     </n-modal>
 
     <!-- 编辑用户 -->
-    <n-modal v-model:show="showEdit" preset="card" title="编辑用户" style="width:560px">
+    <n-modal v-model:show="showEdit" preset="card" title="编辑用户"
+      style="width:min(560px,calc(100vw - 48px));max-height:calc(100vh - 48px)" content-style="overflow:auto">
       <n-form v-if="editForm" label-placement="left" label-width="80">
         <n-form-item label="用户名">
           <n-input v-model:value="editForm.username" />
@@ -155,7 +159,8 @@
     </n-modal>
 
     <!-- 调整余额 -->
-    <n-modal v-model:show="showBalance" preset="card" title="调整点数余额" style="width:520px">
+    <n-modal v-model:show="showBalance" preset="card" title="调整点数余额"
+      style="width:min(520px,calc(100vw - 48px));max-height:calc(100vh - 48px)" content-style="overflow:auto">
       <template v-if="balanceForm">
         <n-alert type="info" :bordered="false" style="margin-bottom:16px">
           直接设置目标值（非增减）。当前：正式 {{ balanceForm.current_paid }} 点 /
@@ -204,7 +209,8 @@
     </n-modal>
 
     <!-- 分配 / 更换 Runtime Token -->
-    <n-modal v-model:show="showAssign" preset="card" :title="detailUser?.runtime_token ? '更换 Runtime Token' : '分配 Runtime Token'" style="width:560px">
+    <n-modal v-model:show="showAssign" preset="card" :title="detailUser?.runtime_token ? '更换 Runtime Token' : '分配 Runtime Token'"
+      style="width:min(560px,calc(100vw - 48px));max-height:calc(100vh - 48px)" content-style="overflow:auto">
       <n-alert type="info" :bordered="false" style="margin-bottom:12px">
         从未分配 Token 中选择一枚绑定给该用户；旧 Token 将自动解绑回池。也可以留空选择，由系统自动挑选最旧的可用正式 Token。
       </n-alert>
@@ -239,7 +245,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, h } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, h } from 'vue'
 import { NTag, NButton, NSpace, useMessage, useDialog } from 'naive-ui'
 import http from '../api/http'
 import { formatTime } from '../utils/time'
@@ -248,7 +254,9 @@ const message = useMessage()
 const dialog = useDialog()
 const users = ref([])
 const filterType = ref(null)
+const filterStatus = ref(null)
 const search = ref('')
+const viewportWidth = ref(window.innerWidth)
 const showDetail = ref(false)
 const detailUser = ref(null)
 const showEdit = ref(false)
@@ -269,6 +277,12 @@ const typeOptions = [
   { label: '付费', value: 'paid' },
 ]
 
+const statusOptions = [
+  { label: '正常', value: 'active' },
+  { label: '禁用', value: 'disabled' },
+  { label: '已归档', value: 'archived' },
+]
+
 const typeTag = { trial: 'warning', paid: 'success', normal: 'default' }
 const typeLabel = { trial: '试用', paid: '付费', normal: '普通' }
 
@@ -282,6 +296,9 @@ function fmt(v, digits) {
 const filtered = computed(() => {
   let list = users.value
   if (filterType.value) list = list.filter(u => u.account_type === filterType.value)
+  if (filterStatus.value === 'active') list = list.filter(u => u.is_active && !u.archived_at)
+  if (filterStatus.value === 'disabled') list = list.filter(u => !u.is_active && !u.archived_at)
+  if (filterStatus.value === 'archived') list = list.filter(u => !!u.archived_at)
   if (search.value) {
     const q = search.value.toLowerCase()
     list = list.filter(u =>
@@ -292,7 +309,7 @@ const filtered = computed(() => {
   return list
 })
 
-const columns = [
+const allColumns = [
   { title: '#', key: 'index', width: 50, render: (_, index) => index + 1 },
   { title: '用户名', key: 'username', width: 130 },
   { title: '邮箱', key: 'email', width: 200, ellipsis: true },
@@ -320,25 +337,33 @@ const columns = [
   },
   {
     title: '状态', key: 'is_active', width: 80,
-    render: row => h(NTag, { type: row.is_active ? 'success' : 'error', size: 'small', bordered: false },
-      { default: () => row.is_active ? '正常' : '禁用' }),
+    render: row => h(NTag, {
+      type: row.archived_at ? 'default' : (row.is_active ? 'success' : 'error'),
+      size: 'small', bordered: false,
+    }, { default: () => row.archived_at ? '已归档' : (row.is_active ? '正常' : '禁用') }),
   },
   {
     title: '注册时间', key: 'created_at', width: 160,
     render: row => formatTime(row.created_at),
   },
   {
-    title: '操作', key: 'actions', width: 250,
+    title: '操作', key: 'actions', width: 250, fixed: 'right',
     render: row => h(NSpace, { size: 'small' }, {
       default: () => [
         h(NButton, { size: 'small', quaternary: true, type: 'info', onClick: () => viewUser(row) }, { default: () => '查看' }),
-        h(NButton, { size: 'small', quaternary: true, type: 'warning', onClick: () => openEdit(row) }, { default: () => '编辑' }),
-        h(NButton, { size: 'small', quaternary: true, type: 'primary', onClick: () => openBalance(row) }, { default: () => '调余额' }),
-        h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDelete(row) }, { default: () => '删除' }),
+        h(NButton, { size: 'small', quaternary: true, type: 'warning', disabled: !!row.archived_at, onClick: () => openEdit(row) }, { default: () => '编辑' }),
+        h(NButton, { size: 'small', quaternary: true, type: 'primary', disabled: !!row.archived_at, onClick: () => openBalance(row) }, { default: () => '调余额' }),
+        h(NButton, { size: 'small', quaternary: true, type: 'error', disabled: !!row.archived_at, onClick: () => confirmDelete(row) }, { default: () => row.archived_at ? '已归档' : '删除' }),
       ]
     }),
   },
 ]
+
+const compactColumnKeys = new Set(['index', 'username', 'email', 'total_credits', 'account_type', 'is_active', 'actions'])
+const columns = computed(() => viewportWidth.value >= 1600
+  ? allColumns
+  : allColumns.filter(column => compactColumnKeys.has(column.key)))
+const tableScrollX = computed(() => viewportWidth.value >= 1600 ? 1300 : 900)
 
 const usageColumns = [
   { title: '模型', key: 'model', width: 120 },
@@ -523,25 +548,58 @@ async function submitAssignToken() {
   }
 }
 
-function confirmDelete(row) {
+async function confirmDelete(row) {
+  let preview
+  try {
+    const response = await http.get(`/api/admin/users/${row.id}/deletion-preview`)
+    preview = response.data
+  } catch (e) {
+    message.error(apiError(e, '无法检查账户关联数据，请稍后重试'))
+    return
+  }
+
+  const isArchive = preview.mode === 'archive'
+  const blockerLabels = {
+    orders: '订单', refund_requests: '退款', billing_transactions: '账务流水',
+    usage_logs: '用量记录', cost_margin_ledger: '成本记录',
+  }
+  const blockerText = Object.entries(preview.blockers || {})
+    .filter(([, count]) => count > 0)
+    .map(([key, count]) => `${blockerLabels[key] || key} ${count} 条`)
+    .join('、')
+
   dialog.warning({
-    title: '确认删除',
-    content: `确定要删除用户 "${row.username}" 吗？此操作不可恢复。`,
-    positiveText: '删除',
+    title: isArchive ? '归档客户账户' : '彻底删除空账户',
+    content: isArchive
+      ? `账户“${row.username}”存在业务历史（${blockerText}），将改为归档：禁止登录并解除 Token 绑定，历史数据继续保留。`
+      : `账户“${row.username}”没有业务历史，将彻底删除账户及设备、Token 绑定。试用领取与分配审计仍会保留。`,
+    positiveText: isArchive ? '确认归档' : '确认删除',
     negativeText: '取消',
     onPositiveClick: async () => {
       try {
-        await http.delete(`/api/admin/users/${row.id}`)
-        message.success('已删除')
+        if (isArchive) {
+          await http.post(`/api/admin/users/${row.id}/archive`, { reason: '管理员从客户账户列表归档' })
+          message.success('账户已归档，业务历史已保留')
+        } else {
+          await http.delete(`/api/admin/users/${row.id}`)
+          message.success('空账户已彻底删除')
+        }
         await loadUsers()
       } catch (e) {
-        message.error(e.response?.data?.detail || '删除失败')
+        const detail = e.response?.data?.detail
+        message.error(typeof detail === 'object' ? (detail.message || '操作失败') : (detail || '操作失败'))
       }
     },
   })
 }
 
-onMounted(loadUsers)
+function syncViewport() { viewportWidth.value = window.innerWidth }
+
+onMounted(() => {
+  window.addEventListener('resize', syncViewport)
+  loadUsers()
+})
+onBeforeUnmount(() => window.removeEventListener('resize', syncViewport))
 </script>
 
 <style scoped>

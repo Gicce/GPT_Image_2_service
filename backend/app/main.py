@@ -111,6 +111,8 @@ async def _ensure_columns(conn):
         ("users", "paid_credits", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "trial_credits", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "gift_credits", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "archived_at", "TIMESTAMPTZ"),
+        ("users", "archived_by", "VARCHAR(64)"),
         ("billing_transactions", "unit_credits", "INTEGER"),
         ("billing_transactions", "amount_credits", "INTEGER NOT NULL DEFAULT 0"),
         ("billing_transactions", "trial_credits_part", "INTEGER NOT NULL DEFAULT 0"),

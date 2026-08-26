@@ -3,6 +3,11 @@
     <!-- 顶部栏 -->
     <n-layout-header class="app-header">
       <div class="header-left">
+        <n-button class="sider-toggle" quaternary circle @click="collapsed = !collapsed" aria-label="切换导航">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M4 6h16M4 12h16M4 18h16" />
+          </svg>
+        </n-button>
         <div class="header-breadcrumb">
           <span class="breadcrumb-prefix">晨阳云枢</span>
           <span class="breadcrumb-sep">/</span>
@@ -31,7 +36,7 @@
 
     <n-layout has-sider style="height:calc(100vh - 60px)">
       <!-- 左侧导航 -->
-      <n-layout-sider class="app-sider" :width="240" :native-scrollbar="false" bordered>
+      <n-layout-sider class="app-sider" :width="240" :collapsed-width="72" :collapsed="collapsed" :native-scrollbar="false" bordered>
         <div class="sider-brand">
           <div class="brand-logo">
             <svg width="32" height="32" viewBox="0 0 40 40" fill="none">
@@ -50,7 +55,7 @@
               </defs>
             </svg>
           </div>
-          <div class="brand-info">
+          <div v-if="!collapsed" class="brand-info">
             <div class="brand-name">晨阳云枢</div>
             <div class="brand-name-en">CyCloudHub</div>
             <div class="brand-tagline">云端运营与计费中枢</div>
@@ -58,11 +63,20 @@
         </div>
 
         <div class="sider-menu">
-          <n-menu :options="menuOptions" :value="activeKey" @update:value="navigate" :indent="20" />
+          <n-menu
+            :options="menuOptions"
+            :value="activeKey"
+            :collapsed="collapsed"
+            :collapsed-width="72"
+            :collapsed-icon-size="20"
+            :default-expanded-keys="expandedGroups"
+            :indent="18"
+            @update:value="navigate"
+          />
         </div>
 
         <div class="sider-footer">
-          <div class="status-item">
+          <div v-if="!collapsed" class="status-item">
             <span class="status-label">服务状态</span>
             <n-tag type="success" size="small" :bordered="false" round>
               <template #icon>
@@ -85,7 +99,7 @@
 </template>
 
 <script setup>
-import { computed, h, defineComponent, onMounted, ref } from 'vue'
+import { computed, h, defineComponent, onMounted, onBeforeUnmount, ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { NIcon } from 'naive-ui'
 import http from '../api/http'
@@ -97,8 +111,15 @@ const activeKey = computed(() => route.path.replace('/', ''))
 // 当前登录管理员（/api/admin/admins/me），用于右上角菜单与角色可见性
 const adminProfile = ref({ username: '', display_name: '', role: '' })
 const isSuperAdmin = computed(() => adminProfile.value.role === 'super_admin')
+const collapsed = ref(window.innerWidth < 1200)
+const expandedGroups = ['operations', 'finance', 'resources', 'system']
+
+function syncCollapsed() {
+  collapsed.value = window.innerWidth < 1200
+}
 
 onMounted(async () => {
+  window.addEventListener('resize', syncCollapsed)
   try {
     const { data } = await http.get('/api/admin/admins/me')
     adminProfile.value = data
@@ -106,6 +127,8 @@ onMounted(async () => {
     // profile 拉取失败不影响导航；401 由全局拦截器处理
   }
 })
+
+onBeforeUnmount(() => window.removeEventListener('resize', syncCollapsed))
 
 const adminMenuOptions = computed(() => [
   {
@@ -137,8 +160,8 @@ const pageTitleMap = {
   users: '客户账户',
   transactions: '账务流水',
   'online-devices': '在线客户端',
-  settings: '系统配置',
-  admins: '管理员管理',
+  settings: '系统设置',
+  admins: '管理员与登录',
   profile: '个人设置',
 }
 
@@ -184,24 +207,40 @@ function makeIcon(key) {
 }
 
 const menuOptions = computed(() => {
-  const options = [
-    { label: '概览', key: 'dashboard', icon: makeIcon('dashboard') },
-    { label: 'Image2 配置', key: 'models', icon: makeIcon('models') },
-    { label: '定价规则', key: 'pricing', icon: makeIcon('models') },
-    { label: 'Token 库存', key: 'tokens', icon: makeIcon('tokens') },
-    { label: '客户账户', key: 'users', icon: makeIcon('users') },
-    { label: '账务流水', key: 'transactions', icon: makeIcon('transactions') },
-    { label: '成本与毛利', key: 'margin', icon: makeIcon('transactions') },
-    { label: '交易订单', key: 'orders', icon: makeIcon('orders') },
-    { label: '运营通知', key: 'notice', icon: makeIcon('notice') },
-    { label: '客户端设备', key: 'online-devices', icon: makeIcon('online-devices') },
-    { label: '系统配置', key: 'settings', icon: makeIcon('settings') },
+  const systemChildren = [
+    { label: '系统设置', key: 'settings', icon: makeIcon('settings') },
   ]
   if (isSuperAdmin.value) {
-    // 管理员管理仅 super_admin 可见（后端同时做 403 校验）
-    options.splice(options.length - 1, 0, { label: '管理员管理', key: 'admins', icon: makeIcon('users') })
+    systemChildren.unshift({ label: '管理员与登录', key: 'admins', icon: makeIcon('users') })
   }
-  return options
+  return [
+    { label: '概览', key: 'dashboard', icon: makeIcon('dashboard') },
+    {
+      label: '运营管理', key: 'operations', icon: makeIcon('users'),
+      children: [
+        { label: '客户账户', key: 'users', icon: makeIcon('users') },
+        { label: '客户端设备', key: 'online-devices', icon: makeIcon('online-devices') },
+        { label: '运营通知', key: 'notice', icon: makeIcon('notice') },
+      ],
+    },
+    {
+      label: '交易与财务', key: 'finance', icon: makeIcon('transactions'),
+      children: [
+        { label: '交易订单', key: 'orders', icon: makeIcon('orders') },
+        { label: '账务流水', key: 'transactions', icon: makeIcon('transactions') },
+        { label: '成本与毛利', key: 'margin', icon: makeIcon('transactions') },
+      ],
+    },
+    {
+      label: '资源与计费', key: 'resources', icon: makeIcon('tokens'),
+      children: [
+        { label: 'Image2 配置', key: 'models', icon: makeIcon('models') },
+        { label: '定价规则', key: 'pricing', icon: makeIcon('models') },
+        { label: 'Token 库存', key: 'tokens', icon: makeIcon('tokens') },
+      ],
+    },
+    { label: '系统管理', key: 'system', icon: makeIcon('settings'), children: systemChildren },
+  ]
 })
 
 function navigate(key) { router.push('/' + key) }
@@ -229,6 +268,11 @@ function logout() {
 .header-left {
   display: flex;
   align-items: center;
+  gap: 10px;
+}
+
+.sider-toggle {
+  color: var(--cy-text-muted);
 }
 
 .header-breadcrumb {
@@ -319,6 +363,7 @@ function logout() {
   border-right: 1px solid var(--cy-border) !important;
   display: flex;
   flex-direction: column;
+  transition: width 0.2s ease;
 }
 
 .sider-brand {
@@ -327,6 +372,8 @@ function logout() {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-height: 104px;
+  overflow: hidden;
 }
 
 .brand-logo {
@@ -393,11 +440,14 @@ function logout() {
 /* 主内容区 */
 .app-content {
   background: var(--cy-bg);
+  min-width: 0;
 }
 
 .content-wrapper {
   padding: 28px 32px;
-  max-width: 1440px;
+  width: 100%;
+  max-width: 1680px;
+  min-width: 0;
   margin: 0 auto;
 }
 
@@ -408,7 +458,7 @@ function logout() {
   }
 }
 
-@media (max-width: 768px) {
+@media (max-width: 1199px) {
   .app-header {
     padding: 0 16px;
   }
@@ -418,7 +468,7 @@ function logout() {
   }
 
   .content-wrapper {
-    padding: 20px 16px;
+    padding: 20px 24px;
   }
 }
 </style>

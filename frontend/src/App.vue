@@ -355,4 +355,17 @@ a:hover {
   background: var(--cy-primary-light);
   color: var(--cy-primary-dark);
 }
+
+/* 所有管理弹窗都受当前视口约束，内容区滚动而不是撑出屏幕。 */
+.n-card.n-modal {
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 48px);
+  display: flex;
+  flex-direction: column;
+}
+
+.n-card.n-modal > .n-card-content {
+  min-height: 0;
+  overflow: auto;
+}
 </style>

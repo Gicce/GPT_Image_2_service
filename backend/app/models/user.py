@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Optional
 from sqlalchemy import String, DateTime, Boolean, Numeric, Integer, Text, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
@@ -30,6 +31,9 @@ class User(Base):
     paid_credits: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     trial_credits: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     gift_credits: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    # 后台归档：保留订单/账务/用量等经营记录，同时立即禁止登录。
+    archived_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    archived_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     orders: Mapped[list["Order"]] = relationship("Order", back_populates="user")

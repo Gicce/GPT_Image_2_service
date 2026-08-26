@@ -9,7 +9,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, delete
 from pydantic import BaseModel, Field
 
 from app.core.database import get_db
@@ -537,6 +537,8 @@ async def list_users(_=Depends(get_admin_user), db: AsyncSession = Depends(get_d
             "id": u.id, "username": u.username, "email": u.email,
             "account_type": u.account_type,
             "is_active": u.is_active,
+            "archived_at": u.archived_at.isoformat() if u.archived_at else None,
+            "archived_by": u.archived_by,
             "paid_credits": u.paid_credits,
             "trial_credits": u.trial_credits,
             "gift_credits": u.gift_credits,
@@ -605,6 +607,8 @@ async def get_user(user_id: str, _=Depends(get_admin_user), db: AsyncSession = D
         "id": u.id, "username": u.username, "email": u.email,
         "account_type": u.account_type,
         "is_active": u.is_active,
+        "archived_at": u.archived_at.isoformat() if u.archived_at else None,
+        "archived_by": u.archived_by,
         "paid_credits": u.paid_credits,
         "trial_credits": u.trial_credits,
         "gift_credits": u.gift_credits,
@@ -713,14 +717,114 @@ async def admin_release_runtime_token(
     return {"ok": True, "released_token_id": released.id}
 
 
-@router.delete("/users/{user_id}")
-async def delete_user(user_id: str, _=Depends(get_admin_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.id == user_id))
-    u = result.scalar_one_or_none()
+async def _user_deletion_preview(db: AsyncSession, user_id: str) -> dict:
+    """判断用户可物理清理还是必须归档；设备/Token 绑定不算经营历史。"""
+    counters = {
+        "orders": Order,
+        "refund_requests": RefundRequest,
+        "billing_transactions": BillingTransaction,
+        "usage_logs": UsageLog,
+        "cost_margin_ledger": CostMarginLedger,
+    }
+    blockers = {}
+    for name, model in counters.items():
+        count = (await db.execute(
+            select(func.count()).select_from(model).where(model.user_id == user_id)
+        )).scalar() or 0
+        blockers[name] = count
+    has_business_history = any(blockers.values())
+    return {
+        "mode": "archive" if has_business_history else "purge",
+        "blockers": blockers,
+        "has_business_history": has_business_history,
+    }
+
+
+@router.get("/users/{user_id}/deletion-preview")
+async def get_user_deletion_preview(
+    user_id: str,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    u = await db.get(User, user_id)
     if not u:
         raise HTTPException(status_code=404, detail="用户不存在")
-    await db.delete(u)
-    return {"ok": True}
+    preview = await _user_deletion_preview(db, user_id)
+    await _record_audit(db, admin, "user_deletion_preview", {
+        "user_id": user_id, "mode": preview["mode"], "blockers": preview["blockers"],
+    })
+    return {"user_id": user_id, "username": u.username, **preview}
+
+
+class UserArchiveRequest(BaseModel):
+    reason: str = Field(default="", max_length=255)
+
+
+@router.post("/users/{user_id}/archive")
+async def archive_user(
+    user_id: str,
+    req: UserArchiveRequest,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    u = await db.get(User, user_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if u.archived_at is None:
+        released = await rt.release_user_token(db, user_id, source="admin_archive")
+        u.is_active = False
+        u.archived_at = datetime.now(timezone.utc)
+        u.archived_by = admin.get("username", "admin")
+        await _record_audit(db, admin, "user_archived", {
+            "user_id": user_id,
+            "username": u.username,
+            "reason": req.reason.strip(),
+            "released_token_id": released.id if released else None,
+        })
+    return {
+        "ok": True,
+        "mode": "archive",
+        "archived_at": u.archived_at.isoformat() if u.archived_at else None,
+    }
+
+
+@router.delete("/users/{user_id}")
+async def delete_user(
+    user_id: str,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    u = await db.get(User, user_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    preview = await _user_deletion_preview(db, user_id)
+    if preview["has_business_history"]:
+        await _record_audit(db, admin, "user_purge_blocked", {
+            "user_id": user_id, "username": u.username, "blockers": preview["blockers"],
+        })
+        # HTTPException 会触发请求事务回滚；失败预检审计必须先独立落盘。
+        await db.commit()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "USER_PURGE_BLOCKED",
+                "message": "该账户存在业务历史，不能彻底删除，请改为归档账户",
+                "suggested_action": "archive",
+                "blockers": preview["blockers"],
+            },
+        )
+
+    # 仅清理运行数据；trial_claims 与 token_assignment_logs 永久保留。
+    await db.execute(delete(ClientDevice).where(ClientDevice.user_id == user_id))
+    await db.execute(delete(RuntimeTokenAssignment).where(RuntimeTokenAssignment.user_id == user_id))
+    redis = get_redis()
+    if redis:
+        async for key in redis.scan_iter(match=f"online_device:{user_id}:*"):
+            await redis.delete(key)
+    audit_detail = {"user_id": user_id, "username": u.username, "email": u.email}
+    await db.execute(delete(User).where(User.id == user_id))
+    await _record_audit(db, admin, "user_purged", audit_detail)
+    return {"ok": True, "mode": "purge"}
 
 
 class BalanceAdjustRequest(BaseModel):
@@ -1272,6 +1376,13 @@ async def get_stats(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db
         )
     )
     total_revenue = revenue_result.scalar()
+    recharged_credits_result = await db.execute(
+        select(func.coalesce(func.sum(BillingTransaction.amount_credits), 0)).where(
+            BillingTransaction.type == billing.RECHARGE,
+            BillingTransaction.status == "SUCCESS",
+        )
+    )
+    total_recharged_credits = recharged_credits_result.scalar()
 
     image2_today = (await db.execute(
         select(func.count(UsageLog.id), func.coalesce(func.sum(UsageLog.image_count), 0)).where(
@@ -1308,6 +1419,7 @@ async def get_stats(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db
         "users_total": users_total,
         "orders_paid": orders_paid,
         "total_revenue_usd": str(total_revenue),
+        "total_recharged_credits": total_recharged_credits,
         "image2_today": {"calls": image2_today[0], "images": image2_today[1]},
         "image2_total": {"calls": image2_total[0], "images": image2_total[1], "cost_usd": str(image2_total[2])},
         "token_stats": token_stats,
@@ -1354,7 +1466,7 @@ async def list_audit_logs(
 
 # ── System Config (.env) ─────────────────────────────────────────
 
-SENSITIVE_KEYS = {"SECRET_KEY", "ADMIN_PASSWORD", "POSTGRES_PASSWORD", "WECHAT_APIV3_KEY", "SMTP_PASSWORD", "PACKYAPI_IMAGE_MASTER_TOKEN", "PACKYAPI_MASTER_TOKEN"}
+SENSITIVE_KEYS = {"SECRET_KEY", "POSTGRES_PASSWORD", "WECHAT_APIV3_KEY", "SMTP_PASSWORD", "PACKYAPI_IMAGE_MASTER_TOKEN", "PACKYAPI_MASTER_TOKEN"}
 MASK = "********"
 
 CONFIG_CATEGORIES = [
@@ -1367,8 +1479,8 @@ CONFIG_CATEGORIES = [
     {
         "label": "认证与安全",
         "icon": "security",
-        "keys": ["SECRET_KEY", "ADMIN_USERNAME", "ADMIN_PASSWORD"],
-        "descriptions": {"SECRET_KEY": "JWT 密钥", "ADMIN_USERNAME": "管理员用户名", "ADMIN_PASSWORD": "管理员密码"},
+        "keys": ["SECRET_KEY"],
+        "descriptions": {"SECRET_KEY": "JWT 密钥（管理员账户请在“管理员与登录”中维护）"},
     },
     {
         "label": "微信支付",
@@ -1394,13 +1506,6 @@ CONFIG_CATEGORIES = [
         "keys": ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM_NAME", "SMTP_USE_SSL"],
         "descriptions": {"SMTP_HOST": "SMTP 服务器", "SMTP_PORT": "端口", "SMTP_USER": "发件邮箱",
                          "SMTP_PASSWORD": "授权码/密码", "SMTP_FROM_NAME": "发件人名称", "SMTP_USE_SSL": "使用 SSL"},
-    },
-    {
-        "label": "支付限额",
-        "icon": "payment",
-        "keys": ["PAYMENT_MIN_TOTAL_USD", "PAYMENT_MAX_TOTAL_USD", "TRIAL_CREDIT_USD"],
-        "descriptions": {"PAYMENT_MIN_TOTAL_USD": "最低充值金额 ($)", "PAYMENT_MAX_TOTAL_USD": "最高充值金额 ($)",
-                         "TRIAL_CREDIT_USD": "注册试用额度 ($)"},
     },
     {
         "label": "服务器",
