@@ -162,6 +162,7 @@ const pageTitleMap = {
   'online-devices': '在线客户端',
   settings: '系统设置',
   admins: '管理员与登录',
+  skills: 'Skill 内容中心',
   profile: '个人设置',
 }
 
@@ -208,6 +209,7 @@ function makeIcon(key) {
 
 const menuOptions = computed(() => {
   const systemChildren = [
+    { label: 'Skill 内容中心', key: 'skills', icon: makeIcon('models') },
     { label: '系统设置', key: 'settings', icon: makeIcon('settings') },
   ]
   if (isSuperAdmin.value) {

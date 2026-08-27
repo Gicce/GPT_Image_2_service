@@ -19,6 +19,7 @@ const routes = [
       { path: 'online-devices', component: () => import('./views/OnlineDevices.vue') },
       { path: 'settings', component: () => import('./views/Settings.vue') },
       { path: 'admins', component: () => import('./views/Admins.vue') },
+      { path: 'skills', component: () => import('./views/Skills.vue') },
       { path: 'profile', component: () => import('./views/Profile.vue') },
     ]
   }

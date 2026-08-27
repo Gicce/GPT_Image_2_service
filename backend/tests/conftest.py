@@ -85,6 +85,7 @@ async def clean_tables(init_backend):
     """每个测试前清空业务表并重置 Image2 配置。"""
     async with AsyncSessionLocal() as session:
         for table in [
+            "skill_packages",
             # client_devices 有指向 users 的 FK，必须先于 users 删除
             "client_devices",
             "billing_transactions", "admin_audit_logs", "usage_logs", "refund_requests",
@@ -105,6 +106,12 @@ async def clean_tables(init_backend):
             "VALUES (:id, :username, 'Test Admin', :pw, 'super_admin', true, false, now(), now())"
         ), {"id": TEST_ADMIN_ID, "username": TEST_ADMIN_USERNAME,
             "pw": hash_password(TEST_ADMIN_LOGIN_PASSWORD)})
+        await session.commit()
+
+    # Skill Catalog 是系统级种子，业务表清理后按正式启动逻辑恢复。
+    from app.services.skill_catalog import seed_skill_catalog
+    async with AsyncSessionLocal() as session:
+        await seed_skill_catalog(session)
         await session.commit()
 
     # 清理登录限流与在线设备相关 Redis key，避免测试间串扰

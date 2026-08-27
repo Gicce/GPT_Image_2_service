@@ -13,12 +13,13 @@ import asyncio
 
 from app.core.database import engine, Base, AsyncSessionLocal, AsyncSession
 from app.core.redis import init_redis, recover_processing_refunds
-from app.api.routes import auth, users, tokens, payment, notice, models, admin, usage, client, admin_accounts, billing as billing_route, trial as trial_route
+from app.api.routes import auth, users, tokens, payment, notice, models, admin, usage, client, admin_accounts, admin_skills, skills as skills_route, billing as billing_route, trial as trial_route
 from app.models.content import AIModel
 from app.models.billing import PricingRule
 from app.services import billing
 from app.services import config_service
 from app.services import credits_migration
+from app.services import skill_catalog
 from app.core.security import hash_password
 from app.core.config import settings
 
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 IMAGE2_MODEL_ID = "gpt-image-2"
 
 # 服务版本唯一来源：/health、/api/health 与 FastAPI 元数据均引用此常量
-APP_VERSION = "4.2.0"
+APP_VERSION = "4.2.2"
 
 # V4：系统仅提供 Image2 一个收费模型，seed 只保证它存在，不再创建任何其他默认模型。
 IMAGE2_SEED = {
@@ -54,6 +55,7 @@ async def seed_defaults():
 
         # V4.2 业务配置默认值（幂等，仅补缺失键）
         await config_service.seed_config_defaults(session)
+        await skill_catalog.seed_skill_catalog(session)
 
         # V4.2 定价规则种子：仅当无任何生效规则时创建。
         # 单价 80 点 = ¥0.80（示例成本 ¥0.20 + 10% 安全垫，70% 目标毛利 → 最低 80 点）。
@@ -475,6 +477,8 @@ app.include_router(admin_accounts.router, prefix="/api/admin", tags=["admin-acco
 app.include_router(client.router, prefix="/api/client", tags=["client"])
 app.include_router(billing_route.router, prefix="/api/billing", tags=["billing"])
 app.include_router(trial_route.router, prefix="/api/trial", tags=["trial"])
+app.include_router(skills_route.router, prefix="/api/skills", tags=["skills"])
+app.include_router(admin_skills.router, prefix="/api/admin", tags=["admin-skills"])
 
 
 @app.get("/api")
