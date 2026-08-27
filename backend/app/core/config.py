@@ -36,6 +36,8 @@ class Settings(BaseSettings):
 
     # Server
     SERVER_BASE_URL: str = "https://www.zjcypc.com"
+    SKILL_SAMPLE_DIR: str = "./data/skill_samples"
+    SKILL_SAMPLE_MAX_BYTES: int = 10 * 1024 * 1024
 
     # SMTP / Email
     SMTP_HOST: str = ""

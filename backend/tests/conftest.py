@@ -48,7 +48,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import engine, Base, AsyncSessionLocal
 from app.main import (
     _ensure_columns, _ensure_indexes, _migrate_v4_single_model,
-    _migrate_v4_shared_token_refund, _migrate_admin_accounts, seed_defaults,
+    _migrate_v4_shared_token_refund, _migrate_admin_accounts,
+    _migrate_skill_submissions, seed_defaults,
 )
 from app.models.user import User
 from app.models.content import AIModel
@@ -75,6 +76,7 @@ async def init_backend():
         await _migrate_v4_single_model(conn)
         await _migrate_v4_shared_token_refund(conn)
         await _migrate_admin_accounts(conn)
+        await _migrate_skill_submissions(conn)
     await seed_defaults()
     yield
     await engine.dispose()
@@ -85,6 +87,7 @@ async def clean_tables(init_backend):
     """每个测试前清空业务表并重置 Image2 配置。"""
     async with AsyncSessionLocal() as session:
         for table in [
+            "skill_submission_events", "skill_submission_samples", "skill_submissions",
             "skill_packages",
             # client_devices 有指向 users 的 FK，必须先于 users 删除
             "client_devices",

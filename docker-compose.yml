@@ -33,10 +33,13 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cyimage}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-cyimage}
       REDIS_URL: redis://redis:6379/0
+      # V4.2.3 社区 Skill 投稿样例目录：显式指向持久卷，重建容器不丢样例
+      SKILL_SAMPLE_DIR: /app/data/skill_samples
     volumes:
       - ./certs:/app/certs:ro
       - ./.env:/app/.env:rw
       - /var/run/docker.sock:/var/run/docker.sock
+      - skill_samples:/app/data/skill_samples
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,3 +63,4 @@ services:
 volumes:
   pgdata:
   redisdata:
+  skill_samples:

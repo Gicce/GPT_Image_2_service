@@ -85,6 +85,8 @@ http://你的服务器IP/admin/
 
 ## 本地开发
 
+本仓库需要分别启动两个进程：**后端**（FastAPI，端口 8000）和**管理后台**（Vite dev server，端口 5000）。数据库与缓存可连接本地已有实例，或用 Docker 单独启动。生产环境则用 Docker Compose 一键部署（见上），管理后台构建为静态文件由 nginx 托管，无 dev server。
+
 ### 后端
 
 ```bash
@@ -97,21 +99,31 @@ pip install -r requirements.txt
 docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=dev postgres:16-alpine
 docker run -d -p 6379:6379 redis:7-alpine
 
-# 复制并编辑 .env
+# 复制并编辑 .env（注意：.env 位于仓库根目录，不在 backend/ 下）
 cp ../.env.example ../.env
 
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload    # 启动在 http://localhost:8000
 ```
 
-### 前端
+启动时 lifespan 会自动建表、执行迁移并 seed 默认数据（模型价格等），无需手动跑 `init_data.py`。
+
+### 管理后台前端（frontend/，Vue3）
+
+本仓库的 `frontend/` 是**运营管理后台**，不是面向用户的桌面客户端（那是独立仓库 GPT_Image_2_Application）。
 
 ```bash
 cd frontend
 npm install
-npm run dev   # 代理 /api 到 localhost:8000
+npm run dev   # 启动在 http://localhost:5000，/api 代理到 127.0.0.1:8000
 ```
 
-访问 `http://localhost:5173/admin/`
+访问 `http://localhost:5000/admin/`（base 路径为 `/admin/`，端口与代理见 `vite.config.js`）。
+
+后端不在本机时，可用环境变量覆盖代理目标：
+
+```bash
+API_PROXY_TARGET=http://192.168.x.x:8000 npm run dev
+```
 
 ## 环境变量说明
 

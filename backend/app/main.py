@@ -2,6 +2,7 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 from decimal import Decimal
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +14,7 @@ import asyncio
 
 from app.core.database import engine, Base, AsyncSessionLocal, AsyncSession
 from app.core.redis import init_redis, recover_processing_refunds
-from app.api.routes import auth, users, tokens, payment, notice, models, admin, usage, client, admin_accounts, admin_skills, skills as skills_route, billing as billing_route, trial as trial_route
+from app.api.routes import auth, users, tokens, payment, notice, models, admin, usage, client, admin_accounts, admin_skills, skill_submissions, skills as skills_route, billing as billing_route, trial as trial_route
 from app.models.content import AIModel
 from app.models.billing import PricingRule
 from app.services import billing
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 IMAGE2_MODEL_ID = "gpt-image-2"
 
 # 服务版本唯一来源：/health、/api/health 与 FastAPI 元数据均引用此常量
-APP_VERSION = "4.2.2"
+APP_VERSION = "4.2.3"
 
 # V4：系统仅提供 Image2 一个收费模型，seed 只保证它存在，不再创建任何其他默认模型。
 IMAGE2_SEED = {
@@ -45,6 +46,7 @@ IMAGE2_SEED = {
 MIGRATION_VERSION = "v4_single_model"
 MIGRATION_VERSION_SHARED_TOKEN_REFUND = "v4_shared_token_refund"
 MIGRATION_VERSION_ADMIN_ACCOUNTS = "v402_admin_accounts"
+MIGRATION_VERSION_SKILL_SUBMISSIONS = "v423_skill_submissions"
 
 
 async def seed_defaults():
@@ -126,6 +128,11 @@ async def _ensure_columns(conn):
         ("orders", "credits_granted", "INTEGER"),
         ("usage_logs", "unit_credits", "INTEGER"),
         ("usage_logs", "cost_credits", "INTEGER NOT NULL DEFAULT 0"),
+        # V4.2.3 社区 Skill 发布元数据
+        ("skill_packages", "source", "VARCHAR(16) NOT NULL DEFAULT 'official'"),
+        ("skill_packages", "author_display_name", "VARCHAR(96)"),
+        ("skill_packages", "preview_sample_id", "VARCHAR(36)"),
+        ("skill_packages", "source_submission_id", "VARCHAR(36)"),
     ]
     for table, column, col_type in new_columns:
         if not await _column_exists(conn, table, column):
@@ -388,6 +395,85 @@ async def _migrate_admin_accounts(conn):
     logger.info("migration %s done", MIGRATION_VERSION_ADMIN_ACCOUNTS)
 
 
+async def _migrate_skill_submissions(conn):
+    """V4.2.3 一次性迁移：社区 Skill 投稿三表显式建表 + 索引。
+
+    生产部署不依赖 ORM create_all 的隐式建表（老容器滚动升级时新表必须由
+    本迁移显式补齐）；schema_migrations 记录版本，幂等可重放。
+    """
+    applied = await conn.execute(text(
+        "SELECT 1 FROM schema_migrations WHERE version = :v"
+    ), {"v": MIGRATION_VERSION_SKILL_SUBMISSIONS})
+    if applied.scalar():
+        return
+
+    logger.info("running migration %s ...", MIGRATION_VERSION_SKILL_SUBMISSIONS)
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS skill_submissions (
+            id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL REFERENCES users(id),
+            local_skill_id VARCHAR(96) NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 1,
+            version VARCHAR(32) NOT NULL DEFAULT '1.0.0',
+            name VARCHAR(128) NOT NULL,
+            domain VARCHAR(64) NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            payload JSON NOT NULL DEFAULT '{}'::json,
+            source_facts JSON NOT NULL DEFAULT '[]'::json,
+            authoring_meta JSON NOT NULL DEFAULT '{}'::json,
+            author_display_name VARCHAR(96) NOT NULL DEFAULT '社区创作者',
+            status VARCHAR(24) NOT NULL DEFAULT 'submitted',
+            review_message TEXT,
+            public_skill_id VARCHAR(96),
+            reviewed_by VARCHAR(64),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            reviewed_at TIMESTAMPTZ
+        )
+    """))
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS skill_submission_samples (
+            id VARCHAR(36) PRIMARY KEY,
+            submission_id VARCHAR(36) NOT NULL REFERENCES skill_submissions(id) ON DELETE CASCADE,
+            file_path TEXT NOT NULL,
+            file_name VARCHAR(255) NOT NULL,
+            content_type VARCHAR(64) NOT NULL,
+            sha256 VARCHAR(64) NOT NULL,
+            task_id VARCHAR(64),
+            generation_meta JSON NOT NULL DEFAULT '{}'::json,
+            public_cover BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """))
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS skill_submission_events (
+            id VARCHAR(36) PRIMARY KEY,
+            submission_id VARCHAR(36) NOT NULL REFERENCES skill_submissions(id) ON DELETE CASCADE,
+            actor VARCHAR(96) NOT NULL,
+            actor_type VARCHAR(16) NOT NULL,
+            action VARCHAR(32) NOT NULL,
+            message TEXT NOT NULL DEFAULT '',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """))
+    for ddl in (
+        "CREATE INDEX IF NOT EXISTS ix_skill_submissions_user_id ON skill_submissions (user_id)",
+        "CREATE INDEX IF NOT EXISTS ix_skill_submissions_status ON skill_submissions (status)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_skill_submission_revision "
+        "ON skill_submissions (user_id, local_skill_id, revision)",
+        "CREATE INDEX IF NOT EXISTS ix_skill_submission_samples_submission_id "
+        "ON skill_submission_samples (submission_id)",
+        "CREATE INDEX IF NOT EXISTS ix_skill_submission_events_submission_id "
+        "ON skill_submission_events (submission_id)",
+    ):
+        await conn.execute(text(ddl))
+
+    await conn.execute(text(
+        "INSERT INTO schema_migrations (version) VALUES (:v) ON CONFLICT DO NOTHING"
+    ), {"v": MIGRATION_VERSION_SKILL_SUBMISSIONS})
+    logger.info("migration %s done", MIGRATION_VERSION_SKILL_SUBMISSIONS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_redis()
@@ -398,6 +484,14 @@ async def lifespan(app: FastAPI):
         await _migrate_v4_single_model(conn)
         await _migrate_v4_shared_token_refund(conn)
         await _migrate_admin_accounts(conn)
+        await _migrate_skill_submissions(conn)
+
+    # V4.2.3 投稿样例目录：启动即确保存在（容器内挂载持久卷后首启可写）
+    try:
+        Path(settings.SKILL_SAMPLE_DIR).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logger.warning("cannot create SKILL_SAMPLE_DIR %s", settings.SKILL_SAMPLE_DIR)
+
     await seed_defaults()
 
     # V4.2 旧美元余额 → CY 点数迁移：
@@ -478,6 +572,7 @@ app.include_router(client.router, prefix="/api/client", tags=["client"])
 app.include_router(billing_route.router, prefix="/api/billing", tags=["billing"])
 app.include_router(trial_route.router, prefix="/api/trial", tags=["trial"])
 app.include_router(skills_route.router, prefix="/api/skills", tags=["skills"])
+app.include_router(skill_submissions.router, prefix="/api/skills", tags=["skill-submissions"])
 app.include_router(admin_skills.router, prefix="/api/admin", tags=["admin-skills"])
 
 

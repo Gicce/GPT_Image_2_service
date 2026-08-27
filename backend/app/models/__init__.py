@@ -10,12 +10,12 @@ from app.models.audit import AdminAuditLog
 from app.models.config import SystemConfig
 from app.models.trial import TrialClaim
 from app.models.device import ClientDevice
-from app.models.skill import SkillPackage
+from app.models.skill import SkillPackage, SkillSubmission, SkillSubmissionEvent, SkillSubmissionSample
 
 __all__ = [
     "User", "AdminUser", "TokenInventory", "TokenAssignmentLog", "RuntimeTokenAssignment",
     "Order", "UsageLog", "OrderStatus", "RefundRequest", "RefundRequestStatus",
     "Notice", "AIModel", "BillingTransaction", "AdminAuditLog",
     "PricingRule", "CostMarginLedger", "SystemConfig", "TrialClaim", "ClientDevice",
-    "SkillPackage",
+    "SkillPackage", "SkillSubmission", "SkillSubmissionEvent", "SkillSubmissionSample",
 ]
