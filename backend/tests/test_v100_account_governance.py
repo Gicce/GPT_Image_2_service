@@ -480,6 +480,22 @@ async def test_late_payment_callback_refuses_credit_for_purged_account(client):
             "SELECT status FROM orders WHERE id = :id"), {"id": order_id}
         )).scalar() == "paid"
 
+        # 拒绝入账事件必须进管理员审计流（notify/query 的 PurgedAccountError
+        # handler 均调用 _record_purged_payment_rejected；隔离环境直接驱动该
+        # helper 断言落库内容——订单号/金额/点数/账户齐全，后台可检索）
+        from app.api.routes.payment import _record_purged_payment_rejected
+        await db.refresh(order)  # rollback 使实例过期，先刷新避免属性惰性 IO
+        await _record_purged_payment_rejected(db, order, exc=PurgedAccountError("账户已彻底删除，拒绝入账"))
+        await db.commit()
+        audits = await _audit_details("purged_payment_rejected")
+        match = [a for a in audits if a["order_id"] == order_id]
+        assert match, "拒绝入账事件未写入 admin_audit_logs"
+        entry = match[-1]
+        assert entry["user_id"] == user.id
+        assert entry["amount_cny"] == 35.0
+        assert entry["credits_granted"] == 500
+        assert "彻底删除" in entry["message"]
+
 
 # ── 列表口径 / 统计 / 旧 token 兼容 ──────────────────────────────
 

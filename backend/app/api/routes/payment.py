@@ -21,10 +21,33 @@ from app.models.token import Order, OrderStatus, RefundRequest
 from app.services.order_assignment import assign_paid_order, InvalidOrderStatusError, PurgedAccountError
 from app.services import billing
 from app.services import refund as refund_service
+from app.models.audit import AdminAuditLog
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 MIN_PAYMENT_CNY = 0.01
+
+
+async def _record_purged_payment_rejected(db: AsyncSession, order: Order, exc: Exception):
+    """迟到/重复支付回调命中已删除账户：拒绝入账事件写管理员审计流。
+
+    仅容器日志时后台不可见，对账无法定位——补一条 admin='system' 的审计
+    记录（含订单号/金额/原因），管理员在「审计日志」页可检索；人工处置
+    入口 = 订单页对该 PAID 订单执行退款（资金差异线下解决）。
+    """
+    import json as _json
+    db.add(AdminAuditLog(
+        admin="system",
+        action="purged_payment_rejected",
+        detail=_json.dumps({
+            "order_id": order.id,
+            "out_trade_no": order.out_trade_no,
+            "user_id": order.user_id,
+            "amount_cny": float(order.amount_cny),
+            "credits_granted": order.credits_granted,
+            "message": str(exc),
+        }, ensure_ascii=False),
+    ))
 
 
 def _wechatpay_error(exc: Exception) -> HTTPException:
@@ -363,8 +386,9 @@ async def wechat_notify(request: Request, db: AsyncSession = Depends(get_db)):
             logger.info(f"Notify: Order {out_trade_no} credited successfully")
         except PurgedAccountError as e:
             # 已彻底删除账户：拒绝入账（不复活、不加点数），订单保持 PAID 留痕，
-            # 应答成功避免微信重试风暴；资金差异人工对账
+            # 应答成功避免微信重试风暴；拒绝事件写审计流供人工对账（见 helper）
             logger.warning(f"Notify: {e}")
+            await _record_purged_payment_rejected(db, order, e)
             await db.commit()
         except InvalidOrderStatusError as e:
             logger.warning(f"Notify: Order {out_trade_no} - {e}")
@@ -414,6 +438,7 @@ async def query_order(
             await db.commit()
         except PurgedAccountError as e:
             logger.warning(f"Query: {e}")
+            await _record_purged_payment_rejected(db, order, e)
             await db.commit()
         except InvalidOrderStatusError as e:
             logger.warning(f"Query: Order {out_trade_no} - {e}")
