@@ -1,4 +1,12 @@
-fastapi==0.115.0
+# v1.0.0 security upgrade (verified 2026-09, pytest 178 passed):
+# fastapi/starlette/aiohttp/cryptography/python-jose/aiosmtplib fix pip-audit
+# PYSEC-2026 advisories; python-jose 3.5.0 also relaxes pyasn1>=0.5.0 so the
+# transitive pyasn1 resolves to the patched 0.6.4. starlette is a fastapi
+# transitive dep, pinned explicitly to match the verified environment.
+# Known-unpatched: ecdsa PYSEC-2026-1325 (0.19.2 is latest upstream; JWT uses
+# HS256 only, ecdsa is not on the attack surface) - documented, not fixed.
+fastapi==0.141.1
+starlette==1.6.0
 uvicorn[standard]==0.30.6
 sqlalchemy==2.0.35
 alembic==1.13.3
@@ -8,14 +16,14 @@ redis==5.1.0
 pydantic==2.9.2
 pydantic-settings==2.5.2
 email-validator==2.2.0
-python-jose[cryptography]==3.3.0
+python-jose[cryptography]==3.5.0
 passlib[bcrypt]==1.7.4
 bcrypt<5
-python-multipart==0.0.12
+python-multipart==0.0.31
 httpx==0.27.2
-aiohttp==3.10.8
+aiohttp==3.14.3
 aiofiles==24.1.0
-cryptography==43.0.1
+cryptography==50.0.0
 wechatpayv3==2.0.2
-aiosmtplib==3.0.2
+aiosmtplib==5.1.2
 docker==7.0.0

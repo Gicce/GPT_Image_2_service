@@ -11,9 +11,9 @@ visibility: internal
 ## 表清单（backend/app/models.py）
 
 ### users
-用户主表：id/username/email/password_hash/account_type/**balance_usd**/**trial_credit_usd**（Numeric(18,6)；V4.2 起降级为**兼容镜像**——业务真相为三类点数列，见下，每次点数变动后按 legacy_usd_to_credits=700 回写，供 V4.0.x 旧客户端展示）/ **paid_credits**/**trial_credits**/**gift_credits**（INTEGER，V4.2 CY Credits 业务真相，消费顺序 trial→gift→paid 唯一入口 billing.consume_credits）/**archived_at**/**archived_by**（业务历史账户归档标记）；旧 `user_tokens` 表已废弃。
+用户主表：id/username/email/password_hash/account_type/**balance_usd**/**trial_credit_usd**（Numeric(18,6)；V4.2 起降级为**兼容镜像**——业务真相为三类点数列，见下，每次点数变动后按 legacy_usd_to_credits=700 回写，供 V4.0.x 旧客户端展示）/ **paid_credits**/**trial_credits**/**gift_credits**（INTEGER，V4.2 CY Credits 业务真相，消费顺序 trial→gift→paid 唯一入口 billing.consume_credits）/**archived_at**/**archived_by**（业务历史账户归档标记）/ **password_changed_at**（v1.0.0 密码最近修改时间；存量行 NULL=未记录，接口不编造）/ **token_version**（v1.0.0 会话撤销版本，JWT `tv` 比对；密码重置/自助改密/归档/彻底删除 +1）/ **purged_at**/**purged_by**/**purge_reason**（v1.0.0 彻底删除三元组，purged 后为脱敏账务主体：username=`purged-{uuid12}`、email=`@purged.invalid`、密码哈希随机重写、is_active=false）；旧 `user_tokens` 表已废弃。
 
-客户移除规则：无订单、退款、账务、用量、成本经营记录的账户才可物理删除；事务内清理 `client_devices` 与 `runtime_token_assignments`。存在任一业务历史时只允许归档（`is_active=false` 并释放有效 Token）。`trial_claims` 和 `token_assignment_logs` 始终保留，防止删号后重复试用并维持分配审计链。
+客户移除规则（v1.0.0 hard-delete）：进行中业务（RESERVED 预占/进行中退款/PENDING、PAID 订单）硬阻断；非零余额先核销（逐桶写 ADMIN_ADJUSTMENT 流水后清零，不构成收入）；无业务历史且未处置余额 → 物理 DELETE（事务内清理 `client_devices` 与 `runtime_token_assignments`），否则保留脱敏账务主体（FK 不断，订单/流水/用量可追溯）。两路径邮箱/用户名均立即释放可重注册。`trial_claims` 和 `token_assignment_logs` 始终保留，防止删号后重复试用并维持分配审计链。
 
 ### billing_transactions —— 账务审计单一真相源
 统一账务流水（**资金变动的唯一审计/对账依据**；当前余额状态另存于 users 行，见上）。关键字段：

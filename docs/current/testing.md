@@ -20,6 +20,12 @@ migrated_at: 2026-09-05
 |---|---|
 | 服务端 API/计费/权限 | 对应 pytest；计费必须验证幂等、预占、结算与失败回滚 |
 | 数据库 | migration/model/repository 契约验证，不改已执行 migration |
+| 账户治理（归档/删除/重置密码/会话） | `tests/test_v100_account_governance.py`（13 项：撤销/恢复/双路径删除/阻断/幂等/迟到回调/权限/审计脱敏/tv 兼容窗口） |
+| 依赖升级 | `pip check` + 导入冒烟 + 全量 pytest（v1.0.0 升级后 178 passed 零回归） |
+
+**当前全量口径（v1.0.0，2026-09-06）：pytest 178 passed**（隔离库 cyimage_v4_test + Redis db15；conftest 重建 TEST_ADMIN，`make_admin_headers(role, admin_id, username)` 可造普通管理员 token）。管理后台 `npm run build` 通过。
+
+**测试环境硬边界**：支付链路全 monkeypatch / dev-payment，不触真实微信；不连生产库；不启动用户日常开发实例；测试后临时数据随测试库重建清理。
 
 ## Release 发布前验证清单
 

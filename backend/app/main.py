@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,6 +14,7 @@ import asyncio
 
 from app.core.database import engine, Base, AsyncSessionLocal, AsyncSession
 from app.core.redis import init_redis, recover_processing_refunds
+from app.core.security import get_admin_user
 from app.api.routes import auth, users, tokens, payment, notice, models, admin, usage, client, admin_accounts, admin_skills, skill_submissions, skills as skills_route, billing as billing_route, trial as trial_route
 from app.models.content import AIModel
 from app.models.billing import PricingRule
@@ -28,8 +29,75 @@ logger = logging.getLogger(__name__)
 
 IMAGE2_MODEL_ID = "gpt-image-2"
 
-# 服务版本唯一来源：/health、/api/health 与 FastAPI 元数据均引用此常量
-APP_VERSION = "4.2.3"
+# ── 版本线（v1.0.0 起为 image-service 独立版本线基线） ──────────────
+# 版本历史口径：4.x 为与客户端共用的工作区统一版本号；2026-09-06 起服务端
+# 以独立的 1.x 版本线发布，客户端版本线不受影响。/health、/api/health、
+# FastAPI 元数据、管理后台版本页与版本日志共用 APP_VERSION / VERSION_LOG
+# 这两个唯一事实源；历史迁移标识（schema_migrations 各 version）不随版本号变化。
+APP_VERSION = "1.0.0"
+APP_VERSION_STATUS = "pending_release"  # 已合入未部署：部署验收后改为 released
+
+# 构建信息由部署流程经环境变量注入（BUILD_COMMIT / BUILD_TIME）；
+# 缺失时如实返回 null，管理后台显示"未记录"，不伪造构建数据
+BUILD_COMMIT = os.environ.get("BUILD_COMMIT") or None
+BUILD_TIME = os.environ.get("BUILD_TIME") or None
+
+VERSION_LOG = [
+    {
+        "version": "1.0.0",
+        "date": "2026-09-06",
+        "status": "pending_release",
+        "features": [
+            "账户治理：管理员重置客户密码（支持自动生成临时密码，仅展示一次）",
+            "账户治理：客户归档 / 恢复 / 彻底删除三段生命周期，彻底删除支持非零余额核销并保留账务追溯",
+            "会话撤销：密码重置、归档、恢复、彻底删除使存量登录凭据立即失效",
+            "邮箱释放：彻底删除后原邮箱可重新注册（新用户 ID，不继承资产；试用领取资格仍一次性）",
+            "版本体系：image-service 独立版本线基线，管理后台新增版本与更新日志页",
+        ],
+        "fixes": [
+            "用户自助找回密码后旧登录会话不再保持有效（token_version 撤销）",
+            "已彻底删除账户的迟到 / 重复支付回调拒绝入账，避免复活账户或误加资产",
+            "已归档账户不再允许调整余额与绑定 Runtime Token（收紧生命周期边界）",
+        ],
+        "notes": [
+            "数据库新增 users.password_changed_at / token_version / purged_at / purged_by / purge_reason 列（幂等加列，无需停机）",
+            "旧客户端兼容：现有 Bearer token（无版本字段）在未发生撤销事件前继续有效；/health 结构不变",
+            "升级注意：部署后管理员重置密码功能要求管理员输入本人登录密码二次确认",
+        ],
+    },
+    {
+        "version": "4.2.3",
+        "date": "2026-08-28",
+        "status": "released",
+        "features": [
+            "社区 Skill 投稿与审核（投稿 / 样例 / 修订 / 审核事件 / 公共 Catalog 发布）",
+            "Skill 创作器与视觉项目通用化（客户端侧配合发布）",
+        ],
+        "fixes": [
+            "投稿端点生产 404 根因修复（功能未部署）",
+            "样例上传原子写入与错误结构化",
+        ],
+        "notes": ["与客户端 v4.2.3 同步发布的最后一个共用版本号"],
+    },
+    {
+        "version": "4.2.2",
+        "date": "2026-08-27",
+        "status": "released",
+        "features": ["Skill Catalog 版本化与管理端内容中心", "报价冻结与点数计费体系完善（ADR-018）"],
+        "fixes": [], "notes": [],
+    },
+    {
+        "version": "4.2.0",
+        "date": "2026-08-24",
+        "status": "released",
+        "features": [
+            "CY Credits 点数计费（¥1=100 点，trial→gift→paid 消费顺序）",
+            "试用一次性领取（trial_claims 邮箱唯一）",
+            "成本与毛利经营账、客户端设备历史",
+        ],
+        "fixes": [], "notes": [],
+    },
+]
 
 # V4：系统仅提供 Image2 一个收费模型，seed 只保证它存在，不再创建任何其他默认模型。
 IMAGE2_SEED = {
@@ -117,6 +185,12 @@ async def _ensure_columns(conn):
         ("users", "gift_credits", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "archived_at", "TIMESTAMPTZ"),
         ("users", "archived_by", "VARCHAR(64)"),
+        # v1.0.0 账户治理：密码修改时间 / 会话撤销版本 / 彻底删除标记
+        ("users", "password_changed_at", "TIMESTAMPTZ"),
+        ("users", "token_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("users", "purged_at", "TIMESTAMPTZ"),
+        ("users", "purged_by", "VARCHAR(64)"),
+        ("users", "purge_reason", "VARCHAR(255)"),
         ("billing_transactions", "unit_credits", "INTEGER"),
         ("billing_transactions", "amount_credits", "INTEGER NOT NULL DEFAULT 0"),
         ("billing_transactions", "trial_credits_part", "INTEGER NOT NULL DEFAULT 0"),
@@ -606,3 +680,23 @@ async def health():
 @app.get("/api/health")
 async def api_health():
     return {"ok": True, "service": "cyimagepro-server", "version": APP_VERSION}
+
+
+@app.get("/api/admin/version")
+async def admin_version(_=Depends(get_admin_user)):
+    """管理后台「版本与更新日志」页数据源（与 /health 同一事实源）。
+
+    - environment：如实返回运行环境（production / development），不伪造
+    - build_commit / build_time：部署注入，缺失为 null（前端显示"未记录"）
+    - api_compat：兼容性口径说明字段，供后台展示；不做接口网关拦截
+    """
+    return {
+        "version": APP_VERSION,
+        "version_status": APP_VERSION_STATUS,
+        "environment": settings.APP_ENV,
+        "build_commit": BUILD_COMMIT,
+        "build_time": BUILD_TIME,
+        "api_compat": "4.x-compatible",
+        "version_line": "image-service",
+        "version_log": VERSION_LOG,
+    }

@@ -28,6 +28,10 @@ class InvalidOrderStatusError(AssignmentError):
     pass
 
 
+class PurgedAccountError(AssignmentError):
+    """订单所属账户已被彻底删除（脱敏主体保留）：迟到/重复支付回调不得入账。"""
+
+
 async def _order_credits(db: AsyncSession, order: Order) -> int:
     """订单到账点数：优先 credits_granted 快照；旧订单按 USD × legacy 率折算。"""
     if order.credits_granted is not None and order.credits_granted > 0:
@@ -50,6 +54,14 @@ async def assign_paid_order(
     if order.status != OrderStatus.PAID:
         raise InvalidOrderStatusError(
             f"Order {order.out_trade_no} status is {order.status}, cannot credit. Only PAID orders can be credited."
+        )
+
+    # 已彻底删除账户的迟到/重复回调：不入账、不复活账户、不改账户类型；
+    # 由调用方记日志后向微信应答成功（避免重试风暴），资金差异走人工对账
+    user_row = await db.get(User, order.user_id)
+    if user_row is not None and user_row.purged_at is not None:
+        raise PurgedAccountError(
+            f"Order {order.out_trade_no} belongs to purged account {order.user_id}; credit refused"
         )
 
     credits = await _order_credits(db, order)

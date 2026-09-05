@@ -3,13 +3,14 @@
     <div class="page-header">
       <div class="page-header-left">
         <h2 class="page-header-title">客户账户</h2>
-        <p class="page-header-subtitle">CY 点数统一账户：正式、试用与赠送点数</p>
+        <p class="page-header-subtitle">CY 点数统一账户：当前客户 → 归档 → 彻底删除 三段生命周期</p>
       </div>
     </div>
 
     <n-tabs v-model:value="accountTab" type="line" animated @update:value="onAccountTabChange">
       <n-tab-pane name="current" :tab="`当前客户（${currentUsers.length}）`" />
       <n-tab-pane name="archived" :tab="archivedLoaded ? `归档记录（${archivedUsers.length}）` : '归档记录'" />
+      <n-tab-pane name="purged" :tab="purgedLoaded ? `已删除账户（${purgedUsers.length}）` : '已删除账户'" />
     </n-tabs>
 
     <div class="filter-bar">
@@ -40,13 +41,22 @@
             </n-tag>
           </n-descriptions-item>
           <n-descriptions-item label="状态">
-            <n-tag :type="detailUser.archived_at ? 'default' : (detailUser.is_active ? 'success' : 'error')" size="small" :bordered="false">
-              {{ detailUser.archived_at ? '已归档' : (detailUser.is_active ? '正常' : '禁用') }}
+            <n-tag :type="statusTagOf(detailUser)" size="small" :bordered="false">
+              {{ statusLabelOf(detailUser) }}
             </n-tag>
           </n-descriptions-item>
           <n-descriptions-item label="注册时间">{{ formatTime(detailUser.created_at) }}</n-descriptions-item>
           <n-descriptions-item label="试用到期">
             {{ detailUser.trial_expires_at ? formatTime(detailUser.trial_expires_at) : '-' }}
+          </n-descriptions-item>
+          <n-descriptions-item label="密码">
+            {{ detailUser.password_changed_at ? `已设置 · 最近修改 ${formatTime(detailUser.password_changed_at)}` : '未记录' }}
+          </n-descriptions-item>
+          <n-descriptions-item v-if="detailUser.archived_at" label="归档信息">
+            {{ formatTime(detailUser.archived_at) }} · 操作者 {{ detailUser.archived_by || '-' }}
+          </n-descriptions-item>
+          <n-descriptions-item v-if="detailUser.purged_at" label="彻底删除">
+            {{ formatTime(detailUser.purged_at) }} · 操作者 {{ detailUser.purged_by || '-' }} · 原因：{{ detailUser.purge_reason || '-' }}
           </n-descriptions-item>
         </n-descriptions>
 
@@ -69,7 +79,7 @@
             </div>
           </template>
           <p v-else class="runtime-token-empty">尚未分配 Image2 Runtime Token（生成时回落使用服务端 Master Token）</p>
-          <n-space v-if="!detailUser.archived_at" size="small">
+          <n-space v-if="!detailUser.archived_at && !detailUser.purged_at" size="small">
             <n-button size="small" type="primary" secondary :loading="assignSubmitting" @click="openAssignToken">
               {{ detailUser.runtime_token ? '更换 Token' : '分配 Token' }}
             </n-button>
@@ -133,7 +143,10 @@
       <template #footer>
         <n-space justify="end">
           <n-button @click="showDetail = false">关闭</n-button>
-          <n-button v-if="!detailUser.archived_at" type="primary" @click="openBalance(detailUser)">调整余额</n-button>
+          <n-button
+            v-if="!detailUser?.archived_at && !detailUser?.purged_at"
+            type="primary" @click="openBalance(detailUser)"
+          >调整余额</n-button>
         </n-space>
       </template>
     </n-modal>
@@ -246,20 +259,170 @@
         </n-space>
       </template>
     </n-modal>
+
+    <!-- 重置客户密码 -->
+    <n-modal v-model:show="showResetPassword" preset="card" title="重置客户密码"
+      style="width:min(560px,calc(100vw - 48px));max-height:calc(100vh - 48px)" content-style="overflow:auto"
+      @after-leave="onResetPasswordClosed">
+      <template v-if="resetTarget && !resetResult">
+        <n-alert type="warning" :bordered="false" style="margin-bottom:16px">
+          为账户「{{ resetTarget.username }}」重置密码。原密码不可查看；重置后该账户所有已登录会话立即失效。
+          新密码留空时由系统生成随机临时密码，仅显示一次，关闭后无法再查。
+        </n-alert>
+        <n-form label-placement="left" label-width="100">
+          <n-form-item label="管理员密码" required>
+            <n-input
+              v-model:value="resetForm.admin_password"
+              type="password" show-password-on="click"
+              placeholder="输入你本人的登录密码以确认操作"
+            />
+          </n-form-item>
+          <n-form-item label="新密码">
+            <n-input
+              v-model:value="resetForm.new_password"
+              type="password" show-password-on="click"
+              placeholder="留空 = 生成随机临时密码；手动设置至少 8 位"
+              :status="resetError ? 'error' : undefined"
+            />
+          </n-form-item>
+          <n-form-item label="原因" required>
+            <n-input v-model:value="resetForm.reason" placeholder="将写入审计日志（不含密码）" maxlength="255" />
+          </n-form-item>
+        </n-form>
+        <div v-if="resetError" style="color:var(--cy-danger);font-size:13px">{{ resetError }}</div>
+      </template>
+      <template v-else-if="resetResult">
+        <n-alert type="success" :bordered="false" style="margin-bottom:16px">
+          密码已重置{{ resetResult.generated ? '，临时密码如下（仅显示这一次，请立即转达客户）' : '' }}。
+          审计日志仅记录操作与原因，不记录密码。
+        </n-alert>
+        <template v-if="resetResult.generated">
+          <div class="temp-password-box">
+            <span class="temp-password-value">{{ tempPasswordVisible ? resetResult.new_password : '••••••••••••' }}</span>
+            <n-button size="small" quaternary type="primary" @click="tempPasswordVisible = !tempPasswordVisible">
+              {{ tempPasswordVisible ? '隐藏' : '显示' }}
+            </n-button>
+            <n-button size="small" quaternary type="primary" @click="copyTempPassword">复制</n-button>
+          </div>
+          <p class="temp-password-hint">关闭本窗口后临时密码不可再查看，也不会出现在任何日志中。</p>
+        </template>
+      </template>
+      <template #footer>
+        <n-space justify="end">
+          <template v-if="!resetResult">
+            <n-button @click="showResetPassword = false">取消</n-button>
+            <n-button type="primary" :loading="resetting" @click="submitResetPassword">确认重置</n-button>
+          </template>
+          <n-button v-else type="primary" @click="showResetPassword = false">我已保存，关闭</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <!-- 归档账户 -->
+    <n-modal v-model:show="showArchive" preset="card" title="归档客户账户"
+      style="width:min(520px,calc(100vw - 48px));max-height:calc(100vh - 48px)" content-style="overflow:auto">
+      <template v-if="archiveTarget">
+        <n-alert type="warning" :bordered="false" style="margin-bottom:16px">
+          归档「{{ archiveTarget.username }}」：立即禁止登录并撤销全部已登录会话，解除 Runtime Token 绑定。
+          历史订单、账务与用量记录完整保留；归档后可恢复，也可从「归档记录」执行彻底删除。
+        </n-alert>
+        <n-form label-placement="left" label-width="80">
+          <n-form-item label="原因">
+            <n-input v-model:value="archiveReason" placeholder="将写入审计日志" maxlength="255" />
+          </n-form-item>
+        </n-form>
+      </template>
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="showArchive = false">取消</n-button>
+          <n-button type="warning" :loading="archiving" @click="submitArchive">确认归档</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <!-- 恢复账户 -->
+    <n-modal v-model:show="showRestore" preset="card" title="恢复归档账户"
+      style="width:min(520px,calc(100vw - 48px));max-height:calc(100vh - 48px)" content-style="overflow:auto">
+      <template v-if="restoreTarget">
+        <n-alert type="info" :bordered="false" style="margin-bottom:16px">
+          恢复「{{ restoreTarget.username }}」：账户重新启用，原密码可重新登录（归档前的旧会话不会复活，
+          Runtime Token 不自动重绑，按现行分配规则重新获取）。
+        </n-alert>
+        <n-form label-placement="left" label-width="80">
+          <n-form-item label="原因">
+            <n-input v-model:value="restoreReason" placeholder="将写入审计日志" maxlength="255" />
+          </n-form-item>
+        </n-form>
+      </template>
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="showRestore = false">取消</n-button>
+          <n-button type="primary" :loading="restoring" @click="submitRestore">确认恢复</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <!-- 彻底删除账户（仅超级管理员） -->
+    <n-modal v-model:show="showHardDelete" preset="card" title="彻底删除账户"
+      style="width:min(640px,calc(100vw - 48px));max-height:calc(100vh - 48px)" content-style="overflow:auto">
+      <template v-if="hardDeleteTarget">
+        <n-alert type="error" :bordered="false" style="margin-bottom:16px">
+          此操作不可恢复（后台无法撤销）。删除成功后该邮箱可被重新注册（新账户不继承任何资产）。
+          进行中的支付、退款、扣费预占会阻断删除，必须先处理完毕。
+        </n-alert>
+        <n-descriptions :column="1" bordered label-placement="left" size="small" style="margin-bottom:16px">
+          <n-descriptions-item label="账户">{{ hardDeleteTarget.username }}（{{ hardDeleteTarget.email }}）</n-descriptions-item>
+          <n-descriptions-item label="剩余点数">
+            正式 {{ hardDeleteTarget.paid_credits ?? 0 }} / 试用 {{ hardDeleteTarget.trial_credits ?? 0 }} /
+            赠送 {{ hardDeleteTarget.gift_credits ?? 0 }} —— 删除时按「核销」清零并写独立账务流水（不构成收入、不自动退款）
+          </n-descriptions-item>
+          <n-descriptions-item label="历史留存">
+            订单 / 支付退款凭据 / 账务流水 / 审计记录按最小必要保留，登录身份与凭据彻底消灭，只能查看不能登录
+          </n-descriptions-item>
+        </n-descriptions>
+        <n-form label-placement="left" label-width="110">
+          <n-form-item label="管理员密码" required>
+            <n-input
+              v-model:value="hardDeleteForm.admin_password"
+              type="password" show-password-on="click"
+              placeholder="输入你本人的登录密码以确认操作"
+            />
+          </n-form-item>
+          <n-form-item label="确认目标账户" required>
+            <n-input
+              v-model:value="hardDeleteForm.confirm_identity"
+              placeholder="输入该账户的用户名或邮箱以确认"
+              :status="hardDeleteError ? 'error' : undefined"
+            />
+          </n-form-item>
+          <n-form-item label="删除原因" required>
+            <n-input v-model:value="hardDeleteForm.reason" placeholder="将写入审计日志" maxlength="255" />
+          </n-form-item>
+        </n-form>
+        <div v-if="hardDeleteError" style="color:var(--cy-danger);font-size:13px;white-space:pre-line">{{ hardDeleteError }}</div>
+      </template>
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="showHardDelete = false">取消</n-button>
+          <n-button type="error" :loading="hardDeleting" @click="submitHardDelete">确认彻底删除</n-button>
+        </n-space>
+      </template>
+    </n-modal>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, h } from 'vue'
-import { NTag, NButton, NSpace, useMessage, useDialog } from 'naive-ui'
+import { NTag, NButton, NSpace, useMessage } from 'naive-ui'
 import http from '../api/http'
 import { formatTime } from '../utils/time'
 
 const message = useMessage()
-const dialog = useDialog()
 const currentUsers = ref([])
 const archivedUsers = ref([])
 const archivedLoaded = ref(false)
+const purgedUsers = ref([])
+const purgedLoaded = ref(false)
 const accountTab = ref('current')
 const filterType = ref(null)
 const filterStatus = ref(null)
@@ -279,6 +442,9 @@ const assignTokensLoading = ref(false)
 const assignSelectedId = ref(null)
 const assignSubmitting = ref(false)
 
+// 当前管理员角色（彻底删除仅超级管理员可见可操作）
+const isSuperAdmin = ref(false)
+
 const typeOptions = [
   { label: '试用', value: 'trial' },
   { label: '普通', value: 'normal' },
@@ -293,18 +459,25 @@ const statusOptions = [
 const typeTag = { trial: 'warning', paid: 'success', normal: 'default' }
 const typeLabel = { trial: '试用', paid: '付费', normal: '普通' }
 
-// 金额格式化：字符串 Decimal → 按需保留小数
-function fmt(v, digits) {
-  const n = Number(v)
-  if (!isFinite(n)) return '0.00'
-  return n.toFixed(digits)
+function statusTagOf(u) {
+  if (u.purged_at) return 'error'
+  if (u.archived_at) return 'default'
+  return u.is_active ? 'success' : 'error'
+}
+
+function statusLabelOf(u) {
+  if (u.purged_at) return '已彻底删除'
+  if (u.archived_at) return '已归档'
+  return u.is_active ? '正常' : '禁用'
 }
 
 const filtered = computed(() => {
-  let list = accountTab.value === 'archived' ? archivedUsers.value : currentUsers.value
+  let list = accountTab.value === 'archived' ? archivedUsers.value
+    : accountTab.value === 'purged' ? purgedUsers.value
+    : currentUsers.value
   if (filterType.value) list = list.filter(u => u.account_type === filterType.value)
-  if (filterStatus.value === 'active') list = list.filter(u => u.is_active && !u.archived_at)
-  if (filterStatus.value === 'disabled') list = list.filter(u => !u.is_active && !u.archived_at)
+  if (filterStatus.value === 'active') list = list.filter(u => u.is_active && !u.archived_at && !u.purged_at)
+  if (filterStatus.value === 'disabled') list = list.filter(u => !u.is_active && !u.archived_at && !u.purged_at)
   if (search.value) {
     const q = search.value.toLowerCase()
     list = list.filter(u =>
@@ -315,7 +488,36 @@ const filtered = computed(() => {
   return list
 })
 
-const allColumns = [
+const actionColumn = computed(() => {
+  const renderActions = row => {
+    if (row.purged_at) {
+      return [h(NButton, { size: 'small', quaternary: true, type: 'info', onClick: () => viewUser(row) }, { default: () => '查看' })]
+    }
+    if (row.archived_at) {
+      const buttons = [
+        h(NButton, { size: 'small', quaternary: true, type: 'info', onClick: () => viewUser(row) }, { default: () => '查看' }),
+        h(NButton, { size: 'small', quaternary: true, type: 'success', onClick: () => openRestore(row) }, { default: () => '恢复' }),
+      ]
+      if (isSuperAdmin.value) {
+        buttons.push(h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => openHardDelete(row) }, { default: () => '彻底删除' }))
+      }
+      return buttons
+    }
+    return [
+      h(NButton, { size: 'small', quaternary: true, type: 'info', onClick: () => viewUser(row) }, { default: () => '查看' }),
+      h(NButton, { size: 'small', quaternary: true, type: 'warning', onClick: () => openEdit(row) }, { default: () => '编辑' }),
+      h(NButton, { size: 'small', quaternary: true, type: 'primary', onClick: () => openBalance(row) }, { default: () => '调余额' }),
+      h(NButton, { size: 'small', quaternary: true, type: 'primary', onClick: () => openResetPassword(row) }, { default: () => '重置密码' }),
+      h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => openArchive(row) }, { default: () => '归档' }),
+    ]
+  }
+  return {
+    title: '操作', key: 'actions', width: accountTab.value === 'current' ? 320 : 250, fixed: 'right',
+    render: row => h(NSpace, { size: 'small' }, { default: () => renderActions(row) }),
+  }
+})
+
+const baseColumns = computed(() => [
   { title: '#', key: 'index', width: 50, render: (_, index) => index + 1 },
   { title: '用户名', key: 'username', width: 130 },
   { title: '邮箱', key: 'email', width: 200, ellipsis: true },
@@ -342,36 +544,27 @@ const allColumns = [
       { default: () => typeLabel[row.account_type] || row.account_type }),
   },
   {
-    title: '状态', key: 'is_active', width: 80,
-    render: row => h(NTag, {
-      type: row.archived_at ? 'default' : (row.is_active ? 'success' : 'error'),
-      size: 'small', bordered: false,
-    }, { default: () => row.archived_at ? '已归档' : (row.is_active ? '正常' : '禁用') }),
+    title: '状态', key: 'is_active', width: 100,
+    render: row => h(NTag, { type: statusTagOf(row), size: 'small', bordered: false },
+      { default: () => statusLabelOf(row) }),
   },
   {
-    title: '注册时间', key: 'created_at', width: 160,
-    render: row => formatTime(row.created_at),
+    title: accountTab.value === 'archived' ? '归档时间' : accountTab.value === 'purged' ? '删除时间' : '注册时间',
+    key: 'created_at', width: 160,
+    render: row => formatTime(
+      accountTab.value === 'archived' ? (row.archived_at || row.created_at)
+        : accountTab.value === 'purged' ? (row.purged_at || row.created_at)
+        : row.created_at
+    ),
   },
-  {
-    title: '操作', key: 'actions', width: 250, fixed: 'right',
-    render: row => h(NSpace, { size: 'small' }, {
-      default: () => row.archived_at ? [
-        h(NButton, { size: 'small', quaternary: true, type: 'info', onClick: () => viewUser(row) }, { default: () => '查看' }),
-      ] : [
-        h(NButton, { size: 'small', quaternary: true, type: 'info', onClick: () => viewUser(row) }, { default: () => '查看' }),
-        h(NButton, { size: 'small', quaternary: true, type: 'warning', onClick: () => openEdit(row) }, { default: () => '编辑' }),
-        h(NButton, { size: 'small', quaternary: true, type: 'primary', onClick: () => openBalance(row) }, { default: () => '调余额' }),
-        h(NButton, { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDelete(row) }, { default: () => '删除' }),
-      ]
-    }),
-  },
-]
+  actionColumn.value,
+])
 
 const compactColumnKeys = new Set(['index', 'username', 'email', 'total_credits', 'account_type', 'is_active', 'actions'])
 const columns = computed(() => viewportWidth.value >= 1600
-  ? allColumns
-  : allColumns.filter(column => compactColumnKeys.has(column.key)))
-const tableScrollX = computed(() => viewportWidth.value >= 1600 ? 1300 : 900)
+  ? baseColumns.value
+  : baseColumns.value.filter(column => compactColumnKeys.has(column.key)))
+const tableScrollX = computed(() => viewportWidth.value >= 1600 ? 1350 : 900)
 
 const usageColumns = [
   { title: '模型', key: 'model', width: 120 },
@@ -394,6 +587,9 @@ async function loadUsers(scope = accountTab.value) {
     if (scope === 'archived') {
       archivedUsers.value = data
       archivedLoaded.value = true
+    } else if (scope === 'purged') {
+      purgedUsers.value = data
+      purgedLoaded.value = true
     } else {
       currentUsers.value = data
     }
@@ -407,6 +603,7 @@ async function onAccountTabChange(scope) {
   filterType.value = null
   search.value = ''
   if (scope === 'archived' && !archivedLoaded.value) await loadUsers('archived')
+  if (scope === 'purged' && !purgedLoaded.value) await loadUsers('purged')
 }
 
 // 5xx 时后端 detail 是通用文案，仍避免把任何内部信息弹给管理员
@@ -568,57 +765,203 @@ async function submitAssignToken() {
   }
 }
 
-async function confirmDelete(row) {
-  let preview
+// ── 重置客户密码（v1.0.0） ────────────────────────────────────
+// 临时密码只存内存 ref，对话框关闭即清除；不写 localStorage / URL / 任何持久化状态
+
+const showResetPassword = ref(false)
+const resetTarget = ref(null)
+const resetForm = ref({ admin_password: '', new_password: '', reason: '' })
+const resetResult = ref(null)
+const resetting = ref(false)
+const resetError = ref('')
+const tempPasswordVisible = ref(false)
+
+function openResetPassword(row) {
+  resetTarget.value = row
+  resetForm.value = { admin_password: '', new_password: '', reason: '' }
+  resetResult.value = null
+  resetError.value = ''
+  tempPasswordVisible.value = true
+  showResetPassword.value = true
+}
+
+function onResetPasswordClosed() {
+  // 关闭即弃：临时密码从内存清除，此后任何界面都无法再查看
+  resetTarget.value = null
+  resetResult.value = null
+  resetForm.value = { admin_password: '', new_password: '', reason: '' }
+  resetError.value = ''
+  tempPasswordVisible.value = false
+}
+
+async function submitResetPassword() {
+  const f = resetForm.value
+  resetError.value = ''
+  if (!f.admin_password) { resetError.value = '请输入管理员密码'; return }
+  if (!f.reason.trim()) { resetError.value = '请填写操作原因'; return }
+  if (f.new_password && f.new_password.length < 8) { resetError.value = '手动设置的新密码至少 8 位'; return }
+
+  resetting.value = true
   try {
-    const response = await http.get(`/api/admin/users/${row.id}/deletion-preview`)
-    preview = response.data
+    const body = { admin_password: f.admin_password, reason: f.reason.trim() }
+    if (f.new_password) body.new_password = f.new_password
+    const { data } = await http.post(`/api/admin/users/${resetTarget.value.id}/reset-password`, body)
+    resetResult.value = { generated: data.generated, new_password: data.new_password }
+    if (data.generated) tempPasswordVisible.value = true
+    await loadUsers()
   } catch (e) {
-    message.error(apiError(e, '无法检查账户关联数据，请稍后重试'))
-    return
+    const detail = e.response?.data?.detail
+    resetError.value = typeof detail === 'object' ? (detail?.message || '重置失败') : (detail || '重置失败')
+  } finally {
+    resetting.value = false
   }
+}
 
-  const isArchive = preview.mode === 'archive'
-  const blockerLabels = {
-    orders: '订单', refund_requests: '退款', billing_transactions: '账务流水',
-    usage_logs: '用量记录', cost_margin_ledger: '成本记录',
+async function copyTempPassword() {
+  const pw = resetResult.value?.new_password
+  if (!pw) return
+  try {
+    await navigator.clipboard.writeText(pw)
+    message.success('已复制到剪贴板')
+  } catch {
+    message.warning('复制失败，请手动选择复制')
   }
-  const blockerText = Object.entries(preview.blockers || {})
-    .filter(([, count]) => count > 0)
-    .map(([key, count]) => `${blockerLabels[key] || key} ${count} 条`)
-    .join('、')
+}
 
-  dialog.warning({
-    title: isArchive ? '归档客户账户' : '彻底删除空账户',
-    content: isArchive
-      ? `账户“${row.username}”存在业务历史（${blockerText}），将改为归档：禁止登录并解除 Token 绑定，历史数据继续保留。`
-      : `账户“${row.username}”没有业务历史，将彻底删除账户及设备、Token 绑定。试用领取与分配审计仍会保留。`,
-    positiveText: isArchive ? '确认归档' : '确认删除',
-    negativeText: '取消',
-    onPositiveClick: async () => {
-      try {
-        if (isArchive) {
-          await http.post(`/api/admin/users/${row.id}/archive`, { reason: '管理员从客户账户列表归档' })
-          message.success('账户已归档，业务历史已保留')
-        } else {
-          await http.delete(`/api/admin/users/${row.id}`)
-          message.success('空账户已彻底删除')
-        }
-        await loadUsers('current')
-        if (isArchive) await loadUsers('archived')
-      } catch (e) {
-        const detail = e.response?.data?.detail
-        message.error(typeof detail === 'object' ? (detail.message || '操作失败') : (detail || '操作失败'))
+// ── 归档 / 恢复（v1.0.0：当前客户 → 归档 → 彻底删除 统一流） ──
+
+const showArchive = ref(false)
+const archiveTarget = ref(null)
+const archiveReason = ref('')
+const archiving = ref(false)
+const showRestore = ref(false)
+const restoreTarget = ref(null)
+const restoreReason = ref('')
+const restoring = ref(false)
+
+function openArchive(row) {
+  archiveTarget.value = row
+  archiveReason.value = ''
+  showArchive.value = true
+}
+
+async function submitArchive() {
+  archiving.value = true
+  try {
+    await http.post(`/api/admin/users/${archiveTarget.value.id}/archive`, {
+      reason: archiveReason.value || '管理员从客户账户列表归档',
+    })
+    message.success('账户已归档：禁止登录、撤销会话、解除 Token 绑定，历史数据保留')
+    showArchive.value = false
+    await loadUsers('current')
+    archivedLoaded.value = false
+  } catch (e) {
+    const detail = e.response?.data?.detail
+    message.error(typeof detail === 'object' ? (detail.message || '归档失败') : (detail || '归档失败'))
+  } finally {
+    archiving.value = false
+  }
+}
+
+function openRestore(row) {
+  restoreTarget.value = row
+  restoreReason.value = ''
+  showRestore.value = true
+}
+
+async function submitRestore() {
+  restoring.value = true
+  try {
+    await http.post(`/api/admin/users/${restoreTarget.value.id}/restore`, {
+      reason: restoreReason.value || '管理员恢复归档账户',
+    })
+    message.success('账户已恢复：原密码可重新登录（旧会话不复活）')
+    showRestore.value = false
+    await loadUsers('archived')
+    await loadUsers('current')
+  } catch (e) {
+    const detail = e.response?.data?.detail
+    message.error(typeof detail === 'object' ? (detail.message || '恢复失败') : (detail || '恢复失败'))
+  } finally {
+    restoring.value = false
+  }
+}
+
+// ── 彻底删除（v1.0.0：仅超级管理员，二次身份确认 + 进行中业务阻断） ──
+
+const showHardDelete = ref(false)
+const hardDeleteTarget = ref(null)
+const hardDeleteForm = ref({ admin_password: '', confirm_identity: '', reason: '' })
+const hardDeleteError = ref('')
+const hardDeleting = ref(false)
+
+const blockerLabels = {
+  reserved_billing: '未结算预占',
+  open_refunds: '进行中退款',
+  incomplete_orders: '未完成订单（待支付/已支付未入账）',
+}
+
+function openHardDelete(row) {
+  hardDeleteTarget.value = row
+  hardDeleteForm.value = { admin_password: '', confirm_identity: '', reason: '' }
+  hardDeleteError.value = ''
+  showHardDelete.value = true
+}
+
+async function submitHardDelete() {
+  const f = hardDeleteForm.value
+  hardDeleteError.value = ''
+  if (!f.admin_password) { hardDeleteError.value = '请输入管理员密码'; return }
+  if (!f.confirm_identity.trim()) { hardDeleteError.value = '请输入目标账户的用户名或邮箱以确认'; return }
+  if (!f.reason.trim()) { hardDeleteError.value = '请填写删除原因'; return }
+
+  hardDeleting.value = true
+  try {
+    const { data } = await http.post(`/api/admin/users/${hardDeleteTarget.value.id}/hard-delete`, {
+      admin_password: f.admin_password,
+      confirm_identity: f.confirm_identity.trim(),
+      reason: f.reason.trim(),
+    })
+    const modeText = data.mode === 'anonymize'
+      ? '登录身份已消灭，账务记录以脱敏主体保留可追溯'
+      : '账户及设备、Token 绑定已物理删除'
+    message.success(`彻底删除完成：${modeText}。邮箱已释放`)
+    showHardDelete.value = false
+    await loadUsers('archived')
+    await loadUsers('purged')
+    await loadUsers('current')
+  } catch (e) {
+    const detail = e.response?.data?.detail
+    if (detail && typeof detail === 'object') {
+      if (detail.code === 'USER_HARD_DELETE_BLOCKED' && detail.blockers) {
+        const lines = Object.entries(detail.blockers)
+          .filter(([, count]) => count > 0)
+          .map(([key, count]) => `${blockerLabels[key] || key} ${count} 项`)
+        hardDeleteError.value = `存在进行中业务，必须先处理完毕：${lines.join('、')}（不支持强制绕过）`
+      } else if (detail.code === 'CONFIRM_MISMATCH') {
+        hardDeleteError.value = detail.message || '确认信息与目标账户不匹配'
+      } else {
+        hardDeleteError.value = detail.message || '删除失败'
       }
-    },
-  })
+    } else {
+      hardDeleteError.value = typeof detail === 'string' ? detail : '删除失败'
+    }
+  } finally {
+    hardDeleting.value = false
+  }
 }
 
 function syncViewport() { viewportWidth.value = window.innerWidth }
 
-onMounted(() => {
+onMounted(async () => {
   window.addEventListener('resize', syncViewport)
   loadUsers()
+  try {
+    const { data } = await http.get('/api/admin/admins/me')
+    isSuperAdmin.value = data.role === 'super_admin'
+  } catch {
+    // 角色拉取失败按普通管理员处理：不显示彻底删除入口（后端仍强制校验）
+  }
 })
 onBeforeUnmount(() => window.removeEventListener('resize', syncViewport))
 </script>
@@ -696,6 +1039,32 @@ onBeforeUnmount(() => window.removeEventListener('resize', syncViewport))
 
 .assign-token-time {
   font-size: 11px;
+  color: var(--cy-text-muted);
+}
+
+.temp-password-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 16px;
+  background: var(--cy-bg-surface);
+  border: 1px dashed var(--cy-border-light);
+  border-radius: var(--cy-radius);
+}
+
+.temp-password-value {
+  flex: 1;
+  font-family: var(--cy-font-mono);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--cy-text);
+  user-select: all;
+}
+
+.temp-password-hint {
+  margin: 10px 0 0;
+  font-size: 12px;
   color: var(--cy-text-muted);
 }
 

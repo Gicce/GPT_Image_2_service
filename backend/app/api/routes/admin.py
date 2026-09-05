@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import string
 import uuid
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -13,10 +15,13 @@ from sqlalchemy import select, func, or_, delete
 from pydantic import BaseModel, Field
 
 from app.core.database import get_db
-from app.core.security import get_admin_user
+from app.core.security import (
+    get_admin_user, hash_password, verify_password, _validate_bcrypt_password,
+)
 from app.core.redis import get_redis, publish_notice_update
 from app.core.config import settings
 from app.models.user import User
+from app.models.admin_user import AdminUser
 from app.models.token import (
     TokenInventory, RuntimeTokenAssignment, Order, UsageLog, OrderStatus,
     RefundRequest, RefundRequestStatus,
@@ -530,15 +535,20 @@ class UserUpdate(BaseModel):
 
 @router.get("/users")
 async def list_users(
-    archive_scope: Literal["current", "archived", "all"] = "current",
+    archive_scope: Literal["current", "archived", "purged", "all"] = "current",
     _=Depends(get_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
     query = select(User)
     if archive_scope == "current":
-        query = query.where(User.archived_at.is_(None))
+        # 当前客户：未归档且未彻底删除（v1.0.0 起 purged 账户不再混入任何"可用客户"口径）
+        query = query.where(User.archived_at.is_(None), User.purged_at.is_(None))
     elif archive_scope == "archived":
-        query = query.where(User.archived_at.is_not(None))
+        # 归档记录：可查看/恢复/彻底删除
+        query = query.where(User.archived_at.is_not(None), User.purged_at.is_(None))
+    elif archive_scope == "purged":
+        # 已删除账户：脱敏账务主体，只读追溯
+        query = query.where(User.purged_at.is_not(None))
     result = await db.execute(query.order_by(User.created_at.desc()).limit(200))
     users = result.scalars().all()
     return [
@@ -548,6 +558,9 @@ async def list_users(
             "is_active": u.is_active,
             "archived_at": u.archived_at.isoformat() if u.archived_at else None,
             "archived_by": u.archived_by,
+            "purged_at": u.purged_at.isoformat() if u.purged_at else None,
+            "purged_by": u.purged_by,
+            "purge_reason": u.purge_reason,
             "paid_credits": u.paid_credits,
             "trial_credits": u.trial_credits,
             "gift_credits": u.gift_credits,
@@ -618,6 +631,12 @@ async def get_user(user_id: str, _=Depends(get_admin_user), db: AsyncSession = D
         "is_active": u.is_active,
         "archived_at": u.archived_at.isoformat() if u.archived_at else None,
         "archived_by": u.archived_by,
+        # v1.0.0：密码仅展示"是否设置 + 最近修改时间"，任何接口不返回密码/哈希；
+        # 存量行无记录时为 null，管理后台显示"未记录"，不编造时间
+        "password_changed_at": u.password_changed_at.isoformat() if u.password_changed_at else None,
+        "purged_at": u.purged_at.isoformat() if u.purged_at else None,
+        "purged_by": u.purged_by,
+        "purge_reason": u.purge_reason,
         "paid_credits": u.paid_credits,
         "trial_credits": u.trial_credits,
         "gift_credits": u.gift_credits,
@@ -658,6 +677,11 @@ async def update_user(user_id: str, req: UserUpdate, admin: dict = Depends(get_a
     if not u:
         raise HTTPException(status_code=404, detail="用户不存在")
     changed = {k: v for k, v in req.model_dump(exclude_none=True).items()}
+    if u.purged_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "USER_PURGED", "message": "已彻底删除的账户不能编辑"},
+        )
     if u.archived_at is not None and changed.get("is_active") is True:
         raise HTTPException(
             status_code=409,
@@ -686,6 +710,11 @@ async def admin_assign_runtime_token(
     user = await db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
+    if user.purged_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "USER_PURGED", "message": "已彻底删除的账户不能绑定 Runtime Token"},
+        )
     if user.archived_at is not None:
         raise HTTPException(
             status_code=409,
@@ -789,11 +818,18 @@ async def archive_user(
     u = await db.get(User, user_id)
     if not u:
         raise HTTPException(status_code=404, detail="用户不存在")
+    if u.purged_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "USER_PURGED", "message": "已彻底删除的账户不能归档"},
+        )
     if u.archived_at is None:
         released = await rt.release_user_token(db, user_id, source="admin_archive")
         u.is_active = False
         u.archived_at = datetime.now(timezone.utc)
         u.archived_by = admin.get("username", "admin")
+        # 撤销全部存量登录会话（token_version +1；防止恢复前旧 token 继续可用）
+        u.token_version += 1
         await _record_audit(db, admin, "user_archived", {
             "user_id": user_id,
             "username": u.username,
@@ -805,6 +841,125 @@ async def archive_user(
         "mode": "archive",
         "archived_at": u.archived_at.isoformat() if u.archived_at else None,
     }
+
+
+class UserRestoreRequest(BaseModel):
+    reason: str = Field(default="", max_length=255)
+
+
+@router.post("/users/{user_id}/restore")
+async def restore_user(
+    user_id: str,
+    req: UserRestoreRequest,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """恢复归档账户。
+
+    - 仅归档账户可恢复；已彻底删除（purged）的脱敏主体不可恢复
+    - 恢复不复活旧会话：归档时 token_version 已 +1，恢复不再递增，
+      旧 token 保持失效，用户需用原密码重新登录
+    - 恢复不自动重绑 Runtime Token（归档时已释放），按现行分配规则重新获取
+    """
+    u = await db.get(User, user_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if u.purged_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "USER_PURGED", "message": "已彻底删除的账户不可恢复"},
+        )
+    if u.archived_at is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "USER_NOT_ARCHIVED", "message": "该账户不在归档状态"},
+        )
+
+    previous = {"archived_at": u.archived_at.isoformat(), "archived_by": u.archived_by}
+    u.archived_at = None
+    u.archived_by = None
+    u.is_active = True
+    await _record_audit(db, admin, "user_restored", {
+        "user_id": user_id,
+        "username": u.username,
+        "previous_archive": previous,
+        "reason": req.reason.strip(),
+    })
+    return {"ok": True, "is_active": u.is_active, "archived_at": None}
+
+
+# ── 管理员重置客户密码（v1.0.0） ──────────────────────────────────
+
+# 临时密码字符集：去除易混淆字符（0/O、1/l/I）
+_TEMP_PASSWORD_ALPHABET = (string.ascii_uppercase + string.ascii_lowercase + string.digits)
+_TEMP_PASSWORD_CONFUSABLE = set("0O1lI")
+
+
+def _generate_temp_password(length: int = 12) -> str:
+    alphabet = [c for c in _TEMP_PASSWORD_ALPHABET if c not in _TEMP_PASSWORD_CONFUSABLE]
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+class UserPasswordResetRequest(BaseModel):
+    """管理员重置客户密码：需管理员本人登录密码二次确认。
+
+    new_password 省略时由服务端生成随机临时密码，仅本次响应返回一次；
+    审计只记录操作与原因，不记录新旧密码、哈希或任何可还原凭据。
+    """
+    admin_password: str
+    new_password: Optional[str] = None
+    reason: str = Field(min_length=1, max_length=255)
+
+
+@router.post("/users/{user_id}/reset-password")
+async def reset_user_password(
+    user_id: str,
+    req: UserPasswordResetRequest,
+    admin: dict = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    u = await db.get(User, user_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if u.purged_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "USER_PURGED", "message": "已彻底删除的账户不能重置密码"},
+        )
+    if u.archived_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "USER_ARCHIVED", "message": "已归档账户不能重置密码，请先恢复账户"},
+        )
+
+    # 管理员二次身份确认：校验操作者本人的登录密码（token 被盗也不能直接重置）
+    admin_row = await db.get(AdminUser, admin["id"])
+    if not admin_row or not admin_row.is_active:
+        raise HTTPException(status_code=401, detail="管理员账户状态异常，请重新登录")
+    if not verify_password(req.admin_password, admin_row.password_hash):
+        raise HTTPException(status_code=401, detail="管理员密码不正确")
+
+    generated = req.new_password is None
+    if generated:
+        new_password = _generate_temp_password()
+    else:
+        new_password = req.new_password
+        _validate_bcrypt_password(new_password)
+        if len(new_password) < 8:
+            raise HTTPException(status_code=400, detail="手动设置的新密码至少 8 位")
+
+    u.password_hash = hash_password(new_password)
+    u.password_changed_at = datetime.now(timezone.utc)
+    # 撤销目标账户全部存量会话：旧密码签发的 Bearer token 立即失效
+    u.token_version += 1
+    await _record_audit(db, admin, "user_password_reset", {
+        "user_id": user_id,
+        "username": u.username,
+        "reason": req.reason.strip(),
+        "generated": generated,
+    })
+    # 新密码仅本次响应返回，前端展示一次后不可再查；不落日志、不进任何持久化状态
+    return {"ok": True, "generated": generated, "new_password": new_password}
 
 
 @router.delete("/users/{user_id}")
@@ -846,6 +1001,175 @@ async def delete_user(
     return {"ok": True, "mode": "purge"}
 
 
+# ── 彻底删除（v1.0.0）：归档记录 → 不可恢复删除，含余额核销与账务留存 ──
+
+async def _hard_delete_inflight_blockers(db: AsyncSession, user_id: str) -> dict:
+    """进行中业务检查：未结算预占 / 进行中退款 / 未完成订单（预检与执行共用）。"""
+    reserved = (await db.execute(
+        select(func.count()).select_from(BillingTransaction).where(
+            BillingTransaction.user_id == user_id,
+            BillingTransaction.status == "RESERVED",
+        )
+    )).scalar() or 0
+    open_refunds = (await db.execute(
+        select(func.count()).select_from(RefundRequest).where(
+            RefundRequest.user_id == user_id,
+            RefundRequest.status.in_(RefundRequestStatus.OPEN),
+        )
+    )).scalar() or 0
+    incomplete_orders = (await db.execute(
+        select(func.count()).select_from(Order).where(
+            Order.user_id == user_id,
+            Order.status.in_((OrderStatus.PENDING, OrderStatus.PAID)),
+        )
+    )).scalar() or 0
+    return {"reserved_billing": reserved, "open_refunds": open_refunds, "incomplete_orders": incomplete_orders}
+
+
+class UserHardDeleteRequest(BaseModel):
+    """彻底删除账户：仅 super_admin；需管理员登录密码 + 输入目标账户确认信息 + 原因。
+
+    - 非零余额不再是禁止理由：删除前按"核销"处置并写独立账务流水（ADMIN_ADJUSTMENT），
+      不视为收入，不自动发起微信退款
+    - 进行中业务（未结算预占/进行中退款/未完成订单）仍然硬阻断，无 force 参数可绕过
+    - 有业务历史的账户删除登录身份后保留脱敏账务主体（FK 指向不断、流水可追溯）；
+      干净账户直接物理删除。两者邮箱/用户名均立即释放，可重新注册
+    """
+    admin_password: str
+    confirm_identity: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=255)
+
+
+@router.post("/users/{user_id}/hard-delete")
+async def hard_delete_user(
+    user_id: str,
+    req: UserHardDeleteRequest,
+    admin: dict = Depends(get_super_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    u = await db.get(User, user_id)
+    if not u:
+        # 幂等：行不存在时区分"从未存在"与"已被物理删除"（后者返回成功，无二次副作用）
+        purged_before = (await db.execute(
+            select(func.count()).select_from(AdminAuditLog).where(
+                AdminAuditLog.action == "user_hard_deleted",
+                AdminAuditLog.detail.like(f'%"user_id": "{user_id}"%'),
+            )
+        )).scalar()
+        if purged_before:
+            return {"ok": True, "mode": "purge", "already_purged": True}
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    if u.purged_at is not None:
+        # 幂等：重复对已删除账户调用直接成功，不再产生副作用
+        await _record_audit(db, admin, "user_hard_delete_replay", {
+            "user_id": user_id, "purged_at": u.purged_at.isoformat(),
+        })
+        return {"ok": True, "mode": "purged", "already_purged": True}
+
+    # 管理员二次身份确认
+    admin_row = await db.get(AdminUser, admin["id"])
+    if not admin_row or not admin_row.is_active:
+        raise HTTPException(status_code=401, detail="管理员账户状态异常，请重新登录")
+    if not verify_password(req.admin_password, admin_row.password_hash):
+        raise HTTPException(status_code=401, detail="管理员密码不正确")
+
+    # 目标账户确认信息：必须与用户名或邮箱完全一致（邮箱忽略大小写）
+    identity = req.confirm_identity.strip()
+    if identity != u.username and identity.lower() != u.email.lower():
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "CONFIRM_MISMATCH", "message": "确认信息与目标账户的用户名/邮箱不一致"},
+        )
+
+    # 进行中业务硬阻断（与最终执行同一事务，预检后数据变化仍会被这里拦住）
+    blockers = await _hard_delete_inflight_blockers(db, user_id)
+    if any(blockers.values()):
+        await _record_audit(db, admin, "user_hard_delete_blocked", {
+            "user_id": user_id, "username": u.username, "blockers": blockers,
+        })
+        await db.commit()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "USER_HARD_DELETE_BLOCKED",
+                "message": "该账户存在进行中业务，必须先处理完毕才能彻底删除（不支持强制绕过）",
+                "blockers": blockers,
+            },
+        )
+
+    original_username, original_email = u.username, u.email
+    original_credits = {
+        "paid": u.paid_credits, "trial": u.trial_credits, "gift": u.gift_credits,
+    }
+
+    # 余额处置：核销清零并写独立账务流水（有余额才有流水；方向为负、不构成收入）
+    disposed = {}
+    for name, column in (
+        ("paid_credits", "paid"), ("trial_credits", "trial"), ("gift_credits", "gift"),
+    ):
+        before = getattr(u, name)
+        if before > 0:
+            db.add(BillingTransaction(
+                user_id=user_id,
+                type=billing.ADMIN_ADJUSTMENT,
+                status="SUCCESS",
+                amount_credits=before,
+                billing_source="NONE",
+                remark=(f"账户彻底删除余额核销：{original_username}（{column} {before} 点清零）"
+                        f" 原因：{req.reason.strip()}"),
+            ))
+            setattr(u, name, 0)
+            disposed[column] = before
+    if disposed:
+        from app.services import config_service as _cs
+        billing.sync_legacy_mirrors(u, await _cs.get_legacy_usd_to_credits(db))
+
+    # 释放运行时绑定与设备在线状态（两条路径共用）
+    released = await rt.release_user_token(db, user_id, source="user_hard_delete")
+    redis = get_redis()
+    if redis:
+        async for key in redis.scan_iter(match=f"online_device:{user_id}:*"):
+            await redis.delete(key)
+
+    # 余额核销流水本身即业务历史：处置过余额的账户一律走脱敏主体路径（FK 安全）
+    preview = await _user_deletion_preview(db, user_id)
+    use_anonymized = preview["has_business_history"] or bool(disposed)
+
+    audit_detail = {
+        "user_id": user_id,
+        "original_username": original_username,
+        "original_email": original_email,
+        "reason": req.reason.strip(),
+        "balance_disposed": disposed,
+        "original_credits": original_credits,
+        "released_token_id": released.id if released else None,
+    }
+
+    if use_anonymized:
+        # 脱敏账务主体：订单/流水/用量的 FK 指向保留（可追溯），登录身份彻底消灭
+        suffix = uuid.uuid4().hex[:12]
+        u.username = f"purged-{suffix}"
+        u.email = f"purged-{suffix}@purged.invalid"
+        u.password_hash = hash_password(f"purged:{uuid.uuid4().hex}")  # 随机不可登录
+        u.is_active = False
+        u.token_version += 1  # 撤销全部存量会话
+        u.purged_at = datetime.now(timezone.utc)
+        u.purged_by = admin.get("username", "admin")
+        u.purge_reason = req.reason.strip()
+        audit_detail["mode"] = "anonymize"
+        await _record_audit(db, admin, "user_hard_deleted", audit_detail)
+        return {"ok": True, "mode": "anonymize", "already_purged": False}
+
+    # 干净账户：物理删除（设备与绑定运行数据一并清理；trial_claims / token_assignment_logs 永久保留）
+    await db.execute(delete(ClientDevice).where(ClientDevice.user_id == user_id))
+    await db.execute(delete(RuntimeTokenAssignment).where(RuntimeTokenAssignment.user_id == user_id))
+    await db.execute(delete(User).where(User.id == user_id))
+    audit_detail["mode"] = "purge"
+    await _record_audit(db, admin, "user_hard_deleted", audit_detail)
+    return {"ok": True, "mode": "purge", "already_purged": False}
+
+
 class BalanceAdjustRequest(BaseModel):
     """管理员直接设置点数余额（绝对值），写 ADMIN_ADJUSTMENT 流水 + 审计。"""
     paid_credits: Optional[int] = Field(default=None, ge=0)
@@ -871,6 +1195,16 @@ async def adjust_user_balance(
     u = result.scalar_one_or_none()
     if not u:
         raise HTTPException(status_code=404, detail="用户不存在")
+    if u.purged_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "USER_PURGED", "message": "已彻底删除的账户不能调整余额"},
+        )
+    if u.archived_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "USER_ARCHIVED", "message": "已归档账户不能调整余额，请先恢复账户"},
+        )
 
     legacy_rate = await config_service.get_legacy_usd_to_credits(db)
     rate = Decimal(legacy_rate)
@@ -1385,7 +1719,9 @@ async def get_stats(_=Depends(get_admin_user), db: AsyncSession = Depends(get_db
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     users_total = (await db.execute(
-        select(func.count()).select_from(User).where(User.archived_at.is_(None))
+        select(func.count()).select_from(User).where(
+            User.archived_at.is_(None), User.purged_at.is_(None),
+        )
     )).scalar()
     orders_paid = (await db.execute(
         select(func.count()).select_from(Order).where(Order.paid_at != None)
@@ -1625,7 +1961,13 @@ class ConfigUpdateRequest(BaseModel):
 
 
 @router.put("/config")
-async def update_config(req: ConfigUpdateRequest, _=Depends(get_admin_user)):
+async def update_config(req: ConfigUpdateRequest, _=Depends(get_super_admin_user)):
+    """写入 .env（含 SECRET_KEY / 支付密钥等敏感键）：仅超级管理员。
+
+    安全边界：普通管理员若可改 SECRET_KEY，即可用已知密钥伪造任意角色
+    （含 super_admin）的管理员 JWT，破坏角色隔离——因此收紧为 super_admin。
+    读取（GET /config）保持所有管理员可用（敏感值已脱敏）。
+    """
     env_path = os.environ.get("ENV_FILE_PATH", "/app/.env")
     if not os.path.exists(env_path):
         env_path = ".env"
@@ -1653,7 +1995,8 @@ async def update_config(req: ConfigUpdateRequest, _=Depends(get_admin_user)):
 
 
 @router.post("/config/restart")
-async def restart_backend(_=Depends(get_admin_user)):
+async def restart_backend(_=Depends(get_super_admin_user)):
+    """重启后端容器（经 docker.sock）：仅超级管理员（容器级运维操作）。"""
     try:
         import docker
         client = docker.from_env()

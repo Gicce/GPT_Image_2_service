@@ -28,7 +28,7 @@ visibility: internal
 - **billing.py**：两阶段扣费 RESERVED→SUCCESS/FAILED（settle 按实际成功数重算、CAS 幂等）；试用额度优先、现金兜底（`_split_charge`）；Decimal 全链路；`release_stale_reservations` 释放超时预占（供 reservation GC 调用）
 - **runtime_token.py**：共享 Token 池下发核心；`assign_runtime_token` 事务（行锁旧+新 Token、skip_locked 抢目标、失败整体回滚）
 - **refund.py**：退款状态机、微信退款调用、金额校验（人民币分为精确基准，见 [decisions/ADR-007](decisions/ADR-007-money-decimal-cents.md)）
-- **order_assignment.py**：支付成功后自动绑定 runtime token
+- **order_assignment.py**：支付成功后自动绑定 runtime token；purged 账户拒绝入账（PurgedAccountError 纵深防御）
 
 ## core 模块
 
@@ -36,10 +36,21 @@ visibility: internal
 
 ## 鉴权体系
 
-1. **用户**：JWT Bearer（`core/security.py` 的 get_current_user）
-2. **管理员**：数据库 `admin_users` 表（V4.0.2 起与 users 严格隔离，must_change_password 强制改密；此前为 .env 静态账号）
+1. **用户**：JWT Bearer（`core/security.py` 的 get_current_user）；payload 含 `tv`（token_version），密码重置/自助改密/归档/彻底删除均 `tv+1` 撤销全部存量会话；v1.0.0 之前签发的无 `tv` 旧 token 视为 0，未发生撤销事件前继续有效（兼容窗口有测试）
+2. **管理员**：数据库 `admin_users` 表（V4.0.2 起与 users 严格隔离，must_change_password 强制改密；此前为 .env 静态账号）；两级角色 `admin` / `super_admin`，`get_super_admin_user` 守卫高危入口（hard-delete、.env 写入、容器重启、余额迁移、定价 force）
 3. **防线**：nginx 对 `/api/auth/admin/login` 限流 10r/m + 应用层 Redis IP+用户名限流
 4. **runtime token**：`/api/users/me/runtime-config` 下发，即"给客户端的上游 API Key"（内存态、带过期）
+
+## 客户账户治理（v1.0.0）
+
+三段生命周期：**current**（正常）→ **archived**（归档：禁用+撤会话+释放 Token，可恢复，恢复不复活旧会话）→ **purged**（彻底删除：不可恢复）。
+
+- **hard-delete 双路径**：干净账户物理 DELETE（设备/绑定运行数据一并清理，trial_claims / token_assignment_logs 永久保留防重复试用）；有业务历史或处置过余额 → 脱敏账务主体（`purged-{uuid12}` / `@purged.invalid` / 密码哈希随机重写 / is_active=False / purged 三元组），订单/流水/用量 FK 不断可追溯
+- **余额核销**：非零桶逐条写 `ADMIN_ADJUSTMENT` 流水（remark 注明原因）后清零；不构成收入、不自动微信退款
+- **进行中业务硬阻断**：RESERVED 预占 / 进行中退款 / PENDING、PAID 订单 → 409，无 force 参数
+- **PurgedAccountError**（order_assignment.py）：服务层纵深防御，purged 账户的订单拒绝入账（防 hard-delete 预检后回调并发置 PAID 的窗口终态）
+- **管理员重置密码**：操作者登录密码二次确认 + 临时密码一次性返回（10–14 位、去 0O1lI）+ 审计脱敏（不记新旧密码/哈希/令牌）
+- v1.0.0 安全收紧：`PUT /api/admin/config`（.env 写入）与 `POST /api/admin/config/restart`（容器重启）从普通管理员收紧为 super_admin——封堵「改 SECRET_KEY → 自签 super_admin JWT」提权链（详见 [current/security-assessment.md](current/security-assessment.md) S-1/S-2 与 ADR-020）
 
 ## 启动流程（lifespan）
 

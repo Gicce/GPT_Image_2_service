@@ -295,7 +295,7 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
     if redis:
         await redis.delete(f"userlogin:fail:user:{username}", f"userlogin:fail:ip:{client_ip}")
 
-    access_token = create_access_token(user.id)
+    access_token = create_access_token(user.id, user.token_version)
     user_info = await _user_info(user, db)
     return {
         "access_token": access_token,
@@ -439,6 +439,9 @@ async def forgot_password_reset(req: ForgotPasswordResetRequest, db: AsyncSessio
 
     _validate_bcrypt_password(req.new_password)
     user.password_hash = hash_password(req.new_password)
+    # 自助改密同样撤销全部存量会话（token_version +1 使旧 Bearer token 立即失效）
+    user.token_version += 1
+    user.password_changed_at = datetime.now(timezone.utc)
     await db.flush()
 
     await redis.delete(code_key, attempts_key, f"pwd:rate:{email}")

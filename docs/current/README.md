@@ -18,16 +18,17 @@ migrated_at: 2026-09-05
 
 | 文件 | 主题 |
 |---|---|
-| `backend.md` | 后端架构与模块（此前整文件迁移） |
+| `backend.md` | 后端架构与模块（v1.0.0 含账户治理/会话撤销/权限收紧） |
 | `database.md` | 数据库结构（此前整文件迁移） |
 | `api.md` | 客户端-服务端 API 契约权威定义（客户端消费约束在客户端仓库） |
 | `models-server.md` | 上游 Provider（服务端调度） |
 | `admin-frontend.md` | 管理后台（Vue3 + naive-ui）视图、信息架构与响应式 |
 | `deployment.md` | 服务端部署（生产 124.221.205.221）与 2026-09-05 只读审计 |
-| `release.md` | 服务端版本线（当前 4.2.3） |
-| `testing.md` | 测试规则（服务端行） |
+| `release.md` | 服务端版本线（工作线 1.0.0 pending_release；生产仍 4.2.3） |
+| `testing.md` | 测试规则（服务端行；当前全量口径 178 passed） |
 | `skill-catalog.md` | 技能工坊服务端事实（SkillPackage 发布侧 / Catalog 与后台 / 计费） |
-| `known-issues.md` | 已知问题（服务端侧，保留原编号 #1/#5/#6/#14） |
+| `security-assessment.md` | v1.0.0 安全评估报告（已修复 S-1～S-5 / 良好项 / 缓期项） |
+| `known-issues.md` | 已知问题（服务端侧；原编号 #1/#5/#6/#14 + v1.0.0 缓期项 #15–#17） |
 | `todo.md` | 真实未完成事项（§运维） |
 | `README.md` | 本索引 |
 
@@ -37,12 +38,14 @@ migrated_at: 2026-09-05
 - `ADR-005-no-scheduler-framework.md` — 不引入调度框架
 - `ADR-007-money-decimal-cents.md` — 金额 Decimal 分存储
 - `ADR-018-cy-credits-billing.md` — CY 点数计费（V4.2）
+- `ADR-019-account-governance-lifecycle.md` — 客户账户三段生命周期 + 会话撤销 + 管理员重置密码（v1.0.0）
+- `ADR-020-ops-endpoints-super-admin.md` — .env 写入与容器重启收紧 super_admin（v1.0.0）
 
 其余 ADR 属客户端与工作区级决策，保留在根工作区 `docs/decisions/`。
 
 ## changelog/
 
-- `CHANGELOG.md` — 本仓库变更记录（服务端条目原文 + 工作区混合条目镜像；两条 2026-09-05 新条目置顶）
+- `CHANGELOG.md` — 本仓库变更记录（服务端条目原文 + 工作区混合条目镜像；v1.0.0 条目置顶）
 
 ## archive/
 
@@ -57,6 +60,6 @@ migrated_at: 2026-09-05
 
 1. 本文件 → `backend.md` / `database.md`（架构与数据基础）
 2. `api.md`（对外契约）→ `models-server.md`（上游模型调度）
-3. `release.md` → `changelog/CHANGELOG.md`（版本事实，当前 4.2.3）
+3. `release.md` → `changelog/CHANGELOG.md`（版本事实：工作线 1.0.0 pending_release / 生产 4.2.3）
 4. `deployment.md` → `known-issues.md` → `todo.md`（部署与运维面）
 5. 专项：`skill-catalog.md`、`admin-frontend.md`、`testing.md`、`decisions/`

@@ -18,7 +18,7 @@ from app.core.wechatpay import get_wxpay, wechatpay_request
 from app.core import wechatpay as wxpay_core
 from app.models.user import User
 from app.models.token import Order, OrderStatus, RefundRequest
-from app.services.order_assignment import assign_paid_order, InvalidOrderStatusError
+from app.services.order_assignment import assign_paid_order, InvalidOrderStatusError, PurgedAccountError
 from app.services import billing
 from app.services import refund as refund_service
 
@@ -361,6 +361,11 @@ async def wechat_notify(request: Request, db: AsyncSession = Depends(get_db)):
             await assign_paid_order(db, order, auto=True)
             await db.commit()
             logger.info(f"Notify: Order {out_trade_no} credited successfully")
+        except PurgedAccountError as e:
+            # 已彻底删除账户：拒绝入账（不复活、不加点数），订单保持 PAID 留痕，
+            # 应答成功避免微信重试风暴；资金差异人工对账
+            logger.warning(f"Notify: {e}")
+            await db.commit()
         except InvalidOrderStatusError as e:
             logger.warning(f"Notify: Order {out_trade_no} - {e}")
             await db.commit()
@@ -406,6 +411,9 @@ async def query_order(
     if order.status == OrderStatus.PAID:
         try:
             await assign_paid_order(db, order, auto=True)
+            await db.commit()
+        except PurgedAccountError as e:
+            logger.warning(f"Query: {e}")
             await db.commit()
         except InvalidOrderStatusError as e:
             logger.warning(f"Query: Order {out_trade_no} - {e}")

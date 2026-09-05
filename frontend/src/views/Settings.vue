@@ -42,7 +42,10 @@
       </n-tab-pane>
 
       <n-tab-pane name="infrastructure" tab="基础设施">
-        <n-alert type="info" :bordered="false" class="section-alert">
+        <n-alert v-if="!isSuperAdmin" type="warning" :bordered="false" class="section-alert">
+          .env 配置写入仅超级管理员可操作（当前为只读视图）。管理员账号与登录记录已移至“管理员与登录”。
+        </n-alert>
+        <n-alert v-else type="info" :bordered="false" class="section-alert">
           管理员账号与登录记录已移至“管理员与登录”。敏感字段留空表示不修改。
         </n-alert>
         <div class="config-grid">
@@ -63,7 +66,7 @@
             </n-form>
             <template #footer>
               <div class="card-footer">
-                <n-button type="primary" size="small" :loading="saving[cat.icon]" @click="saveCategory(cat)">保存配置</n-button>
+                <n-button v-if="isSuperAdmin" type="primary" size="small" :loading="saving[cat.icon]" @click="saveCategory(cat)">保存配置</n-button>
               </div>
             </template>
           </n-card>
@@ -76,7 +79,8 @@
             重启会造成约 5–10 秒服务中断，请避开支付回调和配置保存操作。
           </n-alert>
           <div class="operation-actions">
-            <n-button type="warning" :loading="restarting" @click="showRestartDialog">重启后端服务</n-button>
+            <n-button v-if="isSuperAdmin" type="warning" :loading="restarting" @click="showRestartDialog">重启后端服务</n-button>
+            <n-alert v-else type="info" :bordered="false">重启后端服务仅超级管理员可操作。</n-alert>
             <n-tag v-if="restartStatus" :type="restartStatus === 'healthy' ? 'success' : restartStatus === 'failed' ? 'error' : 'warning'">
               {{ restartMessages[restartStatus] }}
             </n-tag>
@@ -117,6 +121,7 @@ const restartStatus = ref(null)
 const restartModalVisible = ref(false)
 const restartConfirmText = ref('')
 const securitySummary = ref({ admin_count: '-', version: '-' })
+const isSuperAdmin = ref(false)
 
 const categoryTitles = { database: '基础设施', security: '认证与安全', wechat: '支付配置', smtp: '邮件服务', server: 'AI Runtime' }
 const categoryDescriptions = {
@@ -147,7 +152,13 @@ const statusItems = computed(() => [
 ])
 const restartMessages = { restarting: '服务正在重启…', healthy: '服务已恢复', failed: '服务恢复超时' }
 
-onMounted(refreshAll)
+onMounted(() => {
+  refreshAll()
+  // .env 写入与容器重启已收紧为超级管理员（后端强制），前端按角色隐藏入口
+  http.get('/api/admin/admins/me').then(({ data }) => {
+    isSuperAdmin.value = data.role === 'super_admin'
+  }).catch(() => {})
+})
 
 async function refreshAll() {
   await Promise.all([loadConfig(), loadBusinessConfig(), loadSecuritySummary()])

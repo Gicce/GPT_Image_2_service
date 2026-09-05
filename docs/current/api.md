@@ -45,18 +45,32 @@ migrated_at: 2026-09-05
 
 ## 管理 API（/api/admin/*）
 
-用户管理（点数调整 paid/trial/gift、runtime-token 分配、Token 脱敏展示）、Token 池（录入返回 `{total, added, duplicate, invalid, details}` 统计；默认徽章区分 正式默认/试用默认）、订单/退款审核（点数冲正按 credits_granted 比例）、账务流水、**定价规则（pricing/rules + preview；Price Guard：低于目标毛利 403，super_admin force+reason 留痕）**、**成本与毛利（margin/ledger：时间/分类/RequestID 筛选 + 汇总）**、**业务配置（system-config K-V）**、**客户端设备（devices：历史保留 + 服务器计算 seconds_since_seen 恒 ≥0 + 在线/离线筛选）**、**旧余额迁移（billing/credits-migration：preview/apply，super_admin）**、公告、管理员账户与登录记录、Settings（业务配置 + 服务端环境配置 / 触发容器重启）。
+用户管理（点数调整 paid/trial/gift、runtime-token 分配、Token 脱敏展示）、Token 池（录入返回 `{total, added, duplicate, invalid, details}` 统计；默认徽章区分 正式默认/试用默认）、订单/退款审核（点数冲正按 credits_granted 比例）、账务流水、**定价规则（pricing/rules + preview；Price Guard：低于目标毛利 403，super_admin force+reason 留痕）**、**成本与毛利（margin/ledger：时间/分类/RequestID 筛选 + 汇总）**、**业务配置（system-config K-V）**、**客户端设备（devices：历史保留 + 服务器计算 seconds_since_seen 恒 ≥0 + 在线/离线筛选）**、**旧余额迁移（billing/credits-migration：preview/apply，super_admin）**、公告、管理员账户与登录记录、Settings（业务配置 + 服务端环境配置 / 触发容器重启；v1.0.0 起 `.env` 写入 `PUT /config` 与容器重启 `POST /config/restart` 均仅 super_admin，读取保持全部管理员且敏感值脱敏）。
 
-### 客户删除与归档（2026-08-26）
+### 客户账户治理（v1.0.0：归档 / 恢复 / 彻底删除 / 密码重置）
 
 | 端点 | 说明 |
 |---|---|
 | `GET /api/admin/users/{id}/deletion-preview` | 返回 `mode=purge|archive`、`has_business_history` 及 orders/refunds/billing/usage/margin 关联计数，并写预检审计 |
-| `DELETE /api/admin/users/{id}` | 仅干净账户物理删除；有关联记录返回 `409`，`detail.code=USER_PURGE_BLOCKED`、`suggested_action=archive` |
-| `POST /api/admin/users/{id}/archive` | 禁用登录、设置 archived_at/by、释放有效 Runtime Token，保留业务和审计记录 |
+| `DELETE /api/admin/users/{id}` | （旧入口，v1.0.0 起由 hard-delete 取代）仅干净账户物理删除；有关联记录返回 `409`，`detail.code=USER_PURGE_BLOCKED`、`suggested_action=archive` |
+| `POST /api/admin/users/{id}/archive` | 禁用登录、设置 archived_at/by、释放有效 Runtime Token、`token_version+1` 撤销全部存量会话，保留业务和审计记录 |
+| `POST /api/admin/users/{id}/restore` | 恢复归档账户（`reason` 必填写审计）；**不复活旧会话**（归档时 tv 已 +1），原密码重新登录可用；purged 账户 409 `USER_PURGED` 不可恢复 |
+| `POST /api/admin/users/{id}/reset-password` | 管理员重置客户密码：`admin_password`（操作者登录密码二次确认，错则 401）+ 可选 `new_password`（≥8 位，省略则服务端生成 12 位无易混字符临时密码）+ `reason`；成功后 `token_version+1` 撤销目标全部会话；临时密码仅本次响应返回一次；审计不含任何密码材料；归档/purged 账户 409 |
+| `POST /api/admin/users/{id}/hard-delete` | **仅 super_admin**。`admin_password` + `confirm_identity`（须与目标用户名/邮箱完全一致，否则 400 `CONFIRM_MISMATCH`）+ `reason`。进行中业务（RESERVED 预占/进行中退款/PENDING、PAID 订单）409 `USER_HARD_DELETE_BLOCKED` 硬阻断、无 force 绕过；非零余额按「核销」清零并写 ADMIN_ADJUSTMENT 流水（不构成收入、不自动退款）；有业务历史或处置过余额 → 脱敏账务主体（`purged-{uuid12}` / `@purged.invalid` / 哈希重写 / is_active=False，FK 保留可追溯）；干净账户 → 物理删除。两者邮箱/用户名立即释放可重注册；幂等（重复调用返回 `already_purged=true` 无副作用） |
 | `GET /api/admin/admin-login-logs` | 超级管理员专用；支持 result、username、start_date、end_date、page、page_size |
 
-`GET /api/admin/users` 支持 `archive_scope=current|archived|all`，默认只返回未归档客户；管理后台以“当前客户 / 归档记录”双标签分别读取。`GET /api/admin/stats` 的 `users_total` 只统计 `archived_at IS NULL`，禁用但未归档的账户仍计入客户总数。
+`GET /api/admin/users` 支持 `archive_scope=current|archived|purged|all`（v1.0.0 新增 `purged`：脱敏账务主体只读追溯）；管理后台以「当前客户 / 归档记录 / 已删除账户」三标签分别读取。`GET /api/admin/stats` 的 `users_total` 只统计 `archived_at IS NULL AND purged_at IS NULL`。
+
+**邮箱重注册与试用一次性**：hard-delete 后原邮箱立即可注册新账户（新 ID、零资产、零历史）；`trial_claims` 以 email 为准独立保留，同邮箱重注册不能重复领取试用。
+
+**迟到/重复支付回调防护**：purged 账户的 PAID 订单补入账被服务层拒绝（`assign_paid_order` 抛 `PurgedAccountError`，点数不变、订单不推进）——覆盖 hard-delete 预检通过后回调并发的窗口终态。
+
+### 版本接口（v1.0.0）
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/health` | 含 `version` 字段（构建注入 APP_VERSION，未注入如实回退包内声明） |
+| `GET /api/admin/version` | 管理员登录：`version` / `environment` / `version_status`（`released`｜`pending_release`）/ `build_commit` / `build_time`（未注入为 null，不伪造）/ `version_log[]`（version/date/status/features/fixes/notes 纯文本数组，无富文本） |
 
 业务配置新增 `trial_valid_days`（默认 2），与 `trial_feature_enabled`、`trial_grant_credits`、`trial_campaign_version` 共同构成唯一试用策略。注册试用和账户内领取均以这些配置为准。
 

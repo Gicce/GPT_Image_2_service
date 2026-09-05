@@ -14,6 +14,19 @@ migrated_at: 2026-09-05
 >
 > 本文件由工作区 `docs/08-CHANGELOG.md` 按条目拆分而来：服务端条目原文保留；工作区混合条目（双侧均有事实）收录并在标题后标注「（工作区混合条目，双侧镜像）」；纯客户端条目与文档工具链条目已剔除。完整工作区级变更见根工作区 `docs/08-CHANGELOG.md`；客户端详细变更见 `GPT_Image_2_Application/CHANGELOG.md`。本仓库重要修改必须追加本文件。
 
+## 2026-09-06 v1.0.0 客户账户治理 / 版本日志 / 安全加固（develop，pending_release，未部署）
+
+> 独立 worktree `GPT_Image_2_service_v1`（develop@8bd6495 基线）开发；隔离测试环境（cyimage_v4_test + Redis db15）；**生产未发生任何写入/重启/部署/真实支付**。
+
+- **客户账户三段生命周期**（ADR-019）：current → archived（可恢复，恢复不复活旧会话）→ purged（不可恢复）。`POST /api/admin/users/{id}/hard-delete`（仅 super_admin，管理员密码二次确认 + confirm_identity + 进行中业务硬阻断无 force）：干净账户物理删除；有业务历史/处置过余额 → 脱敏账务主体（`purged-{uuid12}`/`@purged.invalid`/哈希重写，FK 保留可追溯）；非零余额核销写 ADMIN_ADJUSTMENT 流水；邮箱/用户名立即释放可重注册，trial_claims 独立保留防重复试用；幂等。`assign_paid_order` 对 purged 账户拒绝入账（PurgedAccountError，防迟到/并发回调）。
+- **管理员重置客户密码**：`POST /api/admin/users/{id}/reset-password`——操作者密码二次确认 + 可选手动/随机临时密码（一次性返回）+ `token_version+1` 撤销目标全部会话 + 审计脱敏（不记新旧密码/哈希/令牌）；任何接口不返回密码/哈希，详情仅「已设置 + 最近修改时间」。前端临时密码只存内存 ref、after-leave 清空。
+- **会话撤销体系**：users.token_version + JWT `tv` 字段；密码重置/自助改密/归档/彻底删除四路径统一 +1；旧 token（无 tv）视为 0 兼容。
+- **v1.0.0 版本线**（独立于客户端 V4.x）：`APP_VERSION`/`VERSION_LOG` 同文件于 main.py；`GET /api/admin/version`（environment/version_status/build_commit/build_time/version_log）+ `/api/health` version；`pending_release` 状态机（生产部署确认后才翻 released）；构建信息未注入如实为 null 不伪造。管理后台新增 VersionLog 页 + Layout 侧栏版本常显。
+- **安全加固**（详见 `docs/current/security-assessment.md`）：`PUT /api/admin/config`（.env 写入）与 `POST /api/admin/config/restart` 收紧为 super_admin（ADR-020，封堵改 SECRET_KEY 自签超管 JWT 提权链）；依赖升级 fastapi 0.141.1 / starlette 1.6.0 / aiohttp 3.14.3 / cryptography 50.0.0 / python-jose 3.5.0 / aiosmtplib 5.1.2 / python-multipart 0.0.31（pip-audit 声明+环境级均只剩 ecdsa 无上游修复项）；前端 npm audit fix（6→2，残留仅 vite/esbuild dev-server 面）。管理后台 Settings 按角色只读化。
+- **验证**：pytest **178 passed**（专项 13 + 全量两轮零回归，警告 271→3）；`pip check` 无冲突；前端 `npm run build` 通过；pip-audit / npm audit 成功执行无静默。测试基建：conftest 重建 TEST_ADMIN + `make_admin_headers(role, admin_id, username)` 可造普通管理员 token。
+- **缓期项（如实记录）**：ecdsa PYSEC-2026-1325（无上游修复，HS256 不涉 ECDSA）；vite<=6.4.2/esbuild（仅 dev server 面，修复需 vite 8 大版本另行排期）；docker.sock 挂载与 CORS 白名单/安全响应头（部署硬化专项）。
+- **文档**：current/{backend,api,database,admin-frontend,release,testing,known-issues,security-assessment}.md 更新；ADR-019/020 新增。
+
 ## 2026-09-05 服务端接入内网 Gitea（Cy-image-service）：main=c16632f / develop 建线，CI 四 job 全绿，CD 准备完成（未启用）
 
 - **接入**：remote `gitea` = SSH alias `gitea-cy:gcy/Cy-image-service.git`（GitHub origin 保留不动，仅新增远端）；**main = c16632f**（`fix(image): switch runtime image endpoint to cf.api.fan`，2026-09-04 17:19，与 GitHub origin/master 及生产 HEAD 一致），**develop** 建线 = main + CI/CD/知识库基建（docs/ + scripts/ragflow_sync.py + .gitea/workflows + deploy/cd/）；推送前敏感扫描通过（工作区 + 全部可达历史：无生产 .env / 支付私钥 / 令牌 / 数据库备份）。推送采用 temp-index 提交法，未触碰工作区未提交改动。

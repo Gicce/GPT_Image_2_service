@@ -85,6 +85,10 @@
               在线
             </n-tag>
           </div>
+          <div v-if="!collapsed" class="status-item" style="margin-top:8px">
+            <span class="status-label">服务版本</span>
+            <span class="server-version">{{ serverVersion || '…' }}</span>
+          </div>
         </div>
       </n-layout-sider>
 
@@ -111,6 +115,7 @@ const activeKey = computed(() => route.path.replace('/', ''))
 // 当前登录管理员（/api/admin/admins/me），用于右上角菜单与角色可见性
 const adminProfile = ref({ username: '', display_name: '', role: '' })
 const isSuperAdmin = computed(() => adminProfile.value.role === 'super_admin')
+const serverVersion = ref('')
 const collapsed = ref(window.innerWidth < 1200)
 const expandedGroups = ['operations', 'finance', 'resources', 'system']
 
@@ -125,6 +130,13 @@ onMounted(async () => {
     adminProfile.value = data
   } catch {
     // profile 拉取失败不影响导航；401 由全局拦截器处理
+  }
+  try {
+    // 侧栏固定展示当前运行版本（与版本日志页同一接口同一事实源）
+    const { data } = await http.get('/api/admin/version')
+    serverVersion.value = data.version || ''
+  } catch {
+    // 版本拉取失败仅不显示，不影响导航
   }
 })
 
@@ -161,6 +173,7 @@ const pageTitleMap = {
   transactions: '账务流水',
   'online-devices': '在线客户端',
   settings: '系统设置',
+  'version-log': '版本与更新日志',
   admins: '管理员与登录',
   skills: 'Skill 内容中心',
   profile: '个人设置',
@@ -211,6 +224,7 @@ const menuOptions = computed(() => {
   const systemChildren = [
     { label: 'Skill 内容中心', key: 'skills', icon: makeIcon('models') },
     { label: '系统设置', key: 'settings', icon: makeIcon('settings') },
+    { label: '版本与更新日志', key: 'version-log', icon: makeIcon('models') },
   ]
   if (isSuperAdmin.value) {
     systemChildren.unshift({ label: '管理员与登录', key: 'admins', icon: makeIcon('users') })
@@ -428,6 +442,12 @@ function logout() {
 .status-label {
   font-size: 13px;
   color: var(--cy-text-muted);
+}
+
+.server-version {
+  font-size: 13px;
+  font-family: var(--cy-font-mono);
+  color: var(--cy-text);
 }
 
 .status-dot {

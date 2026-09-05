@@ -40,3 +40,19 @@ migrated_at: 2026-09-05
 - 根因：删除接口未先判断业务关联；表格和弹窗使用固定宽高；Dashboard 把 Token 记录数误作客户可用额度展示。
 - 当前状态：**已解决**——删除预检 + purge/archive 分流和结构化错误；核心列降级/固定操作列；弹窗视口约束；概览完全移除 Token 指标。
 - 关联：服务端 admin users/stats/admin-login-logs；管理前端 Dashboard/Users/Layout/Admins/Settings。
+
+## v1.0.0 安全评估缓期项（2026-09-06，评估过、留痕不修）
+
+完整评估见 `security-assessment.md`（已修复项 S-1～S-5 均有回归测试）。
+
+### 15. ecdsa PYSEC-2026-1325（低，不修）
+
+- python-jose 传递依赖；0.19.2 已是最新版本，**无上游修复可升**；本项目 JWT 全部 HS256，ECDSA 验签不在任何请求路径上，攻击面不成立。跟踪上游发布即可。
+
+### 16. vite ≤6.4.2 / esbuild ≤0.24.2（低，对本项目；缓期）
+
+- 两条 advisory 均仅影响 `vite dev` 开发服务器（dev path traversal / server.fs.deny 绕过 / launch-editor NTLM 泄露）；生产管理后台只发布 `dist/` 静态产物，不经 vite 服务器。修复需 vite 4→8 大版本升级（破坏性），另行排期。
+
+### 17. docker.sock 挂载与响应头/CORS 硬化（部署面，缓期）
+
+- docker.sock 挂载进 backend 容器为 restart 功能依赖，入口已收紧 super_admin（ADR-020）；socket proxy 方案与 CSP/X-Frame-Options 安全头、生产 `CORS_ORIGINS` 白名单配置属部署硬化专项，随下次人工部署处理。
