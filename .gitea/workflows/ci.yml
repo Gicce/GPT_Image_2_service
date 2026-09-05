@@ -39,9 +39,11 @@ jobs:
         run: |
           for f in .env.example backend/.env.example; do
             [ -f "$f" ] || continue
-            # WECHAT_APIV3_KEY / PACKYAPI_*TOKEN / SECRET_KEY 若非空且非 change-me 类占位则失败
-            val=$(grep -E '^(WECHAT_APIV3_KEY|PACKYAPI[A-Z_]*TOKEN|SECRET_KEY)=' "$f" | grep -vE '=(change[-_ ]?me|)$' || true)
-            if [ -n "$val" ]; then
+            # 疑似真实密钥 = 非空值（≥2 字符）且不以 change/your/replace/example/placeholder/dummy
+            # 等占位前缀开头（占位值如 change-me / change-this-secret-key-in-production / your-key-here）
+            bad=$(grep -E '^(WECHAT_APIV3_KEY|PACKYAPI[A-Z_]*TOKEN|SECRET_KEY)=..+' "$f" \
+              | grep -viE '=(change|your|replace|example|placeholder|dummy)[-_ a-z0-9]*$' || true)
+            if [ -n "$bad" ]; then
               echo "::error::$f 存在疑似真实密钥（非占位值）"
               exit 1
             fi
