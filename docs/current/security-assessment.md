@@ -1,3 +1,11 @@
+---
+type: security
+module: server
+lifecycle: current
+authority: current
+company_standard: 1.x
+---
+
 # v1.0.0 安全评估报告（2026-09-06）
 
 > 本报告覆盖 v1.0.0 专项（客户账户完善 / 版本日志 / 安全与代码评估）执行的前后端安全评估与代码评估。
