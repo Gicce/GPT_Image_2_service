@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     # PackyAPI runtime token（V4：仅保留 Image2 单一上游 Token，存服务端）
     PACKYAPI_MASTER_TOKEN: str = ""      # legacy 兜底
     PACKYAPI_IMAGE_MASTER_TOKEN: str = ""
-    PACKYAPI_IMAGE_BASE_URL: str = "https://cf.api.fan"
+    PACKYAPI_IMAGE_BASE_URL: str = "https://www.packyapi.com"
 
     class Config:
         env_file = ".env"

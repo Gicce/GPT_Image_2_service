@@ -42,6 +42,3 @@ logs/
 
 # Certificates
 certs/
-
-# RAGFlow 同步器本地状态（不含密钥）
-.ragflow/
