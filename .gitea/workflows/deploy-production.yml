@@ -1,0 +1,134 @@
+# CD 手动发布（默认关闭）
+#
+# 开关与凭据（全部默认不配置 → 本 workflow 永远不会执行任何生产变更）：
+#   仓库变量 PROD_DEPLOY_ENABLED == 'true'      —— 生产部署总开关
+#   secrets.DEPLOY_SSH_KEY                        —— 生产 SSH 私钥（受限账号）
+#   secrets.PROD_HOST / secrets.PROD_USER         —— 生产主机与账号
+# 任一缺失立即阻断（fail-fast），绝不静默降级。
+#
+# 发布纪律：
+# - 只部署「受信 main 上通过 CI 的确定提交」（40 位 SHA，正则白名单校验，绝不插值进 shell）
+# - 生产主机上执行 deploy/cd/deploy.sh：先备份（pg_dump）再切换、健康检查版本比对、
+#   必需配置缺失即阻断；只更新应用容器，不动数据卷
+# - 生产 origin 当前指向 GitHub master（与 Gitea main 同步）；SHA 已在本 workflow
+#   侧通过 Gitea main 祖先校验 + CI 绿检查，主机侧再校验 SHA ∈ 其 origin 受信分支
+# - 不构建/发布安装包，不影响客户端更新源
+
+name: Deploy Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '部署提交（40 位 SHA，须为 main 上通过 CI 的提交；留空 = main tip）'
+        required: false
+        default: ''
+
+jobs:
+  explain-disabled:
+    name: 生产部署未启用（说明）
+    if: vars.PROD_DEPLOY_ENABLED != 'true'
+    runs-on: gpt-image-service-ci
+    timeout-minutes: 5
+    steps:
+      - name: 说明启用步骤（当前不做任何事）
+        run: |
+          echo "生产部署开关未开启：PROD_DEPLOY_ENABLED != true（或未设置）。"
+          echo "启用前需人工完成："
+          echo "  1. Gitea 仓库变量 PROD_DEPLOY_ENABLED=true"
+          echo "  2. secrets: DEPLOY_SSH_KEY（受限 SSH 账号私钥）、PROD_HOST、PROD_USER"
+          echo "  3. 人工核对 deploy/cd/*.sh 与生产实际结构一致"
+          echo "本轮未配置以上任何内容，未发生任何生产变更。"
+
+  deploy:
+    name: deploy（受信 main + CI 绿 + 确定提交）
+    if: vars.PROD_DEPLOY_ENABLED == 'true'
+    runs-on: gpt-image-service-ci
+    timeout-minutes: 45
+    env:
+      TARGET_REF: ${{ inputs.ref }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      PROD_HOST: ${{ secrets.PROD_HOST }}
+      PROD_USER: ${{ secrets.PROD_USER }}
+      API_TOKEN: ${{ secrets.GITEA_TOKEN }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 输入白名单校验（40 位 SHA 或空；绝不插值进 shell）
+        run: |
+          if [ -n "$TARGET_REF" ] && ! printf '%s' "$TARGET_REF" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::error::ref 只允许 40 位十六进制 SHA（收到非法输入，已阻断）"
+            exit 2
+          fi
+
+      - name: 必需 secrets 在位（缺失即阻断）
+        run: |
+          miss=0
+          [ -n "$DEPLOY_SSH_KEY" ] || { echo "::error::缺少 secrets.DEPLOY_SSH_KEY"; miss=1; }
+          [ -n "$PROD_HOST" ]      || { echo "::error::缺少 secrets.PROD_HOST"; miss=1; }
+          [ -n "$PROD_USER" ]      || { echo "::error::缺少 secrets.PROD_USER"; miss=1; }
+          [ "$miss" = 0 ] || exit 3
+
+      - name: Checkout pinned source
+        uses: https://192.168.110.142/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0   # 祖先校验需要完整历史
+
+      - name: 解析目标 SHA（输入值或 main tip）
+        id: sha
+        run: |
+          git fetch origin main --quiet
+          if [ -n "$TARGET_REF" ]; then SHA="$TARGET_REF"; else SHA=$(git rev-parse origin/main); fi
+          printf '%s\n' "$SHA" | grep -qE '^[0-9a-f]{40}$' || { echo "::error::SHA 解析失败"; exit 2; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "目标提交：$SHA"
+
+      - name: 受信分支校验（SHA 必须是 main 祖先）
+        run: |
+          SHA="${{ steps.sha.outputs.sha }}"
+          git merge-base --is-ancestor "$SHA" origin/main \
+            || { echo "::error::$SHA 不是 main 的祖先，拒绝部署非受信提交"; exit 4; }
+
+      - name: CI 绿检查（该 SHA 的提交状态必须全部 success）
+        run: |
+          SHA="${{ steps.sha.outputs.sha }}"
+          STATUS_JSON=$(curl -sf --ssl-revoke-best-effort --noproxy '*' \
+            -H "Authorization: token $API_TOKEN" \
+            "${GITHUB_API_URL}/repos/gcy/Cy-image-service/commits/${SHA}/status" || echo '{}')
+          python - "$STATUS_JSON" <<'EOF'
+          import json, sys
+          d = json.loads(sys.argv[1] or '{}')
+          statuses = d.get('statuses') or []
+          if not statuses:
+              print('::error::该提交没有任何 CI 状态（未跑过 CI 的提交禁止部署）'); sys.exit(5)
+          bad = [s.get('context') for s in statuses if s.get('status') not in ('success',)]
+          if bad:
+              print(f"::error::CI 未全绿，禁止部署：{bad}"); sys.exit(5)
+          print(f"CI 全绿（{len(statuses)} 项状态全部 success）")
+          EOF
+
+      - name: 预检（静态，无副作用）
+        run: bash deploy/cd/preflight.sh .
+
+      - name: SSH 部署到生产（管道传输脚本本体，避免依赖主机旧版本脚本）
+        run: |
+          SHA="${{ steps.sha.outputs.sha }}"
+          KEY_FILE=$(mktemp); printf '%s\n' "$DEPLOY_SSH_KEY" > "$KEY_FILE"; chmod 600 "$KEY_FILE"
+          # 生产 origin = GitHub master（与 Gitea main 同步同 SHA），故传 CD_SOURCE_REF=refs/heads/master
+          ssh -i "$KEY_FILE" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 \
+            "$PROD_USER@$PROD_HOST" \
+            "CD_SOURCE_REF=refs/heads/master bash -s -- $SHA" < deploy/cd/deploy.sh
+          RC=$?
+          rm -f "$KEY_FILE"; exit $RC
+
+      - name: 部署后回读核对（远端 HEAD 必须等于目标 SHA）
+        run: |
+          SHA="${{ steps.sha.outputs.sha }}"
+          KEY_FILE=$(mktemp); printf '%s\n' "$DEPLOY_SSH_KEY" > "$KEY_FILE"; chmod 600 "$KEY_FILE"
+          REMOTE_HEAD=$(ssh -i "$KEY_FILE" "$PROD_USER@$PROD_HOST" \
+            "git -C /opt/GPT_Image_2_service rev-parse HEAD")
+          rm -f "$KEY_FILE"
+          [ "$REMOTE_HEAD" = "$SHA" ] \
+            || { echo "::error::远端 HEAD=$REMOTE_HEAD != 目标 $SHA"; exit 6; }
+          echo "回读一致：生产 HEAD = $SHA"

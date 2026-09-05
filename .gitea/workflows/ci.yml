@@ -1,0 +1,183 @@
+# CyImagePro 服务端内网 CI（Gitea Actions）
+# Runner: gpt-image-service-ci（Windows 工作站 host 模式，复用本机 Python 3.12 / Node 18 / 本地 PostgreSQL+Redis）
+# 隔离边界：
+# - 后端测试使用专用测试库（conftest 重建 cyimage_v4_test）+ 本地 Redis db15，绝不连接生产数据库
+# - 支付链路在测试中全部 monkeypatch 模拟，不发生真实收费/支付/退款
+# - 不部署、不推送镜像、不触碰生产；Docker 镜像构建验证因本机无 Docker 未覆盖（如实标注）
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  guard:
+    name: sensitive & config guard
+    runs-on: gpt-image-service-ci
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout pinned source
+        uses: https://192.168.110.142/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: 敏感文件不得被 Git 跟踪
+        run: |
+          bad=$(git ls-files | grep -iE '(^|/)\.env$|(^|/)\.env\.(local|prod)(\.|$)|\.pem$|\.p12$|(^|/)certs/|\.bak$|(^|/)backups/' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::以下敏感文件被 Git 跟踪："
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK：无被跟踪的 .env / 证书 / 备份文件"
+
+      - name: .env.example 只允许占位值
+        run: |
+          for f in .env.example backend/.env.example; do
+            [ -f "$f" ] || continue
+            # 疑似真实密钥 = 非空值（≥2 字符）且不以 change/your/replace/example/placeholder/dummy
+            # 等占位前缀开头（占位值如 change-me / change-this-secret-key-in-production / your-key-here）
+            bad=$(grep -E '^(WECHAT_APIV3_KEY|PACKYAPI[A-Z_]*TOKEN|SECRET_KEY)=..+' "$f" \
+              | grep -viE '=(change|your|replace|example|placeholder|dummy)[-_ a-z0-9]*$' || true)
+            if [ -n "$bad" ]; then
+              echo "::error::$f 存在疑似真实密钥（非占位值）"
+              exit 1
+            fi
+          done
+          echo "OK：示例配置均为占位值"
+
+      - name: 部署与编排文件静态校验
+        run: |
+          bash -n deploy.sh && echo "OK deploy.sh 语法"
+          python - <<'EOF'
+          import yaml, sys
+          with open('docker-compose.yml', encoding='utf-8') as f:
+              doc = yaml.safe_load(f)
+          assert 'services' in doc and {'backend', 'postgres', 'redis', 'nginx'} <= set(doc['services']), 'compose 服务不全'
+          print('OK docker-compose.yml 结构（services:', ', '.join(sorted(doc['services'])), '）')
+          EOF
+
+  backend:
+    name: backend pytest
+    needs: guard
+    runs-on: gpt-image-service-ci
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout pinned source
+        uses: https://192.168.110.142/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install backend dev dependencies
+        run: python -m pip install --disable-pip-version-check -q -r backend/requirements-dev.txt
+
+      - name: Run backend tests（专用测试库 + Redis db15 + 模拟支付）
+        run: python -m pytest
+        working-directory: backend
+
+  admin:
+    name: admin frontend build
+    needs: guard
+    runs-on: gpt-image-service-ci
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout pinned source
+        uses: https://192.168.110.142/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install admin frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Build admin frontend
+        run: npm run build
+        working-directory: frontend
+
+  # CD 脚本隔离测试：deploy/cd/*.sh 的守卫行为必须在 CI 里被真实触发过
+  # （阻断路径逐一验证：非法 SHA / 缺配置 / 无历史回滚 / 破坏性 DDL 回滚阻断 / 非受信 SHA）。
+  # 全部使用临时目录与 CD_DRY_RUN=1，不触碰任何主机，不需要 docker。
+  cd-scripts:
+    name: cd scripts isolation test
+    needs: guard
+    runs-on: gpt-image-service-ci
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout pinned source
+        uses: https://192.168.110.142/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: 预检通过路径（真实检出树上运行）
+        run: bash deploy/cd/preflight.sh .
+
+      - name: 阻断路径：非法 SHA 格式（期望 exit 2）
+        run: |
+          set +e
+          bash deploy/cd/deploy.sh abc123 2>err.txt; rc=$?
+          set -e
+          grep -q "非法提交 SHA" err.txt && [ "$rc" = 2 ] || { echo "::error::非法 SHA 未被正确阻断（rc=$rc）"; cat err.txt; exit 1; }
+          echo "OK 非法 SHA 已阻断"
+
+      - name: 阻断路径：必需配置缺失（期望 exit 3）
+        run: |
+          EMPTY=$(mktemp -d)
+          set +e
+          CD_APP_DIR="$EMPTY" bash deploy/cd/deploy.sh 0000000000000000000000000000000000000000 2>err.txt; rc=$?
+          set -e
+          grep -qE "缺少 (docker-compose.yml|可读的 .env|certs)" err.txt && [ "$rc" = 3 ] \
+            || { echo "::error::缺配置未阻断（rc=$rc）"; cat err.txt; exit 1; }
+          echo "OK 必需配置缺失已阻断"
+
+      - name: 阻断路径：无部署历史时 last-good 回滚（期望 exit 2）
+        run: |
+          EMPTY=$(mktemp -d)
+          set +e
+          CD_APP_DIR="$EMPTY" bash deploy/cd/rollback.sh last-good 2>err.txt; rc=$?
+          set -e
+          grep -q "无部署历史" err.txt && [ "$rc" = 2 ] \
+            || { echo "::error::无历史回滚未阻断（rc=$rc）"; cat err.txt; exit 1; }
+          echo "OK 无历史回滚已阻断"
+
+      - name: 阻断路径：前向迁移含破坏性 DDL 时回滚（期望 exit 6）
+        run: |
+          FX=$(mktemp -d)
+          git -C "$FX" init -q
+          git -C "$FX" -c user.name=ci -c user.email=ci@test commit -q --allow-empty -m base || true
+          mkdir -p "$FX/backend/app" "$FX/certs"
+          printf 'APP_VERSION = "1.0.0"\n' > "$FX/backend/app/main.py"
+          printf 'services: {backend: {}, postgres: {}, redis: {}, nginx: {}}\n' > "$FX/docker-compose.yml"
+          touch "$FX/.env"
+          git -C "$FX" add -A && git -C "$FX" -c user.name=ci -c user.email=ci@test commit -qm v1
+          V1=$(git -C "$FX" rev-parse HEAD)
+          printf '\nconn.execute(text("DROP TABLE legacy_orders"))\n' >> "$FX/backend/app/main.py"
+          git -C "$FX" add -A && git -C "$FX" -c user.name=ci -c user.email=ci@test commit -qm v2-destructive
+          set +e
+          CD_DRY_RUN=1 CD_SUDO="" CD_APP_DIR="$FX" bash deploy/cd/rollback.sh "$V1" 2>err.txt; rc=$?
+          set -e
+          grep -q "破坏性 DDL" err.txt && [ "$rc" = 6 ] \
+            || { echo "::error::破坏性 DDL 回滚未阻断（rc=$rc）"; cat err.txt; exit 1; }
+          echo "OK 破坏性 DDL 回滚已阻断"
+
+      - name: 阻断路径：SHA 不存在于远端（期望 exit 5）
+        run: |
+          FX=$(mktemp -d)
+          git -C "$FX" init -q
+          mkdir -p "$FX/backend/app" "$FX/certs"
+          printf 'APP_VERSION = "1.0.0"\n' > "$FX/backend/app/main.py"
+          printf 'services: {backend: {}, postgres: {}, redis: {}, nginx: {}}\n' > "$FX/docker-compose.yml"
+          touch "$FX/.env"
+          git -C "$FX" add -A && git -C "$FX" -c user.name=ci -c user.email=ci@test commit -qm base
+          set +e
+          CD_DRY_RUN=1 CD_APP_DIR="$FX" bash deploy/cd/deploy.sh 1111111111111111111111111111111111111111 2>err.txt; rc=$?
+          set -e
+          grep -q "不存在" err.txt && [ "$rc" = 5 ] \
+            || { echo "::error::不存在的 SHA 未被正确阻断（rc=$rc）"; cat err.txt; exit 1; }
+          echo "OK 不存在 SHA 已阻断"

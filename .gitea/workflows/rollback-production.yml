@@ -1,0 +1,73 @@
+# CD 手动回滚（默认关闭；纪律与 deploy-production.yml 相同）
+#
+# 回滚铁律（deploy/cd/rollback.sh 在主机侧执行）：
+# - 先过 DB 兼容检查：前向部署（目标..当前）含破坏性 DDL（DROP/RENAME/TRUNCATE）即阻断
+# - 绝不 pg_restore、绝不恢复旧整库、绝不动 pgdata/redisdata/skill_samples 卷
+# - 普通回滚 = 重新部署目标提交（只动应用容器与代码）+ 健康检查版本比对
+
+name: Rollback Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '回滚目标（40 位 SHA 或 last-good）'
+        required: false
+        default: 'last-good'
+
+jobs:
+  explain-disabled:
+    name: 生产回滚未启用（说明）
+    if: vars.PROD_DEPLOY_ENABLED != 'true'
+    runs-on: gpt-image-service-ci
+    timeout-minutes: 5
+    steps:
+      - name: 说明启用步骤（当前不做任何事）
+        run: |
+          echo "生产部署开关未开启：PROD_DEPLOY_ENABLED != true（或未设置）。"
+          echo "本 workflow 与 deploy-production.yml 共用同一开关与 secrets（DEPLOY_SSH_KEY/PROD_HOST/PROD_USER）。"
+          echo "本轮未配置以上任何内容，未发生任何生产变更。"
+
+  rollback:
+    name: rollback（DB 兼容门禁 + last-good）
+    if: vars.PROD_DEPLOY_ENABLED == 'true'
+    runs-on: gpt-image-service-ci
+    timeout-minutes: 45
+    env:
+      TARGET_REF: ${{ inputs.ref }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      PROD_HOST: ${{ secrets.PROD_HOST }}
+      PROD_USER: ${{ secrets.PROD_USER }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 输入白名单校验（40 位 SHA 或字面量 last-good；绝不插值进 shell）
+        run: |
+          if ! printf '%s' "$TARGET_REF" | grep -qE '^([0-9a-f]{40}|last-good)$'; then
+            echo "::error::ref 只允许 40 位 SHA 或 last-good（收到非法输入，已阻断）"
+            exit 2
+          fi
+
+      - name: 必需 secrets 在位（缺失即阻断）
+        run: |
+          miss=0
+          [ -n "$DEPLOY_SSH_KEY" ] || { echo "::error::缺少 secrets.DEPLOY_SSH_KEY"; miss=1; }
+          [ -n "$PROD_HOST" ]      || { echo "::error::缺少 secrets.PROD_HOST"; miss=1; }
+          [ -n "$PROD_USER" ]      || { echo "::error::缺少 secrets.PROD_USER"; miss=1; }
+          [ "$miss" = 0 ] || exit 3
+
+      - name: Checkout pinned source（取 rollback.sh 本体）
+        uses: https://192.168.110.142/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: 预检（静态，无副作用）
+        run: bash deploy/cd/preflight.sh .
+
+      - name: SSH 执行回滚（管道传输脚本本体）
+        run: |
+          KEY_FILE=$(mktemp); printf '%s\n' "$DEPLOY_SSH_KEY" > "$KEY_FILE"; chmod 600 "$KEY_FILE"
+          ssh -i "$KEY_FILE" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 \
+            "$PROD_USER@$PROD_HOST" \
+            "bash -s -- $TARGET_REF" < deploy/cd/rollback.sh
+          RC=$?
+          rm -f "$KEY_FILE"; exit $RC
